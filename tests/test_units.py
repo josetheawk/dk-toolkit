@@ -1,0 +1,356 @@
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+
+from tools.dk.platforms.gc_mwcc.matching import UnitScore, FunctionScore, retarget
+from tools.dk.platforms.gc_mwcc.matchcmds import _version_key
+from tools.dk.platforms.gc_mwcc.units import (
+    add_object, add_split_unit, read_units_file, remove_object, remove_split_unit, render_units_file,
+    replace_split_unit, set_status,
+)
+
+SPLITS = """\
+Sections:
+\t.text       type:code align:32
+\t.data       type:data align:32
+
+b.c: comment:0
+\t.text       start:0x80003200 end:0x80003300 align:16
+
+d.c:
+\t.text       start:0x80003500 end:0x80003600
+"""
+
+UNITS = """\
+# header kept
+
+[[lib]]
+name = "Lib"
+mw_version = "GC/1.3.2"
+cflags = "base"
+objects = [
+    { path = "b.c", status = "NonMatching" },
+]
+"""
+
+
+class SplitsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "splits.txt"
+        self.path.write_text(SPLITS)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_insert_by_address_keeps_existing_lines(self):
+        text = add_split_unit(self.path, "c.c", [(".text", 0x80003300, 0x80003500), (".data", 0x80004000, 0x80004010)])
+        self.assertIn("b.c: comment:0\n\t.text       start:0x80003200 end:0x80003300 align:16\n", text)
+        self.assertLess(text.index("b.c:"), text.index("c.c:"))
+        self.assertLess(text.index("c.c:"), text.index("d.c:"))
+        self.assertIn("\t.data       start:0x80004000 end:0x80004010", text)
+
+    def test_insert_first_and_last(self):
+        first = add_split_unit(self.path, "a.c", [(".text", 0x80003100, 0x80003200)])
+        self.assertLess(first.index("a.c:"), first.index("b.c:"))
+        last = add_split_unit(self.path, "e.c", [(".text", 0x80003600, 0x80003700)])
+        self.assertTrue(last.rstrip().endswith("start:0x80003600 end:0x80003700"))
+
+    def test_rejects_overlap_and_duplicate(self):
+        with self.assertRaises(ValueError):
+            add_split_unit(self.path, "x.c", [(".text", 0x800032F0, 0x80003310)])
+        with self.assertRaises(ValueError):
+            add_split_unit(self.path, "b.c", [(".text", 0x80009000, 0x80009010)])
+
+
+class EditSplitsTest(SplitsTest):
+    def test_replace_keeps_header_and_others(self):
+        text = replace_split_unit(self.path, "b.c", [(".text", 0x80003200, 0x80003280), (".data", 0x80004000, 0x80004004)])
+        self.assertIn("b.c: comment:0\n\t.text       start:0x80003200 end:0x80003280\n\t.data       start:0x80004000 end:0x80004004\n", text)
+        self.assertIn("d.c:\n\t.text       start:0x80003500 end:0x80003600", text)
+        with self.assertRaises(ValueError):
+            replace_split_unit(self.path, "b.c", [(".text", 0x80003500, 0x80003510)])     # overlaps d.c
+        with self.assertRaises(ValueError):
+            replace_split_unit(self.path, "zz.c", [(".text", 0x80009000, 0x80009004)])
+
+    def test_replace_refuses_to_drop_a_section_silently(self):
+        with_data = replace_split_unit(self.path, "b.c", [(".text", 0x80003200, 0x80003280), (".data", 0x80004000, 0x80004004)])
+        self.path.write_text(with_data)
+        with self.assertRaises(ValueError):
+            replace_split_unit(self.path, "b.c", [(".text", 0x80003200, 0x80003280)])
+        text = replace_split_unit(self.path, "b.c", [(".text", 0x80003200, 0x80003280)], drop=(".data",))
+        self.assertNotIn("0x80004000", text)
+
+    def test_remove(self):
+        text = remove_split_unit(self.path, "b.c")
+        self.assertNotIn("b.c", text)
+        self.assertIn("d.c:", text)
+
+
+class UnitsFileTest(unittest.TestCase):
+    def test_roundtrip_add_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "units.toml"
+            path.write_text(UNITS)
+            units = read_units_file(path)
+            self.assertEqual(render_units_file(units), UNITS)          # stable rendering
+            self.assertTrue(add_object(units, "Lib", "c.c", "NonMatching", {}))
+            self.assertFalse(add_object(units, "Lib", "c.c", "NonMatching", {}))
+            self.assertTrue(add_object(units, "New", "n.c", "NonMatching", {"cflags": "runtime", "mw_version": None}))
+            self.assertTrue(set_status(units, "b.c", "Matching"))
+            self.assertTrue(remove_object(units, "n.c"))
+            self.assertIsNone(units.lib("New"))                                      # empty lib dropped
+            self.assertTrue(add_object(units, "New", "n.c", "NonMatching", {"cflags": "runtime", "mw_version": None}))
+            text = render_units_file(units)
+            data = tomllib.loads(text)
+            self.assertEqual(data["lib"][0]["objects"][0], {"path": "b.c", "status": "Matching"})
+            self.assertEqual(data["lib"][1], {"name": "New", "cflags": "runtime", "objects": [{"path": "n.c", "status": "NonMatching"}]})
+            self.assertTrue(text.startswith("# header kept\n"))
+            with self.assertRaises(ValueError):
+                add_object(units, "Lib", "z.c", "Done", {})
+
+
+class MatchingHelpersTest(unittest.TestCase):
+    def test_retarget(self):
+        cmd = ("build/tools/wibo build/compilers/GC/1.3.2/mwcceppc.exe -O4,p -lang=c -MMD "
+               "-c src/a.c -o build/X/src")
+        args = retarget(cmd, Path("/tmp/out"), "GC/2.0", ("-inline", "deferred"))
+        self.assertEqual(args, ["build/tools/wibo", "build/compilers/GC/2.0/mwcceppc.exe", "-O4,p", "-lang=c",
+                                "-inline", "deferred", "-c", "src/a.c", "-o", "/tmp/out"])
+
+    def test_version_order(self):
+        versions = ["2.0", "1.3.2r", "1.2.5n", "1.3", "3.0a3", "1.3.2", "1.2.5", "2.0p1", "1.10"]
+        self.assertEqual(sorted(versions, key=_version_key),
+                         ["1.2.5", "1.2.5n", "1.3", "1.3.2", "1.3.2r", "1.10", "2.0", "2.0p1", "3.0a3"])
+
+    def test_exact_requires_layout(self):
+        s = UnitScore("u", [FunctionScore("f", 8, 100.0)], {".data": 100.0})
+        self.assertTrue(s.exact)
+        s.layout_problems.append("f: moved")
+        self.assertFalse(s.exact)
+        self.assertEqual(UnitScore("u", [FunctionScore("f", 8, 50.0), FunctionScore("g", 8, 100.0)]).code_percent, 75.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class WeakExtrasTest(unittest.TestCase):
+    def test_only_weak_extras(self):
+        import base64
+        from tools.dk.platforms.gc_mwcc.matching import _only_weak_extras
+        b64 = lambda raw: base64.b64encode(raw).decode()
+        common = {"data": b64(b"x" * 72), "size": "72"}
+        weak = [(72, 92, "__vt__4Base")]
+        # trailing weak copy only in the compiled object
+        left = {"data_diff": [common, {"kind": "DIFF_INSERT", "size": "20"}]}
+        right = {"data_diff": [common, {"kind": "DIFF_INSERT", "data": b64(b"\0" * 20), "size": "20"}]}
+        self.assertTrue(_only_weak_extras(left, right, weak))
+        right_real = {"data_diff": [common, {"kind": "DIFF_INSERT", "data": b64(b"r" * 20), "size": "20"}]}
+        self.assertFalse(_only_weak_extras(left, right_real, [(0, 20, "__vt__4Base")]))   # real bytes elsewhere
+        # target zero hole the size of the weak copy (original linker zero-filled it)
+        hole = {"data_diff": [common, {"kind": "DIFF_DELETE", "data": b64(b"\0" * 20), "size": "20"}]}
+        self.assertTrue(_only_weak_extras(hole, right, weak))
+        # real target-only bytes, or a zero block of the wrong size, are not explained
+        real = {"data_diff": [{"kind": "DIFF_DELETE", "data": b64(b"text\0\0\0\0"), "size": "8"}]}
+        self.assertFalse(_only_weak_extras(real, right, weak))
+        wrong = {"data_diff": [{"kind": "DIFF_DELETE", "data": b64(b"\0" * 8), "size": "8"}]}
+        self.assertFalse(_only_weak_extras(wrong, right, weak))
+        # an all-zero base-only chunk reported at another offset is explained by size
+        shifted = {"data_diff": [{"kind": "DIFF_INSERT", "data": b64(bytes(8)), "size": "8"}, common]}
+        self.assertTrue(_only_weak_extras({"data_diff": [common]}, shifted, [(72, 80, "@RTTI")]))
+        # a chunk that starts in the zero padding byte before the first extra
+        pad_first = {"data_diff": [{"data": b64(b"x" * 31), "size": "31"},
+                                   {"kind": "DIFF_INSERT", "data": b64(bytes(1) + b"v" * 20), "size": "21"}]}
+        self.assertTrue(_only_weak_extras({"data_diff": [{"data": b64(b"x" * 31), "size": "31"}]}, pad_first, [(32, 52, "__vt__1G")]))
+        nonzero = {"data_diff": [{"kind": "DIFF_INSERT", "data": b64(b"abcdefgh"), "size": "8"}, common]}
+        self.assertFalse(_only_weak_extras({"data_diff": [common]}, nonzero, [(72, 80, "@RTTI")]))
+
+
+class SymbolEditTest(unittest.TestCase):
+    TEXT = ("lbl_80250F40 = .data:0x80250F40; // type:object size:0x84\n"
+            "__vt__4Base = .data:0x80250FC4; // type:object size:0x14\n")
+
+    def test_split_and_size(self):
+        from tools.dk.platforms.gc_mwcc.symbolcmd import size_text, split_text
+        text, _ = split_text(self.TEXT, 0x80250F70, None)
+        self.assertIn("lbl_80250F40 = .data:0x80250F40; // type:object size:0x30\n", text)
+        self.assertIn("lbl_80250F70 = .data:0x80250F70; // type:object size:0x54\n", text)
+        with self.assertRaises(ValueError):
+            split_text(self.TEXT, 0x80250FC8, None)                 # named symbol: not split
+        with self.assertRaises(ValueError):
+            split_text(self.TEXT, 0x80250F40, None)                 # not strictly inside
+        self.assertIn("__vt__4Base = .data:0x80250FC4; // type:object size:0x18", size_text(self.TEXT, "__vt__4Base", 0x18)[0])
+
+    U64 = ("bound = .sbss:0x80392970; // type:object size:0x4 data:4byte\n"
+           "lbl_80392974 = .sbss:0x80392974; // type:object size:0x4 data:4byte\n"
+           "named = .sbss:0x80392978; // type:object size:0x4\n")
+
+    def test_size_absorbs_auto_labels_only(self):
+        from tools.dk.platforms.gc_mwcc.symbolcmd import size_text
+        text, removed = size_text(self.U64, "bound", 0x8)
+        self.assertEqual(removed, ["lbl_80392974"])
+        self.assertEqual(text, "bound = .sbss:0x80392970; // type:object size:0x8 data:4byte\n"
+                               "named = .sbss:0x80392978; // type:object size:0x4\n")
+        with self.assertRaises(ValueError):
+            size_text(self.U64, "bound", 0xC)                       # would swallow a named symbol
+        with self.assertRaises(ValueError):
+            size_text(self.U64, "bound", 0x6)                       # would cut an auto label
+
+    def test_add_object_and_label(self):
+        from tools.dk.platforms.gc_mwcc.symbolcmd import add_text
+        text, removed = add_text(self.U64, "big", ".sbss", 0x80392974, 0x4, "local")
+        self.assertEqual(removed, ["lbl_80392974"])
+        self.assertIn("bound = .sbss:0x80392970; // type:object size:0x4 data:4byte\n"
+                      "big = .sbss:0x80392974; // type:object size:0x4 scope:local\nnamed", text)
+        text, _ = add_text(self.U64, "lab", ".sbss", 0x80392970, None, "global")
+        self.assertTrue(text.startswith("bound = .sbss:0x80392970; // type:object size:0x4 data:4byte\n"
+                                        "lab = .sbss:0x80392970; // type:label scope:global\n"))
+        with self.assertRaises(ValueError):
+            add_text(self.U64, "named", ".sbss", 0x80392990, 0x4, None)   # name taken
+        with self.assertRaises(ValueError):
+            add_text(self.U64, "x", ".sbss", 0x80392976, 0x4, None)       # cuts a label and a named one
+
+
+class RewriteSourcesTest(unittest.TestCase):
+    def test_plain_names_rewritten_mangled_reported(self):
+        from tests.helpers import make_project
+        from tools.dk.platforms.gc_mwcc.renamecmd import rewrite_sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_project(Path(tmp), files={
+                "src/game/a.cpp": 'extern "C" void fn_801C3E1C(int);\nextern "C" void fn_800ED408(void*);\n'
+                                  "void f() { fn_801C3E1C(1); fn_801C3E1Cx(); }\n",
+                "include/game/a.h": "extern int lbl_80391C74;\n",
+            })
+            changed, manual = rewrite_sources(cfg, [("fn_801C3E1C", "OSAllocFromHeap"), ("lbl_80391C74", "gThing"),
+                                                    ("fn_800ED408", "__dl__FPv"), ("Named", "Other")])
+            self.assertEqual(changed, ["include/game/a.h", "src/game/a.cpp"])
+            text = (Path(tmp) / "src/game/a.cpp").read_text()
+            self.assertIn('extern "C" void OSAllocFromHeap(int);', text)
+            self.assertIn("fn_801C3E1Cx()", text)                       # whole words only
+            self.assertIn("fn_800ED408", text)                           # mangled target: not rewritten
+            self.assertEqual(manual, ["src/game/a.cpp: fn_800ED408"])
+            self.assertIn("gThing", (Path(tmp) / "include/game/a.h").read_text())
+
+
+class FreshnessTest(unittest.TestCase):
+    def test_stale_split_output_removed(self):
+        import os
+        from tests.helpers import make_project
+        from tools.dk.platforms.gc_mwcc.freshness import ensure_split_fresh
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_project(Path(tmp), files={"config/symbols.txt": "", "config/splits.txt": "",
+                                                 "config/DEMO01/config.yml": "", "build/DEMO01/config.json": "{}"})
+            out = Path(tmp) / "build/DEMO01/config.json"
+            os.utime(out, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+            self.assertFalse(ensure_split_fresh(cfg))                       # output newer: keep
+            os.utime(Path(tmp) / "config/symbols.txt", ns=(3_000_000_000_000_000_000, 3_000_000_000_000_000_000))
+            self.assertTrue(ensure_split_fresh(cfg))                        # symbols edited later: force re-split
+            self.assertFalse(out.exists())
+
+
+class CheckAllTest(unittest.TestCase):
+    def test_linked_regression_fails_wip_only_reported(self):
+        from tools.dk.platforms.gc_mwcc.matchcmds import check_all_rows
+        from tools.dk.platforms.gc_mwcc.matching import FunctionScore, UnitScore
+        from tools.dk.core.command import BUILD_ERROR, MISMATCH, OK
+        unit = lambda n, done: {"name": n, "metadata": {"complete": done}}
+        good = UnitScore("a", [FunctionScore("f", 8, 100.0)], {".data": 100.0})
+        half = UnitScore("w", [FunctionScore("g", 8, 100.0), FunctionScore("h", 8, 50.0)])
+        units = [unit("a", True), unit("w", False)]
+        lines, code = check_all_rows(units, {"a": good, "w": half})
+        self.assertEqual(code, OK)
+        self.assertEqual(lines[0], "linked units: 1/1 exact")
+        self.assertIn("1/2", lines[-1])
+        _, code = check_all_rows(units, {"a": half, "w": good})
+        self.assertEqual(code, MISMATCH)
+        _, code = check_all_rows(units, {"a": None, "w": good})
+        self.assertEqual(code, BUILD_ERROR)
+
+    def test_only_trailing_padding(self):
+        import base64
+        from tools.dk.platforms.gc_mwcc.matching import _only_trailing_padding
+        b64 = lambda raw: base64.b64encode(raw).decode()
+        common = {"data": b64(b"x" * 554), "size": "554"}
+        tail = lambda raw: {"kind": "DIFF_DELETE", "data": b64(raw), "size": str(len(raw))}
+        ours = {"data_diff": [common, {"kind": "DIFF_DELETE", "size": "6"}]}
+        self.assertTrue(_only_trailing_padding({"data_diff": [common, tail(bytes(6))]}, ours))
+        self.assertFalse(_only_trailing_padding({"data_diff": [common, tail(b"\0\0\0\0\0\1")]}, ours))   # real byte
+        self.assertFalse(_only_trailing_padding({"data_diff": [common, tail(bytes(32))]}, ours))          # not padding
+        self.assertFalse(_only_trailing_padding({"data_diff": [tail(bytes(4)), common]}, ours))          # not at the end
+
+    def test_discarded_follows_stripped_functions(self):
+        from tools.dk.platforms.gc_mwcc.matching import _discarded
+        referrers = {"@lit_a": {"StrippedFn"}, "@lit_shared": {"StrippedFn", "KeptFn"},
+                     "@rtti": {"__vt__4Base"}, "@name": {"@rtti"}}
+        objects = {"@lit_a", "@lit_shared", "@rtti", "@name", "@unreferenced"}
+        self.assertEqual(_discarded(objects, referrers, {"__vt__4Base"}), {"__vt__4Base", "@rtti", "@name"})
+        both = _discarded(objects, referrers, {"__vt__4Base", "StrippedFn"})
+        self.assertIn("@lit_a", both)                     # only the stripped function used it
+        self.assertNotIn("@lit_shared", both)             # a kept function still uses it
+        self.assertNotIn("@unreferenced", both)
+
+    def test_stripped_only_data_is_never_zero_filled(self):
+        import base64
+        from tools.dk.platforms.gc_mwcc.matching import _only_weak_extras
+        b64 = lambda raw: base64.b64encode(raw).decode()
+        hole = {"data_diff": [{"data": b64(b"x" * 8), "size": "8"}, {"kind": "DIFF_DELETE", "data": b64(bytes(4)), "size": "4"}]}
+        ours = {"data_diff": [{"data": b64(b"x" * 8), "size": "8"}, {"kind": "DIFF_INSERT", "data": b64(b"\x3f\x80\0\0"), "size": "4"}]}
+        ranges = [(8, 12, "@37")]
+        self.assertFalse(_only_weak_extras(hole, ours, ranges, zero_fillable=set()))   # a missing 0.0f literal stays a diff
+
+    def test_packed_section_matches(self):
+        from tools.dk.platforms.gc_mwcc.elf import Elf, ElfSection, ElfSymbol
+        from tools.dk.platforms.gc_mwcc.matching import _packed_section_matches
+        def obj(data, syms, nobits=False):
+            sec = ElfSection(1, ".sdata2", 8 if nobits else 1, 0, len(data), 0, 0, b"" if nobits else data)
+            return Elf((ElfSection(0, "", 0, 0, 0, 0, 0, b""), sec),
+                       tuple(ElfSymbol(n, v, sz, 1, 0, 1) for n, v, sz in syms))
+        f = lambda x: bytes.fromhex(x)
+        # ours: 0.0f, 0.5f (stripped-only), 1.0f, pad, 0.5 (double); the link keeps 0.0f, 1.0f, 0.5
+        ours = obj(f("00000000 3f000000 3f800000 00000000 3fe0000000000000"),
+                   [("@1", 0, 4), ("@2", 4, 4), ("@3", 8, 4), ("@4", 16, 8)])
+        target = obj(f("00000000 3f800000 3fe0000000000000"), [("lbl_a", 0, 4), ("lbl_b", 4, 4), ("lbl_c", 8, 8)])
+        self.assertTrue(_packed_section_matches(target, ours, ".sdata2", {"@2"}))
+        self.assertFalse(_packed_section_matches(target, ours, ".sdata2", set()))          # 0.5f really is extra
+        wrong = obj(f("00000000 3f800000 4000000000000000"), [("lbl_a", 0, 4), ("lbl_b", 4, 4), ("lbl_c", 8, 8)])
+        self.assertFalse(_packed_section_matches(wrong, ours, ".sdata2", {"@2"}))          # a wrong literal
+        # bss: kept objects must start at target labels (a u64 after a u32 aligns to 8)
+        ours_bss = obj(bytes(24), [("a", 0, 4), ("t", 4, 4), ("b", 8, 8), ("unused", 16, 8)], nobits=True)
+        target_bss = obj(bytes(16), [("a", 0, 4), ("gap", 4, 4), ("b", 8, 4), ("b_hi", 12, 4)], nobits=True)
+        self.assertTrue(_packed_section_matches(target_bss, ours_bss, ".sdata2", {"t", "unused"}))
+        self.assertFalse(_packed_section_matches(target_bss, ours_bss, ".sdata2", {"t"}))
+
+
+class RenameLocalTest(unittest.TestCase):
+    TEXT = ("SamplingHandler = .text:0x801CAC88; // type:function size:0x40 scope:local\n"
+            "fn_801DB9DC = .text:0x801DB9DC; // type:function size:0x40\n"
+            "PADRead = .text:0x801CB000; // type:function size:0x40 scope:global\n"
+            "fn_801DBA1C = .text:0x801DBA1C; // type:function size:0x40\n")
+
+    def test_local_duplicates_only_with_flag_and_only_of_locals(self):
+        from tools.dk.platforms.gc_mwcc.renamecmd import rename_text
+        _, errors = rename_text(self.TEXT, [("fn_801DB9DC", "SamplingHandler")])
+        self.assertTrue(errors)
+        text, errors = rename_text(self.TEXT, [("fn_801DB9DC", "SamplingHandler")], local=True)
+        self.assertEqual(errors, [])
+        self.assertIn("SamplingHandler = .text:0x801DB9DC; // type:function size:0x40 scope:local\n", text)
+        text, errors = rename_text(self.TEXT, [("fn_801DBA1C", "PADRead")], local=True)
+        self.assertEqual(errors, [])                              # the existing one becomes local too
+        self.assertIn("PADRead = .text:0x801CB000; // type:function size:0x40 scope:local\n", text)
+        self.assertIn("PADRead = .text:0x801DBA1C; // type:function size:0x40 scope:local\n", text)
+
+    def test_nobits_order_is_checked(self):
+        from tools.dk.platforms.gc_mwcc.elf import Elf, ElfSection, ElfSymbol
+        from tools.dk.platforms.gc_mwcc.matching import _nobits_layout_problems
+        def obj(syms):
+            sec = ElfSection(1, ".sbss", 8, 0, 12, 0, 0, b"")
+            return Elf((ElfSection(0, "", 0, 0, 0, 0, 0, b""), sec), tuple(ElfSymbol(n, v, 4, 1, 0, 1) for n, v in syms))
+        target = obj([("CPUFifo", 0), ("GPFifo", 4), ("__GXCurrentThread", 8)])
+        self.assertEqual(_nobits_layout_problems(target, obj([("CPUFifo", 0), ("GPFifo", 4), ("__GXCurrentThread", 8)]), {}), [])
+        wrong = obj([("__GXCurrentThread", 0), ("GPFifo", 4), ("CPUFifo", 8)])
+        self.assertEqual(len(_nobits_layout_problems(target, wrong, {})), 2)
+        # a discarded object before the others: compare packed offsets
+        extra = obj([("unused", 0), ("CPUFifo", 4), ("GPFifo", 8), ("__GXCurrentThread", 12)])
+        self.assertEqual(_nobits_layout_problems(target, extra, {".sbss": {"unused"}}), [])

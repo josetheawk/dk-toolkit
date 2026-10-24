@@ -1,0 +1,217 @@
+# dk.toml: the only project-specific input to tools/dk.
+# Everything under tools/dk/core and tools/dk/platforms reads its paths and
+# names from here, so the toolkit can move to another project unchanged.
+
+[project]
+name = "<game>-decomp"
+game_id = "<GAMEID>"
+platform = "gc_mwcc"        # tools/dk/platforms/<platform>
+
+[target]
+original = "orig/<GAMEID>/sys/main.dol"
+built = "build/<GAMEID>/main.dol"
+sha1 = "<sha1 of the original main.dol>"
+# Searched by `dk setup` for a disc image when the original binary is missing.
+disc_search = ["orig/<GAMEID>"]
+
+[build]
+configure = ["configure.py"]
+report = "build/<GAMEID>/report.json"   # objdiff-cli report, written by ninja
+
+[platform]
+symbols = "config/<GAMEID>/symbols.txt"
+splits = "config/<GAMEID>/splits.txt"
+units = "config/<GAMEID>/units.toml"      # read by configure.py, edited by dk unit / dk accept
+src = "src"
+asm = "build/<GAMEID>/asm"              # dtk disassembly (write_asm: true)
+m2c = ".venv/bin/m2c"                 # installed from requirements.txt by dk setup
+
+[platform.gen]
+# dk gen verifies functions outside declared units with this linked unit's compile command
+# (the game's flags); at code_end and above lie the libraries, which have their own flags.
+code_end = 0x80000000          # first address of library code (SDK, MSL, runtime)
+template = "<a linked game unit compiled with the game flags>"
+
+[toolkit]
+# The shared toolkit repo (dk launcher, tools/dk, tests, playbook): ./dk toolkit diff|export|import
+repo = "<path to dk-toolkit, relative to the project root>"
+
+[docs]
+agents_md = "AGENTS.md"
+playbook = "playbook"
+project = "docs/<project>"
+generated = "docs/generated"
+# Not checked for budgets or links (vendored upstream material).
+exclude = ["docs/upstream", "build", "orig"]
+# Words that must never appear in playbook/: it has to stay portable.
+banned_in_playbook = ["<game name>", "<GAMEID>", "<project name>"]
+
+[quality]
+paths = ["src", "include"]
+# Vendored reference code is not judged.
+exclude = ["src/dolphin", "src/Runtime.PPCEABI.H", "src/PowerPC_EABI_Support", "src/TRK_MINNOW_DOLPHIN",
+           "src/OdemuExi2", "src/amcstubs", "src/odenotstub", "include/sdk"]
+floor = "config/<GAMEID>/floor.toml"
+
+[[quality.forbidden]]
+name = "inline-asm"
+pattern = '^\s*(?:static\s+|extern\s+)*asm\b|\basm\s*[({]'
+why = "game code is C++; inline asm fakes a match"
+
+[[quality.forbidden]]
+name = "pointer-offset"
+pattern = '\(\s*(?:const\s+)?(?:unsigned\s+)?(?:char|u8|s8|int|u32|s32)\s*\*\s*\)\s*\(?\s*\w+\s*\)?\s*\+\s*(?:0x[0-9A-Fa-f]+|\d+)'
+why = "(char*)p + 0x10 where a struct field belongs; use a struct with m<offset> members"
+
+[[quality.forbidden]]
+name = "fp-contract-pragma"
+pattern = '#pragma\s+fp_contract'
+why = "game flags already set -fp_contract off; per-unit flags go in units.toml extra_cflags"
+
+[[quality.debt]]
+name = "fn_"
+pattern = '\bfn_[0-9A-F]{8}\b'
+why = "unnamed function"
+
+[[quality.debt]]
+name = "lbl_"
+pattern = '\blbl_[0-9A-F]{8}\b'
+why = "unnamed global"
+
+[[quality.debt]]
+name = "Unk"
+pattern = '\bUnk[A-Z0-9]\w*'
+why = "unknown type"
+
+[[quality.debt]]
+name = "mXX"
+pattern = '\bm[0-9A-F]{1,4}\b'
+why = "unknown member (offset name)"
+
+[[quality.debt]]
+name = "vfN"
+pattern = '\bvf\d+'
+why = "unknown virtual (slot name)"
+
+[[quality.debt]]
+name = "pad"
+pattern = '\bpad\w*\s*\['
+why = "unknown layout gap"
+
+[docs.budget]
+playbook_file_lines = 300
+playbook_total_lines = 1500
+agents_md_lines = 100
+
+# Reference decomps used by `dk analyze lib` to find known library code in the binary.
+# Fetched (shallow, pinned) into build/references/<name>; only their C is compiled.
+[[platform.references]]
+name = "dolsdk2001"
+unit_prefix = "dolphin/"
+url = "https://github.com/doldecomp/dolsdk2001.git"
+commit = "eb1234c45e6df75757c652c835507ca89674f9a8"
+sources = "src"
+includes = [["-I", "include"], ["-I", "include/libc"], ["-ir", "src"]]
+compilers = ["GC/1.2.5", "GC/1.2.5n"]
+flags = ["-nodefaults", "-proc", "gekko", "-fp", "hard", "-Cpp_exceptions", "off", "-enum", "int",
+         "-pragma", "cats off", "-O4,p", "-inline", "auto", "-DRELEASE"]
+variants = [["-char", "unsigned"], ["-char", "signed"]]
+
+[[platform.references]]
+name = "dolsdk2004"
+unit_prefix = "dolphin/"
+url = "https://github.com/doldecomp/dolsdk2004.git"
+commit = "2328b4164b1a98422a2255d83ce9a5a7548990cc"
+sources = "src"
+includes = [["-I", "include"], ["-I", "include/libc"], ["-ir", "src"]]
+compilers = ["GC/1.2.5", "GC/1.2.5n"]
+flags = ["-nodefaults", "-proc", "gekko", "-fp", "hard", "-Cpp_exceptions", "off", "-enum", "int",
+         "-pragma", "cats off", "-O4,p", "-inline", "auto", "-DRELEASE", "-D__GEKKO__", "-DSDK_REVISION=0"]
+variants = [["-char", "unsigned"], ["-char", "signed"]]
+
+# zeldaret/tww (CC0): same CodeWarrior era (GC 1.3/1.3.2) MSL_C, Runtime, MetroTRK, Dolphin SDK.
+# Three entries share one checkout because each library family has its own flags there.
+[[platform.references]]
+name = "tww-runtime"
+checkout = "tww"
+vendor = [["include", "include/sdk/tww", ["dolphin", "global.h", "TRK_MINNOW_DOLPHIN"]],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include", "src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include"],
+          ["src/PowerPC_EABI_Support/Runtime/Inc", "src/PowerPC_EABI_Support/Runtime/Inc"],
+          ["src/PowerPC_EABI_Support/MetroTRK", "src/PowerPC_EABI_Support/MetroTRK"]]
+url = "https://github.com/zeldaret/tww.git"
+commit = "cb24f55fbbb183af5a04783d163468eb9b61536b"
+sources = ["src/PowerPC_EABI_Support"]
+includes = [["-i", "include"], ["-i", "src"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include"],
+            ["-i", "src/PowerPC_EABI_Support/Runtime/Inc"],
+            ["-i", "src/PowerPC_EABI_Support/MetroTRK"]]
+compilers = ["GC/1.3", "GC/1.3.2"]
+flags = ["-nodefaults", "-proc", "gekko", "-align", "powerpc", "-enum", "int", "-fp", "hardware",
+         "-Cpp_exceptions", "off", "-inline", "auto", "-pragma", "cats off", "-pragma", "warn_notinlined off",
+         "-maxerrors", "1", "-nosyspath", "-RTTI", "off", "-fp_contract", "on", "-str", "reuse", "-multibyte",
+         "-DNDEBUG=1", "-DVERSION=0",
+         "-O4,p", "-use_lmw_stmw", "on", "-str", "reuse,pool,readonly", "-common", "off",
+         "-inline", "deferred,auto", "-char", "signed"]
+variants = [[]]
+
+[[platform.references]]
+name = "tww-trk"
+checkout = "tww"
+vendor = [["include", "include/sdk/tww", ["dolphin", "global.h", "TRK_MINNOW_DOLPHIN"]],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include", "src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include"],
+          ["src/PowerPC_EABI_Support/Runtime/Inc", "src/PowerPC_EABI_Support/Runtime/Inc"],
+          ["src/PowerPC_EABI_Support/MetroTRK", "src/PowerPC_EABI_Support/MetroTRK"]]
+url = "https://github.com/zeldaret/tww.git"
+commit = "cb24f55fbbb183af5a04783d163468eb9b61536b"
+sources = ["src/TRK_MINNOW_DOLPHIN", "src/OdemuExi2", "src/amcstubs", "src/odenotstub"]
+includes = [["-i", "include"], ["-i", "src"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include"],
+            ["-i", "src/PowerPC_EABI_Support/Runtime/Inc"],
+            ["-i", "src/PowerPC_EABI_Support/MetroTRK"]]
+compilers = ["GC/1.3", "GC/1.3.2", "GC/1.2.5n"]
+flags = ["-nodefaults", "-proc", "gekko", "-align", "powerpc", "-enum", "int", "-fp", "hardware",
+         "-Cpp_exceptions", "off", "-inline", "auto", "-pragma", "cats off", "-pragma", "warn_notinlined off",
+         "-maxerrors", "1", "-nosyspath", "-RTTI", "off", "-fp_contract", "on", "-str", "reuse", "-multibyte",
+         "-DNDEBUG=1", "-DVERSION=0",
+         "-O4,p", "-use_lmw_stmw", "on", "-rostr", "-str", "reuse", "-common", "off",
+         "-inline", "deferred,auto", "-char", "signed", "-sdata", "0", "-sdata2", "0"]
+variants = [[]]
+
+[[platform.references]]
+name = "tww-dolphin"
+checkout = "tww"
+vendor = [["include", "include/sdk/tww", ["dolphin", "global.h", "TRK_MINNOW_DOLPHIN"]],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include", "src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include"],
+          ["src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include", "src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include"],
+          ["src/PowerPC_EABI_Support/Runtime/Inc", "src/PowerPC_EABI_Support/Runtime/Inc"],
+          ["src/PowerPC_EABI_Support/MetroTRK", "src/PowerPC_EABI_Support/MetroTRK"]]
+url = "https://github.com/zeldaret/tww.git"
+commit = "cb24f55fbbb183af5a04783d163468eb9b61536b"
+sources = ["src/dolphin"]
+includes = [["-i", "include"], ["-i", "src"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/MSL_Common_Embedded/Math/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C/PPC_EABI/Include"],
+            ["-i", "src/PowerPC_EABI_Support/MSL/MSL_C++/MSL_Common/Include"],
+            ["-i", "src/PowerPC_EABI_Support/Runtime/Inc"],
+            ["-i", "src/PowerPC_EABI_Support/MetroTRK"]]
+compilers = ["GC/1.2.5n", "GC/1.2.5"]
+flags = ["-nodefaults", "-proc", "gekko", "-align", "powerpc", "-enum", "int", "-fp", "hardware",
+         "-Cpp_exceptions", "off", "-inline", "auto", "-pragma", "cats off", "-pragma", "warn_notinlined off",
+         "-maxerrors", "1", "-nosyspath", "-RTTI", "off", "-fp_contract", "on", "-str", "reuse", "-multibyte",
+         "-DNDEBUG=1", "-DVERSION=0", "-O4,p", "-fp_contract", "off"]
+variants = [[]]
