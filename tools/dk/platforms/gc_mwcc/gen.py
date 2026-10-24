@@ -113,6 +113,25 @@ class Literal:
 
 
 @dataclass(frozen=True)
+class IndexPtr:       # base + disp + index*size: an element address, resolved by how it is used
+    base: object
+    index: object
+    size: int
+    disp: int
+    raw: object = None  # the integer reading (base + offset) when nothing proves base a pointer
+
+
+@dataclass(frozen=True)
+class Elem:           # location: element `index` of an array of `size`-byte elements
+    base: object      # the object holding the array, or (via_pointer) the pointer to the elements
+    start: int        # where the array starts inside base's object (0 when via_pointer)
+    index: object
+    size: int
+    sub: int          # offset of the accessed field inside the element
+    via_pointer: bool
+
+
+@dataclass(frozen=True)
 class Offset:         # pointer + constant, resolved by how it is used
     base: object
     delta: int
@@ -158,6 +177,9 @@ class Unsupported(Exception):
     """The lifter does not handle this function (the message says why)."""
 
 
+LOADS_X = {"lwzx": ("int", 4), "lhzx": ("unsigned short", 2), "lhax": ("short", 2), "lbzx": ("unsigned char", 1),
+           "lfsx": ("float", 4), "lfdx": ("double", 8)}
+STORES_X = {"stwx": ("int", 4), "sthx": ("short", 2), "stbx": ("unsigned char", 1), "stfsx": ("float", 4), "stfdx": ("double", 8)}
 LOADS = {"lwz": ("int", 4), "lhz": ("unsigned short", 2), "lha": ("short", 2), "lbz": ("unsigned char", 1),
          "lfs": ("float", 4), "lfd": ("double", 8)}
 STORES = {"stw": ("int", 4), "sth": ("short", 2), "stb": ("unsigned char", 1), "stfs": ("float", 4), "stfd": ("double", 8)}
@@ -187,6 +209,7 @@ class Lifted:
     notes: list = field(default_factory=list)                         # caveats printed with the draft
     base_call: object = None                                          # constructor mode: the base constructor call
     locals: dict = field(default_factory=dict)                        # frame offset -> size of each local used
+    arrays: dict = field(default_factory=dict)                        # (base, start, via_pointer) -> {"size", "fields"}
     unsigned_results: set = field(default_factory=set)                # call results compared unsigned
     ret: object | None = None
     ret_fp: bool = False
@@ -424,6 +447,7 @@ class _Executor:
         self.as_base: set[object] = set()
         self.data_loads: set[Load] = set()  # loads of data (not vtable pointers or slots)
         self.scratch: set = set()           # stack offsets used by conversion idioms
+        self.raw_bases: set = set()         # bases whose element addresses were used as plain integers
         self.regions: dict = {}             # local variables: frame offset -> size
 
     # helpers -----------------------------------------------------------------------------
@@ -460,9 +484,80 @@ class _Executor:
         else:
             fields[offset] = ctype
 
+    def scaled(self, v, byte_ok: bool = False):
+        """(index, element size, extra displacement) for i<<k, i*n, (i*n)+c (or a plain int
+        index for byte arrays)."""
+        if isinstance(v, Op) and v.op == "+" and isinstance(v.args[1], Const):
+            inner = self.scaled(v.args[0])
+            if inner:
+                return inner[0], inner[1], inner[2] + v.args[1].value
+        if isinstance(v, Op) and v.op == "<<" and isinstance(v.args[1], Const) and 0 < v.args[1].value < 8:
+            return v.args[0], 1 << v.args[1].value, 0
+        if isinstance(v, Op) and v.op == "*" and isinstance(v.args[1], Const) and v.args[1].value > 1:
+            return v.args[0], v.args[1].value, 0
+        if byte_ok and (isinstance(v, (Load, CallResult)) or isinstance(v, Param) and v not in self.as_base):
+            return v, 1, 0
+        return None
+
+    def index_ptr(self, p, k, byte_ok: bool = False):
+        """p + k as an element address, if p is a pointer and k a scaled index."""
+        sc = self.scaled(k, byte_ok)
+        if sc is None:
+            return None
+        index, size, disp = sc
+        if isinstance(p, Offset):
+            p, disp = p.base, disp + p.delta
+        if isinstance(p, AddrOf) and isinstance(p.loc, Field):
+            p, disp = p.loc.base, disp + p.loc.offset
+            if isinstance(p, (Param, Load, CallResult)):
+                return IndexPtr(("embedded-in", p), index, size, disp)
+            return IndexPtr(("embedded-in", p), index, size, disp)
+        if isinstance(p, AddrOf) and isinstance(p.loc, GlobalObj):
+            self.out.global_objs.add(p.loc.sym)
+            return IndexPtr(("embedded-in", p.loc), index, size, disp)
+        if isinstance(p, Param) and p.reg.startswith("r") and p.reg not in self.out.int_params \
+                or isinstance(p, Load) and p.ctype in ("int", "unsigned int") or isinstance(p, CallResult) and not p.fp:
+            if isinstance(index, Param) and index.reg.startswith("r"):
+                self.out.int_params.setdefault(index.reg, "int")
+            return IndexPtr(p, index, size, disp, Op("+", (p, k), "int") if not disp else None)
+        return None
+
+    def element(self, ix: IndexPtr, disp: int, width: int) -> Elem:
+        """The element location an access at disp(ix) reads or writes."""
+        d = ix.disp + disp
+        base = ix.base
+        holder = isinstance(base, tuple)
+        container = base[1] if holder else base
+        if not holder and isinstance(container, Param) and container.reg == "r3" and self.this_is_object:
+            holder = True                       # this->mS[i]: an array inside the object
+        if not holder and 0 <= d < ix.size:
+            start, sub_off, via = 0, d, True    # p[i] (.mSUB)
+        else:
+            sub_off = 0 if width == ix.size else d % ix.size
+            start, via = d - sub_off, False
+            if start < 0:
+                raise Unsupported("element before its array")
+        if isinstance(container, Param) and container.reg.startswith("r"):
+            if container.reg in self.out.int_params:
+                raise Unsupported(f"{container.reg} is used both as a number and as a pointer")
+            self.as_base.add(container)
+        elif isinstance(container, (Load, CallResult)):
+            self.as_base.add(container)
+        key = (container, start, via)
+        arr = self.out.arrays.setdefault(key, {"size": ix.size, "fields": {}})
+        if arr["size"] != ix.size:
+            raise Unsupported("one array indexed with two element sizes")
+        self.out.notes.append("array bounds and element layout are one possible reading of base + offset + i*size") \
+            if "array bounds" not in " ".join(self.out.notes) else None
+        if not via:
+            self.out.nodes.setdefault(container, {})
+        return Elem(container, start, ix.index, ix.size, sub_off, via)
+
     def pointer(self, value, disp: int) -> Field:
         """The location `disp(value)`, where value must be a pointer."""
         out = self.out
+        if isinstance(value, IndexPtr):
+            return value                        # resolved by the caller with the access width
         if isinstance(value, Param) and value.reg.startswith("r"):
             if value.reg in out.int_params:
                 raise Unsupported(f"{value.reg} is used both as a number and as a pointer")
@@ -502,7 +597,24 @@ class _Executor:
             raise Unsupported(f"relocation {ref['kind']} in a memory operand")
         if m["base"] == "r1":
             return self.local_field(_imm(m["disp"]))
-        return self.pointer(self.get(st, m["base"]), _imm(m["disp"]))
+        base = self.get(st, m["base"])
+        if isinstance(base, IndexPtr):
+            return self.element(base, _imm(m["disp"]), size)
+        return self.pointer(base, _imm(m["disp"]))
+
+    def elem_address(self, ix: IndexPtr) -> AddrOf:
+        """&element for an element address that is passed or returned (not dereferenced)."""
+        loc = self.element(ix, 0, ix.size)
+        if loc.sub:                                     # inside an element: a member of unknown type
+            self.out.arrays[(loc.base, loc.start, loc.via_pointer)]["fields"].setdefault(loc.sub, "char")
+        return AddrOf(loc)
+
+    def elem_field(self, loc: Elem, ctype: str) -> None:
+        fields = self.out.arrays[(loc.base, loc.start, loc.via_pointer)]["fields"]
+        old = fields.get(loc.sub)
+        if old and old != ctype and {old, ctype} not in ({"short", "unsigned short"}, {"int", "unsigned int"}):
+            raise Unsupported(f"array element field accessed as {old} and {ctype}")
+        fields[loc.sub] = ctype if not old or ctype.startswith("unsigned") else old
 
     def local_field(self, off: int) -> Field:
         start = max((r for r in self.regions if r <= off), default=None)
@@ -514,12 +626,20 @@ class _Executor:
 
     def as_value(self, value):
         """A register value used as a number: params become int params."""
+        if isinstance(value, IndexPtr) and value.raw is not None and not isinstance(value.base, tuple) \
+                and value.base not in self.as_base and not (isinstance(value.base, Param) and value.base.reg == "r3"
+                                                            and self.this_is_object):
+            self.raw_bases.add(value.base)
+            value = value.raw                   # nothing made it a pointer: plain integer arithmetic
+            for x in _walk(value):
+                if isinstance(x, Param) and x.reg.startswith("r"):
+                    self.out.int_params.setdefault(x.reg, "int")
         if isinstance(value, Param) and value.reg.startswith("r"):
             if value in self.as_base:
                 raise Unsupported(f"{value.reg} is used both as a number and as a pointer")
             self.out.int_params.setdefault(value.reg, "int")
-        if isinstance(value, (Offset, AddrOf, HaPart)):
-            raise Unsupported("arithmetic on a pointer (array indexing or casts)")
+        if isinstance(value, (Offset, AddrOf, HaPart, IndexPtr)):
+            raise Unsupported("arithmetic on a pointer (casts or pointer math)")
         return value
 
     def mark_unsigned(self, value) -> None:
@@ -549,6 +669,28 @@ class _Executor:
         if op == "addi" and len(a) == 3 and a[1] == "r1":
             put(a[0], AddrOf(self.local_field(_imm(a[2]))))
             return
+        if op in LOADS_X or op in STORES_X:
+            ctype, size = (LOADS_X.get(op) or STORES_X[op])
+            x, y = get(a[1]), get(a[2])
+            ix = self.index_ptr(x, y, size == 1) or self.index_ptr(y, x, size == 1)
+            if ix is None:
+                raise Unsupported(f"{op} that is not array indexing")
+            loc = self.element(ix, 0, size)
+            if op in LOADS_X:
+                self.elem_field(loc, ctype)
+                load = Load(loc, ctype, seq)
+                self.data_loads.add(load)
+                put(a[0], load)
+            else:
+                value = get(a[0])
+                if isinstance(value, (Offset, AddrOf, HaPart, IndexPtr)):
+                    raise Unsupported("stores a pointer value into an array")
+                self.elem_field(loc, ctype)
+                st.stored.add(loc)
+                store = Store(loc, value, ctype, seq)
+                out.stores.append(store)
+                stmts.append(store)
+            return
         if op in LOADS:
             ctype, size = LOADS[op]
             loc = self.location(st, a[1], size)
@@ -559,6 +701,8 @@ class _Executor:
                 raise Unsupported("reads a location it wrote")
             if isinstance(loc, Field):
                 self.node(loc.base, loc.offset, ctype)
+            elif isinstance(loc, Elem):
+                self.elem_field(loc, ctype)
             else:
                 out.small_globals[loc.sym] = ctype
             load = Load(loc, ctype, seq)
@@ -583,8 +727,14 @@ class _Executor:
                 out.int_params[value.reg] = ctype if ctype != "int" else out.int_params.get(value.reg, "int")
             if isinstance(value, Param) and value.reg.startswith("f") and ctype == "double":
                 out.int_params[value.reg] = "double"
+            if isinstance(value, IndexPtr):
+                value = self.as_value(value)
+                if isinstance(value, IndexPtr):
+                    raise Unsupported("stores an element address")
             if isinstance(loc, Field):
                 self.node(loc.base, loc.offset, ctype)
+            elif isinstance(loc, Elem):
+                self.elem_field(loc, ctype)
             else:
                 out.small_globals[loc.sym] = ctype
             st.stored.add(loc)
@@ -618,6 +768,10 @@ class _Executor:
                 put(a[0], AddrOf(GlobalObj(ref["sym"])))
                 return
             k = _imm(a[2]) * (-1 if op == "subi" else 1)
+            if isinstance(src, IndexPtr):
+                raw = Op("+", (src.raw, Const(k)), "int") if src.raw is not None else None
+                put(a[0], IndexPtr(src.base, src.index, src.size, src.disp + k, raw))
+                return
             if isinstance(src, Const):
                 put(a[0], Const(_s32(src.value + k)))
             elif isinstance(src, (Param, Load, AddrOf, Offset)) and not (isinstance(src, Param) and src.reg in out.int_params):
@@ -626,6 +780,8 @@ class _Executor:
                 put(a[0], Op("+", (self.as_value(src), Const(k)), "int"))
         elif op in ("mr", "fmr"):
             put(a[0], get(a[1]))
+        elif op == "add" and (ix := self.index_ptr(get(a[1]), get(a[2])) or self.index_ptr(get(a[2]), get(a[1]))):
+            put(a[0], ix)
         elif op in _INT_OPS:
             x, y = self.as_value(get(a[1])), self.as_value(get(a[2]))
             put(a[0], Op(_INT_OPS[op], (y, x) if op == "subf" else (x, y), "int"))
@@ -745,7 +901,7 @@ class _Executor:
         n_gpr, n_fpr = sig
         args = tuple(self.get(st, f"r{n}") for n in range(3, 3 + n_gpr)) + tuple(self.get(st, f"f{n}") for n in range(1, 1 + n_fpr))
         # &member passed to a call: an embedded object (same evidence rule as for returns)
-        args = tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else v for v in args)
+        args = tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v) if isinstance(v, IndexPtr) else v for v in args)
         for v in args:
             if isinstance(v, HaPart):
                 raise Unsupported("passes half an address")
@@ -770,7 +926,7 @@ class _Executor:
                 gpr += 1
             if gpr > 11 or fpr > 9:
                 raise Unsupported("arguments on the stack")
-        args = [_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else v for v in args]
+        args = [_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v) if isinstance(v, IndexPtr) else v for v in args]
         if any(isinstance(v, HaPart) for v in args):
             raise Unsupported("passes half an address")
         if cxx.quals:
@@ -883,7 +1039,7 @@ class _Executor:
         n_gpr, n_fpr = sig
         n_gpr = max(n_gpr, 1)
         args = (obj,) + tuple(self.get(st, f"r{n}") for n in range(4, 3 + n_gpr)) + tuple(self.get(st, f"f{n}") for n in range(1, 1 + n_fpr))
-        args = (obj,) + tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else v for v in args[1:])
+        args = (obj,) + tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v) if isinstance(v, IndexPtr) else v for v in args[1:])
         call = Call(f"vf{slot}", args, n_gpr, seq, virtual=True)
         out.calls.append(call)
         stmts.append(call)
@@ -910,6 +1066,10 @@ class _Executor:
 
     def returned(self, st: _State):
         """What a path returns at blr: (value, fp, void_first)."""
+        if isinstance(st.regs.get("r3"), IndexPtr):
+            ix = st.regs["r3"]
+            # the integer reading if the body already used this base that way, else &element
+            st.regs["r3"] = self.as_value(ix) if ix.base in self.raw_bases else self.elem_address(ix)
         r3, f1 = st.regs.get("r3"), st.regs.get("f1")
         if isinstance(r3, CallResult) and isinstance(f1, CallResult) and r3.call == f1.call:
             return r3, False, True          # ends with a call: returning its result compiles the same
@@ -1084,6 +1244,9 @@ def _merge(cond, a: _State, b: _State) -> _State:
 
 def location_key(b):
     """Identity of what a load reads: loads of one location are one object."""
+    if isinstance(b, Load) and isinstance(b.loc, Elem):
+        e = b.loc
+        return ("elem", location_key(e.base), e.start, e.index, e.size, e.sub, e.via_pointer)
     if isinstance(b, Load):
         return ("load", location_key(b.loc.base) if isinstance(b.loc, Field) else ("global", b.loc.sym),
                 b.loc.offset if isinstance(b.loc, Field) else 0)
@@ -1272,6 +1435,67 @@ class Renderer:
     def field_name(self, offset: int) -> str:
         return f"m{offset:X}"
 
+    # arrays --------------------------------------------------------------------------------
+
+    def array_key(self, loc: Elem) -> tuple:
+        return (loc.base, loc.start, loc.via_pointer)
+
+    def elem_type(self, key: tuple) -> str:
+        arr = self.l.arrays[key]
+        fields = arr["fields"]
+        if list(fields) == [0] and SIZES.get(fields[0], 4) == arr["size"]:
+            return fields[0]
+        base, start, via = key
+        return f"{self.object_name(base)}_{'p' if via else f'm{start:X}'}_elem"
+
+    def object_name(self, base) -> str:
+        """An identifier for an object, whether or not it got a placeholder struct."""
+        if isinstance(base, Param) and base.reg == "r3" and self.n.member:
+            return re.sub(r"\W", "_", self.n.this_type)
+        try:
+            return re.sub(r"\W", "_", self.type_name(base))
+        except KeyError:
+            pass
+        prefix = re.sub(r"\W", "_", self.n.this_type)
+        if isinstance(base, Load) and isinstance(base.loc, Field):
+            return f"{self.object_name(base.loc.base)}_m{base.loc.offset:X}"
+        if isinstance(base, Load) and isinstance(base.loc, GlobalVar):
+            return f"Unk_{base.loc.sym}_target"
+        if isinstance(base, Param):
+            return f"{prefix}_arg{int(base.reg[1:]) - 3}"
+        if isinstance(base, CallResult):
+            return f"{prefix}_{base.call.callee}_ret"
+        return f"{prefix}_obj"
+
+    def elem_structs(self) -> list[str]:
+        out = []
+        for key, arr in sorted(self.l.arrays.items(), key=lambda kv: self.elem_type(kv[0])):
+            t = self.elem_type(key)
+            if t in SIZES:
+                continue
+            body, cur = [], 0
+            for off in sorted(arr["fields"]):
+                ctype = arr["fields"][off]
+                width = SIZES.get(ctype, 4)
+                if off < cur or off % width:
+                    raise Unsupported("array element fields overlap")
+                if off > cur:
+                    body.append(f"    char _pad{cur:X}[0x{off - cur:X}];")
+                body.append(f"    {ctype} m{off:X};")
+                cur = off + width
+            if arr["size"] > cur:
+                body.append(f"    char _pad{cur:X}[0x{arr['size'] - cur:X}];")
+            out += [f"struct {t} {{"] + body + ["};"]
+        return out
+
+    def via_pointer_type(self, base) -> str | None:
+        for key in self.l.arrays:
+            if key[2] and self.rep(key[0]) == self.rep(base):
+                if self.l.nodes.get(self.rep(base)):
+                    raise Unsupported("a pointer used both for fields and as an array")
+                return f"{self.elem_type(key)}*"
+        return None
+
     def local_scalar(self, b) -> str | None:
         """A local holding one scalar (int l8;), as opposed to a struct local."""
         if not isinstance(b, StackObj) or ("embedded", b, 0) in self.l.bound:
@@ -1317,6 +1541,13 @@ class Renderer:
     def lvalue(self, loc) -> str:
         if isinstance(loc, GlobalVar):
             return loc.sym
+        if isinstance(loc, Elem):
+            index = self.expr(loc.index)
+            if loc.via_pointer:
+                head = f"{self.expr(loc.base, False)}[{index}]"
+            else:
+                head = f"{self.lvalue(Field(loc.base, loc.start))}[{index}]"
+            return head if self.elem_type(self.array_key(loc)) in SIZES else f"{head}.{self.field_name(loc.sub)}"
         base = loc.base
         if isinstance(base, StackObj):
             if self.local_scalar(base) or (loc.offset == 0 and ("embedded", base, 0) in self.l.bound):
@@ -1345,6 +1576,14 @@ class Renderer:
             return float_literal(e.raw)
         if isinstance(e, Load):
             return self.lvalue(e.loc)
+        if isinstance(e, AddrOf) and isinstance(e.loc, Elem):
+            loc = e.loc
+            if loc.sub == 0:                               # the whole element
+                index = self.expr(loc.index)
+                head = f"{self.expr(loc.base, False)}[{index}]" if loc.via_pointer else \
+                    f"{self.lvalue(Field(loc.base, loc.start))}[{index}]"
+                return f"&{head}"
+            return f"&{self.lvalue(loc)}"
         if isinstance(e, AddrOf):
             if isinstance(e.loc, Field) and isinstance(e.loc.base, StackObj) and e.loc.offset == 0:
                 return f"&l{e.loc.base.offset:X}"          # the whole local
@@ -1383,6 +1622,10 @@ class Renderer:
 
     def ctype_of(self, e, bool_ret: bool = False) -> str:
         e = _simplify(e)
+        if isinstance(e, (Param, Load, CallResult)) and not (isinstance(e, Param) and self.n.member and e.reg == "r3"):
+            vp = self.via_pointer_type(e)
+            if vp:
+                return vp
         if isinstance(e, CallResult):
             if self.rep(e) in self.l.nodes:
                 return f"{self.type_name(e)}*"
@@ -1415,6 +1658,14 @@ class Renderer:
             if self.n.member and e.reg == "r3":
                 return f"{self.n.this_type}*"
             return self.param_type(e.reg)
+        if isinstance(e, AddrOf) and isinstance(e.loc, Elem):
+            t = self.elem_type(self.array_key(e.loc))
+            if t in SIZES or e.loc.sub == 0:
+                return f"{t}*"
+            fields = self.l.arrays[self.array_key(e.loc)]["fields"]
+            return f"{fields.get(e.loc.sub, 'char')}*"
+        if isinstance(e, Load) and isinstance(e.loc, Elem):
+            return e.ctype
         if isinstance(e, AddrOf):
             loc = e.loc
             if isinstance(loc, Field) and isinstance(loc.base, StackObj) and loc.offset == 0:
@@ -1462,6 +1713,11 @@ class Renderer:
                       and self.rep(b.loc.base) == base and b.loc.offset == offset), None)
         if child is not None:
             return f"{self.type_name(child)}*"
+        for key in self.l.arrays:                          # a pointer to array elements
+            k0 = key[0]
+            if key[2] and isinstance(k0, Load) and isinstance(k0.loc, Field) and self.rep(k0.loc.base) == base \
+                    and k0.loc.offset == offset:
+                return self.via_pointer_type(k0)
         for e, want in self.l.expected.items():
             if isinstance(e, Load) and isinstance(e.loc, Field) and self.rep(e.loc.base) == base and e.loc.offset == offset:
                 return want
@@ -1475,6 +1731,9 @@ class Renderer:
         p = Param(reg)
         if p in self.l.expected:
             return self.l.expected[p]
+        vp = self.via_pointer_type(p)
+        if vp:
+            return vp
         if p in self.l.nodes:
             if self.scalar_deref(p):
                 return f"{self.l.nodes[p][0]}*"
@@ -1601,8 +1860,25 @@ class Renderer:
             entries.setdefault(off, self.embedded_type(base, off))
         if base in self.l.vptrs:
             entries[self.l.vptrs[base]] = "@vptr"
+        arrays = {k[1]: k for k in self.l.arrays if not k[2] and self.rep(k[0]) == self.rep(base)}
+        for start in arrays:
+            if start in entries:
+                raise Unsupported("an array overlaps a field")
+            entries[start] = "@array"
         for off in sorted(entries):
             ctype = entries[off]
+            if ctype == "@array":
+                key = arrays[off]
+                size = self.l.arrays[key]["size"]
+                later = [o for o in entries if o > off]
+                count = max(1, (min(later) - off) // size) if later else 1
+                if off > cur:
+                    members.append(f"    char _pad{cur:X}[0x{off - cur:X}];")
+                if off < cur:
+                    raise Unsupported(f"overlapping fields at +0x{off:X}")
+                members.append(f"    {self.elem_type(key)} {self.field_name(off)}[{count}];")
+                cur = off + count * size
+                continue
             if ctype == "@vptr":
                 if off > cur:
                     members.append(f"    char _pad{cur:X}[0x{off - cur:X}];")
@@ -1958,6 +2234,9 @@ def _walk(e):
             yield from _walk(x)
     elif isinstance(e, Load) and isinstance(e.loc, Field):
         yield from _walk(e.loc.base)
+    elif isinstance(e, (Load, AddrOf)) and isinstance(e.loc, Elem):
+        yield from _walk(e.loc.base)
+        yield from _walk(e.loc.index)
     elif isinstance(e, AddrOf) and isinstance(e.loc, Field):
         yield from _walk(e.loc.base)
     elif isinstance(e, Phi):
@@ -1979,10 +2258,12 @@ def has_flow(lifted) -> bool:
 
 
 def return_value(lifted):
-    """The value a function returns (first returned value for branching bodies)."""
+    """The value a function returns (for branching bodies, the first returned value that is
+    not a constant, since a constant fits any type)."""
     if not has_flow(lifted):
         return lifted.ret
-    return next((st.value for st in _flatten(lifted.tree) if isinstance(st, Return) and st.value is not None), None)
+    values = [st.value for st in _flatten(lifted.tree) if isinstance(st, Return) and st.value is not None]
+    return next((v for v in values if not isinstance(v, Const)), values[0] if values else None)
 
 
 @dataclass(frozen=True)
@@ -2025,6 +2306,8 @@ def _variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
     reads = [{e.loc for e in _walk(st.value) if isinstance(e, Load)} for st in stores]
     locs = [st.loc for st in stores]
     # provably distinct locations only: one base (different offsets) or distinct globals
+    if any(isinstance(l, Elem) for l in locs):
+        return [Variant(base, m) for m in modes] + [Variant(base, m, True) for m in modes]
     bases = {location_key(l.base) if isinstance(l, Field) else ("global", l.sym) for l in locs}
     distinct = len(bases) == 1 or all(isinstance(l, GlobalVar) or isinstance(l, Field) and isinstance(l.base, GlobalObj)
                                       for l in locs)
@@ -2053,6 +2336,8 @@ def name_nodes(lifted: Lifted, prefix: str) -> dict[object, str]:
             t = f"{prefix}_arg{int(b.reg[1:]) - 3}"
         elif isinstance(b, CallResult):
             t = f"{prefix}_{b.call.callee}_ret"
+        elif isinstance(b.loc, Elem):                      # pointer held in an array element
+            t = f"{prefix}_a{b.loc.start:X}_e{b.loc.sub:X}"
         elif isinstance(b.loc, GlobalVar):                 # pointer held in a small global
             m = re.fullmatch(r"lbl_([0-9A-F]{8})", b.loc.sym)
             t = f"Unk{m[1]}_target" if m else f"Unk_{b.loc.sym}_target"
@@ -2091,7 +2376,7 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
     decls = r.struct_decls()
     if display and member:
         decls = [d for d in decls if d != f"struct {this_type};"]
-    out += decls
+    out += decls + r.elem_structs()
     sig = ", ".join(r.signature())
     fn_names = [fn_name] if display else [f"v{i}" for i in range(len(chosen))]
     value = return_value(lifted)

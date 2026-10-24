@@ -260,3 +260,25 @@ class ConversionTest(unittest.TestCase):
     def test_other_stack_use_is_refused(self):
         with self.assertRaises(gen.Unsupported):
             gen.lift(gen.parse(I2F.replace("lfd f0, 0x8(r1)", "lfd f0, 0x10(r1)")), lambda s, n, o=0: None, True)
+
+
+class ArrayTest(unittest.TestCase):
+    def lift(self, body):
+        return gen.lift(gen.parse(body), no_literals, True)
+
+    def test_embedded_int_array(self):
+        lifted = self.lift("/* 800C4664 00000000  54 80 10 3A */\tslwi r0, r4, 2\n"
+                           "/* 800C4668 00000000  7C 63 02 14 */\tadd r3, r3, r0\n"
+                           "/* 800C466C 00000000  80 63 00 10 */\tlwz r3, 0x10(r3)\n"
+                           "/* 800C4670 00000000  4E 80 00 20 */\tblr\n")
+        src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
+        self.assertIn("return m10[arg1];", src)
+
+    def test_pointer_to_struct_elements(self):
+        lifted = self.lift("/* 800D1818 00000000  80 63 00 28 */\tlwz r3, 0x28(r3)\n"
+                           "/* 800D181C 00000000  54 80 28 34 */\tslwi r0, r4, 5\n"
+                           "/* 800D1820 00000000  7C 63 02 14 */\tadd r3, r3, r0\n"
+                           "/* 800D1824 00000000  4E 80 00 20 */\tblr\n")
+        src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
+        self.assertIn("return &m28[arg1];", src)
+        self.assertIn("char _pad0[0x20];", src)                    # the element is 32 bytes
