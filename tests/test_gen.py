@@ -40,6 +40,7 @@ class GenTest(unittest.TestCase):
         self.assertEqual(gen.float_literal(bytes.fromhex("3eaaaa9f")), "0.333333f")
         self.assertEqual(gen.float_literal(bytes.fromhex("3f800000")), "1.0f")
         self.assertEqual(gen.float_literal(bytes.fromhex("42700000")), "60.0f")
+        self.assertTrue(gen.float_literal(bytes.fromhex("7f7fffff")).endswith("f"))      # FLT_MAX
 
 
 class CompareTest(unittest.TestCase):
@@ -174,8 +175,37 @@ class FlowTest(unittest.TestCase):
         src, _ = gen.render_tu(lifted, True, "C", "f", [gen.Variant((), "return")], {}, display=True)
         self.assertIn("if (m178 != 0) {\n        return m178->m6E8;\n    } else {\n        return 0;\n    }", src)
 
-    def test_loops_are_refused(self):
-        loop = EARLY.replace("beq .L_80038954", "beq .L_80038940").replace("80038940 00000000  80 63 01 78 */\tlwz", ".L_80038940:\n/* 80038940 00000000  80 63 01 78 */\tlwz")
+    def test_do_while_loop_with_a_loop_variable(self):
+        asm = """
+/* 80009484 00000000  94 21 FF F0 */\tstwu r1, -0x10(r1)
+/* 80009488 00000000  7C 08 02 A6 */\tmflr r0
+/* 8000948C 00000000  90 01 00 14 */\tstw r0, 0x14(r1)
+/* 80009490 00000000  93 E1 00 0C */\tstw r31, 0xc(r1)
+/* 80009494 00000000  93 C1 00 08 */\tstw r30, 0x8(r1)
+/* 80009498 00000000  7C 7E 1B 78 */\tmr r30, r3
+/* 8000949C 00000000  3B E0 00 00 */\tli r31, 0x0
+.L_800094A0:
+/* 800094A0 00000000  7F C3 F3 78 */\tmr r3, r30
+/* 800094A4 00000000  7F E4 FB 78 */\tmr r4, r31
+/* 800094A8 00000000  48 00 00 01 */\tbl fn_8000C270
+/* 800094AC 00000000  3B FF 00 01 */\taddi r31, r31, 0x1
+/* 800094B0 00000000  2C 1F 00 04 */\tcmpwi r31, 0x4
+/* 800094B4 00000000  41 80 FF EC */\tblt .L_800094A0
+/* 800094B8 00000000  80 01 00 14 */\tlwz r0, 0x14(r1)
+/* 800094BC 00000000  83 E1 00 0C */\tlwz r31, 0xc(r1)
+/* 800094C0 00000000  83 C1 00 08 */\tlwz r30, 0x8(r1)
+/* 800094C4 00000000  7C 08 03 A6 */\tmtlr r0
+/* 800094C8 00000000  38 21 00 10 */\taddi r1, r1, 0x10
+/* 800094CC 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, True, {"fn_8000C270": (2, 0)}.get)
+        src, _ = gen.render_tu(lifted, True, "C", "f", [gen.Variant((), "void")], {}, display=True)
+        self.assertIn("int v31 = 0;\n    do {\n        fn_8000C270(this, v31);\n        v31 = v31 + 1;\n    } while (v31 < 4);", src)
+
+    def test_loop_closed_by_an_unconditional_branch_is_refused(self):
+        loop = EARLY.replace("beq .L_80038954", "beq .L_80038954").replace(
+            "/* 80038950 00000000  4E 80 00 20 */\tblr", "/* 80038950 00000000  4B FF FF F0 */\tb .L_80038940").replace(
+            "80038940 00000000  80 63 01 78 */\tlwz", ".L_80038940:\n/* 80038940 00000000  80 63 01 78 */\tlwz")
         with self.assertRaises(gen.Unsupported):
             gen.lift(gen.parse(loop), no_literals, True)
 
@@ -282,3 +312,40 @@ class ArrayTest(unittest.TestCase):
         src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
         self.assertIn("return &m28[arg1];", src)
         self.assertIn("char _pad0[0x20];", src)                    # the element is 32 bytes
+
+
+class BitfieldTest(unittest.TestCase):
+    def test_rotate_forms_become_shifts_and_masks(self):
+        x = gen.Param("r3")
+        self.assertEqual(gen._rotated(x, 20, gen._mask(31, 31)),                  # extrwi r, x, 1, 12
+                         gen.Op("&", (gen.Op(">>u", (x, gen.Const(12)), "int"), gen.Const(1)), "int"))
+        self.assertEqual(gen._rotated(x, 4, gen._mask(0, 27)), gen.Op("<<", (x, gen.Const(4)), "int"))   # slwi
+        with self.assertRaises(gen.Unsupported):
+            gen._rotated(x, 8, gen._mask(0, 31))                                  # a real rotate
+
+    def test_insert_renders_as_mask_and_or(self):
+        asm = ("/* 800F55C0 00000000  88 03 00 01 */\tlbz r0, 0x1(r3)\n"
+               "/* 800F55C4 00000000  50 80 26 36 */\trlwimi r0, r4, 4, 25, 27\n"
+               "/* 800F55C8 00000000  98 03 00 01 */\tstb r0, 0x1(r3)\n"
+               "/* 800F55CC 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(gen.parse(asm), no_literals, True)
+        src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
+        self.assertIn("m1 = (m1 & ~0x70) | ((arg1 << 4) & 0x70);", src)
+
+
+class MergedValueTest(unittest.TestCase):
+    def test_a_value_merged_from_two_arms_becomes_a_variable(self):
+        asm = """
+/* 80000000 00000000  2C 04 00 00 */\tcmpwi r4, 0x0
+/* 80000004 00000000  41 82 00 0C */\tbeq .L_80000010
+/* 80000008 00000000  38 00 00 01 */\tli r0, 0x1
+/* 8000000C 00000000  48 00 00 08 */\tb .L_80000014
+.L_80000010:
+/* 80000010 00000000  38 00 00 02 */\tli r0, 0x2
+.L_80000014:
+/* 80000014 00000000  90 03 00 08 */\tstw r0, 0x8(r3)
+/* 80000018 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, True)
+        src, _ = gen.render_tu(lifted, True, "C", "f", [gen.Variant((), "void")], {}, display=True)
+        self.assertIn("int m1;\n    if (arg1 != 0) {\n        m1 = 1;\n    } else {\n        m1 = 2;\n    }\n    m8 = m1;", src)

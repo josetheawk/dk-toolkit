@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from .. import platforms
-from . import build, doclint, floor, nextcmd, progress, quality, retro, rmcmd, setup, status, testcmd, toolkitcmd, verifyhead
+from . import build, committools, doclint, floor, nextcmd, progress, quality, retro, rmcmd, setup, status, testcmd, toolkitcmd, verifyhead
 from .command import GROUPS, USAGE, Command
 from .config import ConfigError, load
 from .util import project_lock
@@ -25,6 +25,7 @@ CORE_COMMANDS: list[Command] = [
     retro.COMMAND,
     testcmd.COMMAND,
     toolkitcmd.COMMAND,
+    committools.COMMAND,
 ]
 
 

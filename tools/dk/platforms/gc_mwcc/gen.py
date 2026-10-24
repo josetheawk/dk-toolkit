@@ -201,7 +201,8 @@ class Lifted:
     global_objs: set[str] = field(default_factory=set)
     int_params: dict[str, str] = field(default_factory=dict)            # reg -> ctype when used as a value
     calls: list[Call] = field(default_factory=list)
-    tree: list = field(default_factory=list)                          # Store | Call | If | Return
+    var_types: dict = field(default_factory=dict)                     # VarRef -> type of its initial value
+    tree: list = field(default_factory=list)                          # Store | Call | If | Loop | Return
     vptrs: dict = field(default_factory=dict)                         # object -> vtable pointer offset
     alias: dict = field(default_factory=dict)                         # load -> the load that names its type
     bound: dict = field(default_factory=dict)                         # object -> qualified class (tuple)
@@ -214,6 +215,44 @@ class Lifted:
     ret: object | None = None
     ret_fp: bool = False
     void_first: bool = False
+
+
+_ROTATE_FORMS = {
+    # alias -> (SH, MB, ME) from its operands
+    "extrwi": lambda n, b: (b + n, 32 - n, 31),
+    "extlwi": lambda n, b: (b, 0, n - 1),
+    "clrlslwi": lambda b, n: (n, b - n, 31 - n),
+    "clrrwi": lambda n: (0, 0, 31 - n),
+    "rotlwi": lambda n: (n, 0, 31),
+    "rlwinm": lambda sh, mb, me: (sh, mb, me),
+}
+_INSERT_FORMS = {
+    "rlwimi": lambda sh, mb, me: (sh, mb, me),
+    "inslwi": lambda n, b: ((32 - b) % 32, b, b + n - 1),
+    "insrwi": lambda n, b: ((32 - (b + n)) % 32, b, b + n - 1),
+}
+
+
+def _mask(mb: int, me: int) -> int:
+    if mb > me:
+        raise Unsupported("wrap-around rotate mask")
+    m = 0
+    for i in range(mb, me + 1):
+        m |= 1 << (31 - i)
+    return m
+
+
+def _rotated(x, sh: int, mask: int):
+    """rotl32(x, sh) & mask as shifts and masks, when the rotation is really a shift."""
+    if sh == 0:
+        return x if mask == 0xFFFFFFFF else Op("&", (x, Const(_s32(mask))), "int")
+    if mask & ((1 << sh) - 1) == 0:                 # the wrapped-around bits are masked off: a left shift
+        shifted = Op("<<", (x, Const(sh)), "int")
+        return shifted if mask == (0xFFFFFFFF << sh) & 0xFFFFFFFF else Op("&", (shifted, Const(_s32(mask))), "int")
+    if mask < (1 << sh):                            # only the wrapped-around bits survive: a right shift
+        shifted = Op(">>u", (x, Const(32 - sh)), "int")
+        return shifted if mask == (1 << sh) - 1 else Op("&", (shifted, Const(_s32(mask))), "int")
+    raise Unsupported("a real rotate")
 
 
 def is_auto(name: str) -> bool:
@@ -245,6 +284,28 @@ _VOLATILE = [f"r{n}" for n in (0, *range(3, 13))] + [f"f{n}" for n in range(0, 1
 _FRAME_OPS = ("stwu", "mflr", "mtlr")
 
 
+def save_slots(insns: list[Insn]) -> dict[int, str]:
+    """Frame offsets holding saved callee-saved registers: a store of r14-r31/f14-f31 before
+    the function writes that register (the prologue). A later store is a local."""
+    written: set[str] = set()
+    slots: dict[int, str] = {}
+    for insn in insns[1:]:
+        a = insn.args
+        mem = _MEM.match(a[1]) if len(a) > 1 else None
+        reg = _REG.fullmatch(a[0]) if a else None
+        if mem and mem["base"] == "r1" and reg and int(reg[2]) >= 14 and a[0] not in written \
+                and insn.op in ("stw", "stfd", "stmw", "psq_st") and re.fullmatch(r"-?(?:0x[0-9A-Fa-f]+|\d+)", mem["disp"]):
+            off = int(mem["disp"], 0)
+            if insn.op == "stmw":
+                for n in range(int(reg[2]), 32):
+                    slots[off + 4 * (n - int(reg[2]))] = f"r{n}"
+            else:
+                slots.setdefault(off, a[0])
+            continue
+        written.update(_reads_writes(insn, None)[1])
+    return slots
+
+
 def strip_frame(insns: list[Insn]) -> list[Insn]:
     """The body without the stack frame: stwu/addi r1, LR save/restore and the saves/restores
     of callee-saved registers. Any other use of the stack (locals, varargs) is refused."""
@@ -254,6 +315,7 @@ def strip_frame(insns: list[Insn]) -> list[Insn]:
         raise Unsupported("unusual frame")
     frame = _MEM.match(insns[0].args[1])
     frame_size = -int(frame["disp"], 0) if frame else 0
+    slots = save_slots(insns)
     body = []
     # register save/restore helpers: addi r11, r1, N; bl _savegpr_NN (or _restgpr/_savefpr/_restfpr)
     helper = re.compile(r"^_(?:save|rest)(?:gpr|fpr)_\d+$")
@@ -269,9 +331,11 @@ def strip_frame(insns: list[Insn]) -> list[Insn]:
         mem = _MEM.match(a[1]) if len(a) > 1 else None
         on_stack = bool(mem and mem["base"] == "r1")
         reg = _REG.fullmatch(a[0]) if a else None
-        lr_slot = a[0] == "r0" and mem is not None and int(mem["disp"], 0) == frame_size + 4 \
-            if mem and re.fullmatch(r"-?(?:0x[0-9A-Fa-f]+|\d+)", mem["disp"]) else False
-        saved = bool(reg and int(reg[2]) >= 14) or lr_slot
+        numeric = bool(mem and re.fullmatch(r"-?(?:0x[0-9A-Fa-f]+|\d+)", mem["disp"]))
+        lr_slot = bool(a) and a[0] == "r0" and numeric and int(mem["disp"], 0) == frame_size + 4
+        # a save or restore uses one of the prologue's save slots with the same register
+        saved = lr_slot or bool(numeric and reg and slots.get(int(mem["disp"], 0)) == a[0]) \
+            or op in ("stmw", "lmw") and bool(reg and int(reg[2]) >= 14)
         if op in ("mflr", "mtlr") and a[0] == "r0":
             continue
         if op == "addi" and a[:2] == ("r1", "r1"):
@@ -298,14 +362,10 @@ def frame_layout(insns: list[Insn]) -> tuple[int, int]:
         return 0, 0
     m = _MEM.match(insns[0].args[1])
     size = -int(m["disp"], 0) if m else 0
-    low = size
+    slots = save_slots(insns)
+    low = min([size] + list(slots))
     for insn in insns:
         a = insn.args
-        mem = _MEM.match(a[1]) if len(a) > 1 else None
-        reg = _REG.fullmatch(a[0]) if a else None
-        if mem and mem["base"] == "r1" and reg and int(reg[2]) >= 14 and insn.op in ("stw", "stfd", "stmw", "psq_st"):
-            if re.fullmatch(r"-?(?:0x[0-9A-Fa-f]+|\d+)", mem["disp"]):
-                low = min(low, int(mem["disp"], 0))
         h = re.fullmatch(r"_save(gpr|fpr)_(\d+)", a[0]) if insn.op == "bl" and a else None
         if h:
             low = min(low, size - (4 if h[1] == "gpr" else 8) * (32 - int(h[2])) * (2 if h[1] == "fpr" else 1))
@@ -387,6 +447,19 @@ class Phi:            # a value that depends on which arm of an if ran
     cond: object
     then: object
     other: object
+    site: int = -1    # the If that produced it (seq), for materialising it as a variable
+
+
+@dataclass(frozen=True)
+class Raw:            # already-rendered C++ (a folded short-circuit expression)
+    text: str
+
+
+@dataclass
+class Assign:         # var = value (a merged value materialised as a variable)
+    var: object
+    value: object
+    seq: int
 
 
 @dataclass
@@ -395,11 +468,27 @@ class If:
     then: list
     other: list
     seq: int
+    decls: list = field(default_factory=list)   # variables assigned in the arms, declared before
 
 
 @dataclass
 class Return:
     value: object | None
+    seq: int
+
+
+@dataclass(frozen=True)
+class VarRef:           # a loop variable (a register carried around a loop)
+    name: str
+
+
+@dataclass
+class Loop:
+    kind: str           # "while" (test first) | "do" (test last)
+    cond: object        # the loop runs again while it holds (in terms of the updated variables)
+    body: list
+    inits: list         # [(VarRef, value)] before the loop
+    updates: list       # [(VarRef, value)] at the end of each iteration
     seq: int
 
 
@@ -448,6 +537,8 @@ class _Executor:
         self.data_loads: set[Load] = set()  # loads of data (not vtable pointers or slots)
         self.scratch: set = set()           # stack offsets used by conversion idioms
         self.raw_bases: set = set()         # bases whose element addresses were used as plain integers
+        self.ifs: dict = {}                 # seq -> If (for materialising merged values)
+        self.materialised: dict = {}        # Phi -> VarRef
         self.regions: dict = {}             # local variables: frame offset -> size
 
     # helpers -----------------------------------------------------------------------------
@@ -457,10 +548,33 @@ class _Executor:
             raise Unsupported(f"uses {reg} after a call clobbered it" if reg in st.clobbered else f"reads {reg} before writing it")
         value = st.regs[reg]
         if isinstance(value, Phi):
-            raise Unsupported("value merged from two branches used later")
+            value = self.materialise(value)
+            st.regs[reg] = value
         if isinstance(value, tuple):
             raise Unsupported("a half-built int->float conversion used")
         return value
+
+    def materialise(self, phi: Phi):
+        """`T v; if (c) { ...; v = a; } else { ...; v = b; }`: the If that merged the value
+        assigns a variable in each arm, declared before it."""
+        if phi in self.materialised:
+            return self.materialised[phi]
+        site = self.ifs.get(phi.site)
+        if site is None:
+            raise Unsupported("value merged from two branches used later")
+        for arm in (phi.then, phi.other):
+            if isinstance(arm, Phi):
+                self.materialise(arm)
+        var = VarRef(f"m{len(self.materialised) + 1}")
+        then_v = self.materialised.get(phi.then, phi.then)
+        other_v = self.materialised.get(phi.other, phi.other)
+        last = lambda arm: max([site.seq] + [x.seq for x in _flatten(arm) if hasattr(x, "seq")]) + 0.5
+        site.then.append(Assign(var, then_v, last(site.then)))
+        site.other.append(Assign(var, other_v, last(site.other)))
+        site.decls.append(var)
+        self.out.var_types.setdefault(var, then_v if not isinstance(then_v, Const) else other_v)
+        self.materialised[phi] = var
+        return var
 
     def put(self, st: _State, reg: str, value) -> None:
         st.regs[reg] = value
@@ -563,7 +677,8 @@ class _Executor:
                 raise Unsupported(f"{value.reg} is used both as a number and as a pointer")
             self.as_base.add(value)
             return Field(value, disp)
-        if isinstance(value, Load) and value.ctype in ("int", "unsigned int") or isinstance(value, CallResult) and not value.fp:
+        if isinstance(value, Load) and value.ctype in ("int", "unsigned int") or isinstance(value, CallResult) and not value.fp \
+                or isinstance(value, VarRef):
             self.as_base.add(value)
             return Field(value, disp)
         if isinstance(value, AddrOf) and isinstance(value.loc, GlobalObj):
@@ -638,7 +753,7 @@ class _Executor:
             if value in self.as_base:
                 raise Unsupported(f"{value.reg} is used both as a number and as a pointer")
             self.out.int_params.setdefault(value.reg, "int")
-        if isinstance(value, (Offset, AddrOf, HaPart, IndexPtr)):
+        if isinstance(value, (Offset, AddrOf, HaPart, IndexPtr)) or isinstance(value, VarRef) and value in self.as_base:
             raise Unsupported("arithmetic on a pointer (casts or pointer math)")
         return value
 
@@ -697,8 +812,6 @@ class _Executor:
             if isinstance(loc, Literal):
                 put(a[0], Literal(loc.sym, ctype, loc.raw))
                 return
-            if loc in st.stored and not (isinstance(loc, Field) and isinstance(loc.base, StackObj)):
-                raise Unsupported("reads a location it wrote")
             if isinstance(loc, Field):
                 self.node(loc.base, loc.offset, ctype)
             elif isinstance(loc, Elem):
@@ -719,8 +832,12 @@ class _Executor:
                 out.global_objs.discard(value.loc.sym)
                 stmts.append(VtStore(value.loc.sym, loc.offset, seq))
                 return
-            if isinstance(value, (Offset, AddrOf, HaPart)):
-                raise Unsupported("stores a pointer value (constructor or pointer field)")
+            if isinstance(value, Offset):
+                value = _resolve_offset(out, value, self.this_is_object)     # &member (with evidence)
+            if isinstance(value, AddrOf) and isinstance(value.loc, GlobalObj) and value.loc.sym.startswith("__vt__"):
+                raise Unsupported("stores a vtable pointer outside a constructor")
+            if isinstance(value, HaPart):
+                raise Unsupported("stores half an address")
             if isinstance(value, Param) and value.reg.startswith("r"):
                 if value in self.as_base:
                     raise Unsupported(f"{value.reg} is used both as a value and as a pointer")
@@ -790,6 +907,23 @@ class _Executor:
             put(a[0], Op(sym, (self.as_value(get(a[1])), Const(_imm(a[2]))), "int"))
             if op == "andi.":
                 st.cr["cr0"] = ("signed", st.regs[a[0]], Const(0))
+        elif op in _ROTATE_FORMS:
+            sh, mb, me = _ROTATE_FORMS[op](*(_imm(x) for x in a[2:]))
+            put(a[0], _rotated(self.as_value(get(a[1])), sh % 32, _mask(mb, me)))
+        elif op in _INSERT_FORMS:
+            sh, mb, me = _INSERT_FORMS[op](*(_imm(x) for x in a[2:]))
+            mask = _mask(mb, me)
+            base, value = self.as_value(get(a[0])), self.as_value(get(a[1]))
+            kept = Op("&", (base, Const(_s32(~mask & 0xFFFFFFFF))), "int")
+            put(a[0], Op("|", (kept, _rotated(value, sh % 32, mask)), "int"))
+        elif op in ("slw", "srw", "sraw"):
+            sym = {"slw": "<<", "srw": ">>u", "sraw": ">>"}[op]
+            put(a[0], Op(sym, (self.as_value(get(a[1])), self.as_value(get(a[2]))), "int"))
+        elif op == "addis":
+            if _SYMREF.match(a[2]):
+                raise Unsupported("addis with a relocation")
+            src, k = get(a[1]), _s32(_imm(a[2]) << 16)
+            put(a[0], Const(_s32(src.value + k)) if isinstance(src, Const) else Op("+", (self.as_value(src), Const(k)), "int"))
         elif op == "subfic":
             put(a[0], Op("-", (Const(_imm(a[2])), self.as_value(get(a[1]))), "int"))
         elif op in ("slwi", "srwi", "srawi"):
@@ -1138,8 +1272,8 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
         t = _target(insn)
         if t is not None and (insn.op == "b" or _BRANCH.match(insn.op)):
             j = resolve(t)
-            if j <= i:
-                raise Unsupported("loop (backward branch)")
+            if j <= i and not _BRANCH.match(insn.op):
+                raise Unsupported("loop closed by an unconditional branch")
             starts.add(j)
             starts.add(i + 1)
         elif insn.op in ("blr", "b") or _BRANCH.match(insn.op) or insn.op.startswith("bdnz"):
@@ -1168,12 +1302,44 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
             return [k + 1, block_of[resolve(t)]] if k + 1 < len(blocks) else [block_of[resolve(t)]]
         return [k + 1] if k + 1 < len(blocks) else [EXIT]
 
-    if len(blocks) > 12 or sum(_BRANCH.match(insns[e - 1].op) is not None for _, e in blocks) > 4:
+    if len(blocks) > 96 or sum(_BRANCH.match(insns[e - 1].op) is not None for _, e in blocks) > 48:
         raise Unsupported("control flow too large")
+    # loops: a conditional branch back to an earlier block (header h .. latch k); a rotated
+    # loop is entered by a `b` from before h straight to the latch (the test)
+    latches: dict[int, int] = {}                 # latch block -> header block
+    for k, (s0, e0) in enumerate(blocks):
+        last = insns[e0 - 1]
+        t = _target(last)
+        if t is not None and _BRANCH.match(last.op) and block_of[resolve(t)] <= k:
+            latches[k] = block_of[resolve(t)]
+    headers = list(latches.values())
+    if len(set(headers)) != len(headers):
+        raise Unsupported("two loops sharing a header")
+    spans = sorted((h, k) for k, h in latches.items())
+    for (h1, k1), (h2, k2) in zip(spans, spans[1:]):
+        if h2 <= k1 and not k2 <= k1:
+            raise Unsupported("overlapping loops")
+    entry_jump: dict[int, int] = {}              # preheader block -> latch (rotated loops)
+    for k, h in latches.items():
+        pre = h - 1
+        if pre >= 0:
+            last = insns[blocks[pre][1] - 1]
+            t = _target(last)
+            if last.op == "b" and t is not None and block_of[resolve(t)] == k:
+                entry_jump[pre] = k
+        for j in range(h, k + 1):                # no jumps into or out of the loop body
+            for x in succs(j):
+                if x != EXIT and not h <= x <= k + 1 and not (j == k and x == k + 1):
+                    raise Unsupported("loop with a break or a jump out")
+        for j in range(0, len(blocks)):
+            if j < h or j > k:
+                for x in succs(j):
+                    if h < x <= k and not (j in entry_jump and x == k):
+                        raise Unsupported("jump into a loop body")
     # immediate post-dominators (acyclic, so a reverse pass over blocks in address order)
     pdom: dict[int, set[int]] = {EXIT: {EXIT}}
     for k in range(len(blocks) - 1, -1, -1):
-        ss = succs(k)
+        ss = [x for x in succs(k) if x == EXIT or x > k]      # back edges are loops, not joins
         common = set.intersection(*(pdom[x] for x in ss))
         pdom[k] = {k} | common
 
@@ -1182,11 +1348,112 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
         return min(cands, key=lambda x: len(pdom[x]) * -1 if x != EXIT else 0) if len(cands) > 1 else next(iter(cands))
 
     executed: set[int] = set()
+    in_loop: set[int] = set()                    # loop headers being lifted (their body starts there)
+    _PURE = {"li", "lis", "mr", "addi", "subi", "ori", "lwz", "lhz", "lha", "lbz", "lfs", "lfd", "fmr", "neg",
+             "extsb", "extsh", "clrlwi", "slwi", "srwi", "srawi", "rlwinm", "extrwi", "b", "blr"}
+
+    def pure(k: int) -> bool:
+        """A block that only computes registers (a shared `li r3, 0` of short-circuit code):
+        running it once per path that reaches it changes nothing."""
+        s0, e0 = blocks[k]
+        return all(i.op in _PURE and not (len(i.args) > 1 and i.args[1].endswith("(r1)")) for i in insns[s0:e0]) \
+            and not any(h <= k <= l for l, h in latches.items())
+
+    def loop_registers(h: int, k: int, rotated: bool) -> tuple[list[str], set[str]]:
+        """(carried: read before written in one iteration and written in it, written)."""
+        order = list(range(k, k + 1)) + list(range(h, k)) if rotated else list(range(h, k + 1))
+        written: set[str] = set()
+        live: list[str] = []
+        for j in order:
+            s0, e0 = blocks[j]
+            for insn in insns[s0:e0]:
+                reads, writes = _reads_writes(insn, ex.signature)
+                for r in reads:
+                    if r not in written and r not in live and r not in ("r1", "r2", "r13"):
+                        live.append(r)
+                if insn.op in ("bl", "bctrl"):
+                    writes = list(writes) + _VOLATILE
+                written.update(writes)
+        return [r for r in live if r in written], written
+
+    def run_loop(h: int, k: int, rotated: bool, st: _State, stmts: list) -> _State:
+        carried, written = loop_registers(h, k, rotated)
+        inits, body_st = [], st.copy()
+        for r in carried:
+            if r not in st.regs:
+                raise Unsupported(f"loop variable {r} has no value before the loop")
+            var = VarRef(f"v{r[1:]}" if r[0] == "r" else f"fv{r[1:]}")
+            init = ex.get(st, r)
+            inits.append((var, init))
+            body_st.regs[r] = var
+        body_st.stored = set()
+        body_st.cr = {}
+        latch_s, latch_e = blocks[k]
+        cond_stmts: list = []
+        if rotated:                                         # the test runs first, on the variables
+            test_st = body_st.copy()
+            for i in range(latch_s, latch_e - 1):
+                ex.step(test_st, i, insns[i], cond_stmts)
+            body, end_st, ended = run(h, k, body_st)
+            if ended:
+                raise Unsupported("loop body that always returns")
+        else:
+            body, end_st, ended = run(h, k, body_st)
+            if ended:
+                raise Unsupported("loop body that always returns")
+            test_st = end_st
+            for i in range(latch_s, latch_e - 1):
+                ex.step(test_st, i, insns[i], body)
+            end_st = test_st
+        if cond_stmts:
+            raise Unsupported("a loop test with side effects")
+        executed.add(k)
+        last = insns[latch_e - 1]
+        field_ = last.args[0] if len(last.args) > 1 else "cr0"
+        if field_ not in test_st.cr:
+            raise Unsupported("loop branch on a condition the lifter did not see")
+        kind, x, y = test_st.cr[field_]
+        cond = Op(_CMP_OF[_BRANCH.match(last.op)[1]], (x, y), "float" if kind == "float" else "int")   # taken: loop again
+        updates = []
+        new_values = {}
+        for var, _ in inits:
+            r = next(rr for rr in carried if (f"v{rr[1:]}" if rr[0] == "r" else f"fv{rr[1:]}") == var.name)
+            new = end_st.regs.get(r)
+            if new is None:
+                raise Unsupported(f"loop variable {r} clobbered in the loop")
+            if new != var:
+                updates.append((var, new))
+                new_values[new] = var
+        if not rotated:                                     # do-while: the test sees the updated values
+            cond = _substitute(cond, new_values)
+        for x_ in _walk(cond):
+            if isinstance(x_, VarRef) and x_ in {v for v, _ in updates} and not rotated and x_ not in new_values.values():
+                pass
+        for var, init in inits:
+            out.var_types.setdefault(var, init)
+        stmts.append(Loop("while" if rotated else "do", cond, body, inits, updates, blocks[h][0]))
+        after = st.copy()
+        for r in written:
+            after.regs.pop(r, None)
+            after.clobbered.add(r)
+        for var, _ in inits:
+            r = next(rr for rr in carried if (f"v{rr[1:]}" if rr[0] == "r" else f"fv{rr[1:]}") == var.name)
+            after.regs[r] = var
+            after.clobbered.discard(r)
+        after.stored, after.cr = set(), {}
+        return after
 
     def run(k: int, stop: int, st: _State) -> tuple[list, _State, bool]:
         stmts: list = []
         while k != stop and k != EXIT:
-            if k in executed:
+            if k in latches.values() and k not in executed and k not in in_loop:
+                latch = next(l for l, hh in latches.items() if hh == k)
+                in_loop.add(k)
+                rotated = (k - 1) in entry_jump
+                st = run_loop(k, latch, rotated, st, stmts)
+                k = latch + 1
+                continue
+            if k in executed and not pure(k):
                 raise Unsupported("code shared by two branches (goto-like flow)")
             executed.add(k)
             s, e = blocks[k]
@@ -1200,6 +1467,9 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
                 out.ret_fp = out.ret_fp or fp
                 out.void_first = out.void_first or void_first
                 return stmts, st, True
+            if k in entry_jump:                                    # b to the loop test: the loop follows
+                k = k + 1
+                continue
             if last.op == "b" and _target(last) is None:          # tail call
                 call = ex.call(st, e - 1, last.args[0], stmts)
                 stmts.append(Return(CallResult(call, False), e - 1))
@@ -1215,10 +1485,12 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
                 j = ipdom(k)
                 then, st_then, exit_then = run(k + 1, j, st.copy())
                 other, st_other, exit_other = run(block_of[resolve(_target(last))], j, st.copy())
-                stmts.append(If(cond, then, other, e - 1))
+                node = If(cond, then, other, e - 1)
+                ex.ifs[e - 1] = node
+                stmts.append(node)
                 if exit_then and exit_other:
                     return stmts, st_then, True
-                st = st_other if exit_then else st_then if exit_other else _merge(cond, st_then, st_other)
+                st = st_other if exit_then else st_then if exit_other else _merge(cond, st_then, st_other, e - 1)
                 k = j
                 continue
             k = succs(k)[0]
@@ -1233,11 +1505,20 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
     out.regs, out.written = st.regs, st.written
 
 
-def _merge(cond, a: _State, b: _State) -> _State:
+def _substitute(e, mapping: dict):
+    """Replace subexpressions (the loop's new values) by loop variables."""
+    if e in mapping:
+        return mapping[e]
+    if isinstance(e, Op):
+        return Op(e.op, tuple(_substitute(x, mapping) for x in e.args), e.ctype)
+    return e
+
+
+def _merge(cond, a: _State, b: _State, site: int = -1) -> _State:
     regs = {}
     for reg in set(a.regs) & set(b.regs):
         va, vb = a.regs[reg], b.regs[reg]
-        regs[reg] = va if va == vb else Phi(cond, va, vb)
+        regs[reg] = va if va == vb else Phi(cond, va, vb, site)
     return _State(regs, a.written | b.written, a.clobbered | b.clobbered, a.stored | b.stored, {},
                   None, a.fresh & b.fresh)
 
@@ -1253,11 +1534,43 @@ def location_key(b):
     return b
 
 
+def _merge_node(out: Lifted, b, r) -> None:
+    """Fold object b's layout into object r's and make b an alias of r."""
+    out.nodes.setdefault(r, {})
+    for off, ctype in out.nodes.pop(b, {}).items():
+        old = out.nodes[r].get(off)
+        if old and old != ctype and {old, ctype} not in ({"short", "unsigned short"}, {"int", "unsigned int"}):
+            raise Unsupported(f"field +0x{off:X} accessed as {old} and {ctype}")
+        out.nodes[r][off] = ctype if not old or ctype.startswith("unsigned") else old
+    out.embedded.setdefault(r, set()).update(out.embedded.pop(b, set()))
+    if b in out.vptrs:
+        v = out.vptrs.pop(b)
+        if out.vptrs.setdefault(r, v) != v:
+            raise Unsupported("two vtable pointers")
+    if b in out.bound:
+        q = out.bound.pop(b)
+        if out.bound.setdefault(r, q) != q:
+            raise Unsupported("one object used as two classes")
+    out.alias[b] = r
+
+
 def _canonicalize(out: Lifted) -> None:
     """The same pointer read twice (two loads of one location) is one object: merge their
-    layouts under the first load, so the object gets one placeholder type."""
+    layouts under the first load, so the object gets one placeholder type. Results of one
+    callee share a type, and a loop or merged variable has its initial value's type."""
     key = location_key
     rep: dict = {}
+    by_callee: dict = {}
+    for b in [b for b in out.nodes if isinstance(b, CallResult)]:
+        first = by_callee.setdefault(b.call.callee, b)
+        if first is not b:
+            _merge_node(out, b, first)
+    for var, init in list(out.var_types.items()):
+        if var in out.nodes and isinstance(init, (Param, Load, CallResult)) and not isinstance(init, VarRef):
+            target = out.alias.get(init, init)
+            if isinstance(target, Load):
+                target = next((r for r in out.nodes if isinstance(r, Load) and location_key(r) == location_key(target)), target)
+            _merge_node(out, var, target)
     for b in sorted(list(out.nodes), key=lambda b: b.seq if isinstance(b, Load) else -1):
         k = key(b)
         if k not in rep:
@@ -1327,14 +1640,19 @@ def float_literal(raw: bytes) -> str:
         (v,) = struct.unpack(">f", raw)
         if v != v or v in (float("inf"), float("-inf")) or (v == 0 and raw[0] & 0x80):
             raise Unsupported("special float literal")
+        def same(t: str) -> bool:
+            try:
+                return struct.pack(">f", float(t)) == raw
+            except OverflowError:                       # rounded past the float range
+                return False
         for digits in range(1, 18):
             text = f"{v:.{digits}g}"
-            if struct.pack(">f", float(text)) == raw:
+            if same(text):
                 break
         if "e" in text and 1e-5 <= abs(v) < 1e9:       # prefer plain decimals: 60.0f, not 6e+01f
             for places in range(0, 12):
                 fixed = f"{v:.{places}f}"
-                if struct.pack(">f", float(fixed)) == raw:
+                if same(fixed):
                     text = fixed
                     break
         text = text if any(c in text for c in ".e") else text + ".0"
@@ -1417,6 +1735,13 @@ class Renderer:
                         t = pointer_type(x)
                         if t and untyped(y) and not isinstance(y, Const):
                             self.l.expected[y] = t
+        pairs = [(a.var, a.value) for a in _flatten(self.l.tree) if isinstance(a, Assign)]
+        for lp in (st for st in _flatten(self.l.tree) if isinstance(st, Loop)):
+            pairs += lp.inits + lp.updates
+        for var, value in pairs:
+            t = pointer_type(var)
+            if t and not isinstance(value, Const) and value not in self.l.expected and self.rep(value) not in self.l.nodes:
+                self.l.expected[value] = t
         for st in self.l.stores:
             if isinstance(st.loc, Field) and untyped(st.value):
                 try:
@@ -1429,6 +1754,9 @@ class Renderer:
     def roots_all(self) -> list:
         roots = [st.value for st in self.l.stores] + [a for c in self.l.calls for a in c.args]
         roots += [st.cond for st in _flatten(self.l.tree) if isinstance(st, If)]
+        for lp in (st for st in _flatten(self.l.tree) if isinstance(st, Loop)):
+            roots += [lp.cond] + [v for _, v in lp.inits] + [v for _, v in lp.updates]
+        roots += [a.value for a in _flatten(self.l.tree) if isinstance(a, Assign)]
         roots += [self.l.ret] + [st.value for st in _flatten(self.l.tree) if isinstance(st, Return)]
         return [r for r in roots if r is not None]
 
@@ -1566,6 +1894,10 @@ class Renderer:
             return self.temps[e]
         if isinstance(e, CallResult):
             raise Unsupported("call result used without a temporary")
+        if isinstance(e, VarRef):
+            return e.name
+        if isinstance(e, Raw):
+            return e.text
         if isinstance(e, Param):
             if self.n.member and e.reg == "r3":
                 return "this"
@@ -1616,6 +1948,11 @@ class Renderer:
             return f"(short){a[0]}"
         if e.op == ">>u":
             return f"(unsigned int){a[0]} >> {a[1]}"
+        if e.op in ("&", "|", "^") and isinstance(e.args[1], Const) and not 0 <= e.args[1].value < 10:
+            v = e.args[1].value & 0xFFFFFFFF
+            inverse = ~v & 0xFFFFFFFF
+            mask = f"~0x{inverse:X}" if inverse < v and inverse else f"0x{v:X}"
+            return f"{a[0]} {e.op} {mask}"
         return f"{a[0]} {e.op} {a[1]}"
 
     # types
@@ -1634,6 +1971,14 @@ class Renderer:
             return "float" if e.fp else "unsigned int" if e in self.l.unsigned_results else "int"
         if isinstance(e, Phi):
             return self.ctype_of(e.then, bool_ret)
+        if isinstance(e, VarRef):
+            if self.rep(e) in self.l.nodes:
+                return f"{self.type_name(e)}*"
+            vp = self.via_pointer_type(e)
+            if vp:
+                return vp
+            init = self.l.var_types.get(e)
+            return self.ctype_of(init) if init is not None and not isinstance(init, VarRef) else "int"
         if isinstance(e, Load) and self.rep(e) in self.l.nodes:
             return f"{self.type_name(e)}*"
         if isinstance(e, Load) and e in self.l.expected:
@@ -1701,9 +2046,10 @@ class Renderer:
         return "::".join(q) if q else re.sub(r"\W", "_", self.type_name(base)) + f"_m{offset:X}"
 
     def type_name(self, base) -> str:
+        base = self.rep(base)
         if isinstance(base, Param) and self.n.member and base.reg == "r3":
             return self.n.this_type
-        return self.bound_class(base) or self.n.types[self.rep(base)]
+        return self.bound_class(base) or self.n.types[base]
 
     def field_type(self, base, offset: int) -> str:
         """A field's type: a pointer to the object loaded from it, else a pointer stored into
@@ -1943,12 +2289,75 @@ class Renderer:
                 count[load] = count.get(load, 0) + 1
         return {l for l, n in count.items() if n >= 2}
 
+    def short_circuit(self, tree: list):
+        """[..., If(conditions), Return(0/1 merged)] -> [..., return a && f(b) != 0;]
+
+        Short-circuit code branches to one shared false block, and its conditions may call
+        functions; when the If arms hold nothing but those calls (results used only by the
+        conditions), the whole thing is one boolean expression."""
+        if len(tree) < 2 or not isinstance(tree[-1], Return) or not isinstance(tree[-2], If):
+            return None
+        calls: dict = {}
+
+        def arms_ok(arm: list) -> bool:
+            for st in arm:
+                if isinstance(st, Call):
+                    calls[st] = None
+                elif isinstance(st, If):
+                    if not (arms_ok(st.then) and arms_ok(st.other)) or st.decls:
+                        return False
+                else:
+                    return False
+            return True
+        if not arms_ok([tree[-2]]):
+            return None
+
+        def cond_text(c) -> str:
+            mapping = {}
+            for x in _walk(c):
+                if isinstance(x, CallResult) and x.call in calls:
+                    mapping[x] = Raw(self.call_text(x.call))
+            return self.expr(_substitute(_simplify(c), mapping), False)
+
+        def fold(e) -> str:
+            if e == Const(1):
+                return "true"
+            if e == Const(0):
+                return "false"
+            if isinstance(e, Phi):
+                if e.other == Const(0):
+                    rest = fold(e.then)
+                    return cond_text(e.cond) if rest == "true" else f"{cond_text(e.cond)} && {rest}"
+                if e.then == Const(1):
+                    rest = fold(e.other)
+                    return cond_text(e.cond) if rest == "false" else f"{cond_text(e.cond)} || {rest}"
+            raise Unsupported("not a short-circuit value")
+        try:
+            text = fold(tree[-1].value)
+        except Unsupported:
+            return None
+        # every call result must be used by a condition only
+        used = {x for st in [tree[-1]] for x in _walk(st.value) if isinstance(x, CallResult)}
+        if any(CallResult(c, False) not in used for c in calls) or text in ("true", "false"):
+            return None
+        return tree[:-2] + [Return(Raw(text), tree[-1].seq)]
+
     def body_tree(self, ret_mode: str) -> list[str]:
         """Nested if/else and early returns, in address order. Temporaries as in body_flat:
         a load invalidated (by a store to it or any call) before its use is declared right
         after it was read; a call result used later gets one."""
         self.temps = {}
-        flat = list(_flatten(self.l.tree))
+        tree = self.l.tree
+        if getattr(self, "fold_bool", ""):
+            folded = self.short_circuit(tree)
+            if folded is None:
+                raise Unsupported("no short-circuit form")
+            if self.fold_bool == "if":            # if (a && b) { return 1; } return 0;
+                cond = folded[-1].value
+                folded = folded[:-1] + [If(cond, [Return(Const(1), folded[-1].seq)], [], folded[-1].seq),
+                                        Return(Const(0), folded[-1].seq)]
+            tree = folded
+        flat = list(_flatten(tree))
         void = ret_mode == "void"
 
         def exprs(st) -> list:
@@ -1958,6 +2367,10 @@ class Renderer:
                 return list(st.args)
             if isinstance(st, If):
                 return [st.cond]
+            if isinstance(st, Loop):
+                return [st.cond] + [v for _, v in st.inits] + [v for _, v in st.updates]
+            if isinstance(st, Assign):
+                return [st.value]
             return [] if void or st.value is None else [st.value]
 
         def seq_of(st) -> int:
@@ -2033,11 +2446,13 @@ class Renderer:
                         lines.append(f"{pad}{text};")
                 elif isinstance(st, If):
                     then, other, cond = st.then, st.other, _simplify(st.cond)
-                    if not then and not other:
+                    if not then and not other and not st.decls:
                         k += 1                  # the branch only selects a value (a ternary)
                         continue
                     if not then and other:
                         then, other, cond = other, [], _negate(cond)
+                    for var in st.decls:
+                        lines.append(f"{pad}{self.ctype_of(var)} {declare(var.name)};")
                     checked(cond)
                     lines.append(f"{pad}if ({self.expr(cond)}) {{")
                     scopes.append(set())
@@ -2049,6 +2464,24 @@ class Renderer:
                         emit(other, depth + 1, False)
                         scopes.pop()
                     lines.append(f"{pad}}}")
+                elif isinstance(st, Assign):
+                    checked(st.value)
+                    lines.append(f"{pad}{st.var.name} = {self.expr(st.value)};")
+                elif isinstance(st, Loop):
+                    for var, init in st.inits:
+                        checked(init)
+                        lines.append(f"{pad}{self.ctype_of(var)} {declare(var.name)} = {self.expr(init)};")
+                    if st.kind == "while":
+                        lines.append(f"{pad}while ({self.expr(_simplify(st.cond))}) {{")
+                    else:
+                        lines.append(f"{pad}do {{")
+                    scopes.append(set())
+                    emit(st.body, depth + 1, False)
+                    for var, value in st.updates:
+                        checked(value)
+                        lines.append(f"{pad}    {var.name} = {self.expr(value)};")
+                    scopes.pop()
+                    lines.append(f"{pad}}}" if st.kind == "while" else f"{pad}}} while ({self.expr(_simplify(st.cond))});")
                 elif isinstance(st, Return):
                     last = top and k == len(block) - 1
                     if void:
@@ -2061,7 +2494,7 @@ class Renderer:
                         lines.append(f"{pad}return {self.expr(_simplify(st.value))};")
                 k += 1
 
-        emit(self.l.tree, 1, True)
+        emit(tree, 1, True)
         return lines
 
     def body_flat(self, order: list[Store], ret_mode: str) -> list[str]:
@@ -2152,6 +2585,9 @@ class Renderer:
         roots = [st.value for st in self.l.stores] + [st.loc.base for st in self.l.stores if isinstance(st.loc, Field)]
         roots += [a for c in self.l.calls for a in c.args]
         roots += [st.cond for st in _flatten(self.l.tree) if isinstance(st, If)]
+        for lp in (st for st in _flatten(self.l.tree) if isinstance(st, Loop)):
+            roots += [lp.cond] + [v for _, v in lp.inits] + [v for _, v in lp.updates]
+        roots += [a.value for a in _flatten(self.l.tree) if isinstance(a, Assign)]
         if self.ret_used:
             roots += [self.l.ret] + [st.value for st in _flatten(self.l.tree) if isinstance(st, Return)]
         return roots
@@ -2251,10 +2687,12 @@ def _flatten(tree: list):
         if isinstance(st, If):
             yield from _flatten(st.then)
             yield from _flatten(st.other)
+        elif isinstance(st, Loop):
+            yield from _flatten(st.body)
 
 
 def has_flow(lifted) -> bool:
-    return any(isinstance(st, (If, Return)) for st in lifted.tree)
+    return any(isinstance(st, (If, Return, Loop)) for st in lifted.tree)
 
 
 def return_value(lifted):
@@ -2272,6 +2710,7 @@ class Variant:
     ret_mode: str               # "return" | "bool" | "void"
     cache: bool = False         # values read once but used by several statements go in locals
     locals_desc: bool = False   # declare stack locals from the highest offset down
+    fold: str = ""              # "expr": return a && b;  "if": if (a && b) return 1; return 0;
 
 
 def variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
@@ -2290,7 +2729,16 @@ def _variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
         if all(isinstance(_simplify(v), Op) and _simplify(v).op in ("==", "!=") or v == Const(0) or v == Const(1)
                for v in values if v is not None):
             modes.insert(modes.index("return"), "bool")
-        return [Variant((), m) for m in modes] + [Variant((), m, True) for m in modes]
+        out = [Variant((), m) for m in modes] + [Variant((), m, True) for m in modes]
+        def bool_tree(v) -> bool:
+            if isinstance(v, Phi):
+                return bool_tree(v.then) and bool_tree(v.other)
+            return v in (Const(0), Const(1))
+        if any(isinstance(v, Phi) and bool_tree(v) for v in values):   # return a && f(b) != 0;  /  if (...) return 1;
+            folds = [Variant((), "bool", fold="expr"), Variant((), "bool", fold="if"), Variant((), "return", fold="if")]
+            at = 1 if lifted.void_first and out and out[0].ret_mode == "void" else 0
+            out[at:at] = folds
+        return out
     stores = lifted.stores
     modes = ["void"] if lifted.ret is None else ["return"]
     if lifted.ret is not None:
@@ -2336,6 +2784,8 @@ def name_nodes(lifted: Lifted, prefix: str) -> dict[object, str]:
             t = f"{prefix}_arg{int(b.reg[1:]) - 3}"
         elif isinstance(b, CallResult):
             t = f"{prefix}_{b.call.callee}_ret"
+        elif isinstance(b, VarRef):
+            t = f"{prefix}_{b.name}"
         elif isinstance(b.loc, Elem):                      # pointer held in an array element
             t = f"{prefix}_a{b.loc.start:X}_e{b.loc.sub:X}"
         elif isinstance(b.loc, GlobalVar):                 # pointer held in a small global
@@ -2380,7 +2830,8 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
     sig = ", ".join(r.signature())
     fn_names = [fn_name] if display else [f"v{i}" for i in range(len(chosen))]
     value = return_value(lifted)
-    ret_types = [("void" if v.ret_mode == "void" else r.ctype_of(value, v.ret_mode == "bool")) for v in chosen]
+    ret_types = [("void" if v.ret_mode == "void" else "bool" if v.fold and v.ret_mode == "bool"
+                  else r.ctype_of(value, v.ret_mode == "bool")) for v in chosen]
     this_in_model = member and ("::" in this_type or tuple(this_type.split("::")) in r.classes())
     this_members = None
     if this_in_model and not display:
@@ -2438,6 +2889,7 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
     for v, t, n in zip(chosen, ret_types, fn_names):
         stores = [lifted.stores[i] for i in v.order]
         head = f"{t} {this_type}::{n}({sig})" if member else f'extern "C" {t} {n}({sig})'
+        r.fold_bool = v.fold
         lines = r.body(stores, v.ret_mode, v.cache)
         if lifted.locals:
             lines = r.local_decls(v.locals_desc) + lines
@@ -2468,6 +2920,11 @@ _MASK = {"l": 0xFFFF, "h": 0xFFFF, "ha": 0xFFFF, "sda21": 0x1FFFFF, "rel24": 0x0
 
 def compare(insns: list[Insn], obj: Elf, fn_symbol: str, literal, renames: dict | None = None,
             literal_info=None) -> str | None:
+    return compare_detail(insns, obj, fn_symbol, literal, renames, literal_info)[0]
+
+
+def compare_detail(insns: list[Insn], obj: Elf, fn_symbol: str, literal, renames: dict | None = None,
+                   literal_info=None) -> tuple[str | None, int]:
     """None if the compiled function equals the original, else the first difference.
 
     Relocated fields are masked; the target must be the same symbol and addend, except a
@@ -2479,27 +2936,28 @@ def compare(insns: list[Insn], obj: Elf, fn_symbol: str, literal, renames: dict 
     """
     fn = obj.functions().get(fn_symbol)
     if fn is None:
-        return f"{fn_symbol} missing from the compiled object"
-    if len(fn.code) != 4 * len(insns):
-        return f"size 0x{len(fn.code):X} vs 0x{4 * len(insns):X}"
+        return f"{fn_symbol} missing from the compiled object", 0
+    size_note = f"size 0x{len(fn.code):X} vs 0x{4 * len(insns):X}" if len(fn.code) != 4 * len(insns) else None
     relocs = {}
     for r in fn.relocs:                                   # HA/LO sit on the immediate halfword
         if (r.offset & ~3) in relocs:
-            return f"two relocations on instruction {r.offset // 4}"
+            return f"two relocations on instruction {r.offset // 4}", 0
         relocs[r.offset & ~3] = r
     for i, insn in enumerate(insns):
+        if 4 * i + 4 > len(fn.code):
+            return size_note, i
         ours = struct.unpack_from(">I", fn.code, 4 * i)[0]
         want = insn.reloc()
         got = relocs.get(4 * i)
         if want is None and got is None:
             if ours != insn.word:
-                return f"instruction {i} ({insn.op}) differs"
+                return f"instruction {i} ({insn.op}) differs", i
             continue
         if want is None or got is None or _KIND.get(got.type) != want[0]:
-            return f"instruction {i} ({insn.op}) relocation differs"
+            return f"instruction {i} ({insn.op}) relocation differs", i
         mask = _MASK[want[0]]
         if ours & ~mask != insn.word & ~mask:
-            return f"instruction {i} ({insn.op}) differs"
+            return f"instruction {i} ({insn.op}) differs", i
         kind, sym, addend = want
         access = LOADS.get(insn.op, STORES.get(insn.op, (None, None)))[1]
         info = literal_info(sym) if literal_info else None
@@ -2509,12 +2967,12 @@ def compare(insns: list[Insn], obj: Elf, fn_symbol: str, literal, renames: dict 
             sec = obj.section(got.target_section) if got.target_section else None
             start = got.target_value + got.addend
             if sec is None or sec.data[start:start + len(raw)] != raw:
-                return f"instruction {i}: literal value differs"
+                return f"instruction {i}: literal value differs", i
             if info and got.target_section != info[0]:
-                return f"instruction {i}: literal in {got.target_section}, original in {info[0]}"
+                return f"instruction {i}: literal in {got.target_section}, original in {info[0]}", i
         elif renames and renames.get(got.symbol) == sym and not got.target_section and got.addend == addend:
             pass
         elif got.symbol != sym or got.addend != addend:
             # (a same-named symbol this unit defines, like a vtable, is the same object linked)
-            return f"instruction {i}: refers to {got.symbol}+{got.addend:#x}, original {sym}+{addend:#x}"
-    return None
+            return f"instruction {i}: refers to {got.symbol}+{got.addend:#x}, original {sym}+{addend:#x}", i
+    return (size_note, len(insns)) if size_note else (None, len(insns))

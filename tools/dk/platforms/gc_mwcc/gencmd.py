@@ -48,6 +48,7 @@ class Result:
     source: str = ""            # display draft (exact only)
     notes: list[str] = field(default_factory=list)
     compiler: str = ""
+    closest: str = ""           # differs: how far the closest variant matched
 
 
 class Context:
@@ -291,19 +292,25 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
         # one variant the renderer got wrong must not hide the others: compile each alone
         objects = []
         for i, v in enumerate(chosen):
-            one, _ = gen.render_tu(lifted, member, "G", "v", [v], sizes)
+            try:
+                one, _ = gen.render_tu(lifted, member, verify_type, "v", [v], sizes)
+            except gen.Unsupported:
+                objects.append(None)
+                continue
             objects.append(_compile(ctx, command, one, work, f"{stem}_{i}")[0])
         if not any(objects):
             result.status, result.detail = "error", f"generator bug (draft does not compile): {error}"
             return result
-    first_diff = ""
+    first_diff, best = "", (-1, None)
     for i, v in enumerate(chosen):
         obj = objects[i]
         if obj is None:
             continue
         index = i if len(set(map(id, objects))) == 1 else 0
         sym_name = next((f for f in obj.functions() if re.match(rf"^v{index}(?:__|$)", f)), f"v{index}")
-        diff = gen.compare(insns, obj, sym_name, ctx.literal, literal_info=ctx.literal_info)
+        diff, matched = gen.compare_detail(insns, obj, sym_name, ctx.literal, literal_info=ctx.literal_info)
+        if diff is not None and matched > best[0]:
+            best = (matched, v, diff)
         if diff is None:
             try:
                 result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [v], sizes, display=True)
@@ -315,6 +322,13 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
             return result
         first_diff = first_diff or diff
     result.status, result.detail = "differs", f"no variant matched ({len(chosen)} tried): {first_diff}"
+    if best[1] is not None:                     # the closest variant, for --unverified
+        try:
+            result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [best[1]], sizes, display=True)
+            result.notes += lifted.notes
+            result.closest = f"{best[0]}/{len(insns)} instructions match, then: {best[2]}"
+        except gen.Unsupported:
+            result.source = ""
     return result
 
 
@@ -361,7 +375,11 @@ def solve_many(ctx: Context, names: list[str], jobs: int) -> list[Result]:
 
 
 def format_draft(r: Result) -> str:
-    lines = [f"// dk gen: exact draft for {r.name} (verified alone with GC/{r.compiler} and its unit's flags)"]
+    if r.status != "exact":
+        lines = [f"// dk gen: UNVERIFIED draft for {r.name} (closest variant, NOT exact: {r.closest})",
+                 "// start from it, then fix the differences with ./dk check and ./dk diff"]
+    else:
+        lines = [f"// dk gen: exact draft for {r.name} (verified alone with GC/{r.compiler} and its unit's flags)"]
     if r.notes:
         lines.append("// layout it relies on (offsets exact; names and int/word types are placeholders):")
         lines += [f"//   {n}" for n in r.notes]
@@ -394,7 +412,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         return USAGE
     results = solve_many(ctx, names, args.jobs)
     for r in results:
-        if r.status == "exact":
+        if r.status == "exact" or args.unverified and r.status == "differs" and r.source:
             print(format_draft(r) + "\n")
         else:
             print(f"// {r.name}: no draft ({r.status}): {r.detail}\n")
@@ -509,6 +527,8 @@ def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("--show", choices=("exact", "differs", "unsupported", "error", "skipped", "thunk"),
                    help="survey: also print each result with this status")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel compiles")
+    p.add_argument("--unverified", action="store_true",
+                   help="also print the closest NOT-exact draft of a function that lifts but does not match")
     p.add_argument("--regress", metavar="REV", help="compare with the generator at REV on the same functions (exit 1 if a draft is lost)")
 
 
