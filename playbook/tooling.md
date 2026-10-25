@@ -40,6 +40,12 @@
 - **Get the verifier reviewed independently.** Why: a second reader found five gaps the tests didn't cover (addends, literal section, address-of size, duplicate relocations, aliasing reorders).
 - **Byte-identical isn't fidelity.** `bl f; blr` is both `f();` and `return f();`, and a pass-through argument is invisible to a virtual call. Apply: decide return vs void from the callers (do they read the result register after the call?), and print a caveat where the asm can't decide.
 - **Rebuild compiler-shaped functions from metadata instead of lifting them.** Virtual destructors and constructors are mostly compiler output. Build the class chain from RTTI and vtable stores, compile `C::~C() {}`, and verify. Name an unnamed callee only on structural evidence (its own asm stores that base's vtable), and emit the rename for the agent.
+- **Enumerate source variants instead of hand-tweaking.** Why: agents matched faster with scripts that compiled every combination (declaration order, if/else vs ternary, helper vs inline) than by editing one guess at a time. Apply: a generator renders each variant, compiles all of them, and keeps the exact one.
+
+## Shared working trees
+
+- **Judge ratchets on the clean build a commit is made from, never on the shared tree.** Why: the shared tree also holds other agents' half-edited units, so its numbers come and go; a floor raised from them crept above what HEAD builds and then refused honest commits. Apply: build HEAD + the change in a clean worktree, compare that report with the committed floor, and commit the floor raised to it.
+- **Shared config files change entry by entry.** A unit's commit composes HEAD's copy plus only that unit's entries; committing the whole file would land other agents' unfinished entries.
 
 ## GC/Wii template quick start
 

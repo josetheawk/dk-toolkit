@@ -10,6 +10,7 @@ commit_overlay()  writes the overlay with git plumbing through a private index, 
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -42,7 +43,8 @@ def _drop(cfg: Config, tree: Path) -> None:
 
 
 def verify_overlay(cfg: Config, overlay: Overlay, timeout: int = 900, keep: bool = False,
-                   name: str = "verify") -> tuple[bool, str]:
+                   name: str = "verify", measures: dict | None = None) -> tuple[bool, str]:
+    """`measures`, when given, receives the clean tree's progress measures (what would be committed)."""
     tree = _worktree(cfg, name)
     try:
         for rel, data in overlay.items():
@@ -76,6 +78,9 @@ def verify_overlay(cfg: Config, overlay: Overlay, timeout: int = 900, keep: bool
                 return False, f"timeout after {timeout}s in {' '.join(step)}"
             if p.returncode != 0:
                 return False, tail(out, 30)
+        report = tree / cfg.rel(cfg.report)
+        if measures is not None and report.is_file():
+            measures.update(json.loads(report.read_text()).get("measures", {}))
         return True, "builds and matches"
     finally:
         if not keep:

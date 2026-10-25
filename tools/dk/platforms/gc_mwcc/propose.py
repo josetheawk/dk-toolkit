@@ -35,7 +35,22 @@ class Proposal:
         return out
 
 
-def propose(symbols: list[Symbol], entries: dict[str, AsmEntry], start: int, end: int) -> Proposal:
+def ctor_slots(dol, symbols: list[Symbol]) -> dict[int, int]:
+    """Static-initializer address -> its .ctors slot address (dtk names few of the slots)."""
+    starts = [s.address for s in symbols if s.section == ".ctors"]
+    section = dol.section_at(min(starts)) if starts else None
+    if section is None:
+        return {}
+    out = {}
+    for address in range(min(starts), section.end, 4):
+        value = int.from_bytes(dol.read(address, 4), "big")
+        if value:
+            out.setdefault(value, address)
+    return out
+
+
+def propose(symbols: list[Symbol], entries: dict[str, AsmEntry], start: int, end: int,
+            slots: dict[int, int] | None = None) -> Proposal:
     by_name = {s.name: s for s in symbols}
     functions = sorted((s for s in symbols if s.type == "function" and s.section == ".text" and start <= s.address < end),
                        key=lambda s: s.address)
@@ -91,6 +106,11 @@ def propose(symbols: list[Symbol], entries: dict[str, AsmEntry], start: int, end
         if new_included == included:
             break
         included = new_included
+    own = sorted(slots[f.address] for f in functions if slots and f.address in slots)
+    if own:
+        lo, hi = result.sections.get(".ctors", (own[0], own[-1] + 4))
+        result.sections[".ctors"] = (min(lo, own[0]), max(hi, own[-1] + 4))
+        result.members.setdefault(".ctors", [])
     included = {n for ms in result.members.values() for n in ms}
     all_refs = [r for f in result.functions if f in entries for r in entries[f].refs]
     result.extern_data = sorted({r for r in all_refs if r in data_syms and r not in included})
@@ -113,6 +133,15 @@ def _affinity(name: str, group: set[str], entries: dict[str, AsmEntry], data_of:
     if any(name in entries[d].refs for d in group_data if d in entries and entries[d].kind == "obj"):
         score += 2
     return score
+
+
+def self_contained(name: str, entries: dict[str, AsmEntry]) -> bool:
+    """A function that calls nothing and references only data no other function touches."""
+    e = entries.get(name)
+    if e is None or e.calls:
+        return False
+    users = referrers(entries)
+    return all(users.get(r, set()) <= {name} for r in e.refs)
 
 
 MARGIN = 2   # evidence a function needs to change TU: a vtable back-reference, or 2 more references
@@ -166,12 +195,13 @@ def adjust_tu_bounds(functions: list[Symbol], previous: list[Symbol], following:
     moved_in: list[str] = []
     here = {s.name for s in current}
     # dtk splits each __sinit into its own object right after its TU. It belongs here when it
-    # touches anything of this unit (one reference is enough: initializers are short).
+    # touches anything of this unit (one reference is enough: initializers are short), or when
+    # it touches only data of its own: a header's static initialised in every TU including it.
     if following and is_sinit(following[0]) and not is_sinit(current[-1]):
         sinit = following[0]
         later = {s.name for s in following[1:]}
         if (_affinity(sinit.name, here, entries, data_of)
-                - _affinity(sinit.name, later, entries, data_of)) >= 1:
+                - _affinity(sinit.name, later, entries, data_of)) >= 1 or self_contained(sinit.name, entries):
             following.pop(0)
             moved_in.append(sinit.name)
             here.add(sinit.name)

@@ -14,7 +14,6 @@ from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
 from ...core.util import run_ninja
-from ...core import floor
 from .matching import MatchError, commit_gate, resolve_unit, score
 from .unitcommit import commit_unit
 
@@ -37,7 +36,6 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         for prob in problems:
             print(f"REJECTED: {prob}")
         return MISMATCH
-    floor.raise_floor(cfg)
     message = f"WIP {rel}: {exact}/{len(s.functions)} functions exact\n"
     if args.note:
         message += "\n" + "\n".join(args.note) + "\n"
@@ -45,8 +43,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         message += "\n" + "\n".join(args.trailer) + "\n"
     ok, detail = commit_unit(cfg, unit, message)
     if not ok:
-        print(f"note: not committed ({detail})")
-        return OK
+        print(f"{'REJECTED' if detail.startswith('below the progress floor') else 'note: not committed'}: {detail}")
+        return MISMATCH if detail.startswith("below the progress floor") else OK
     print(f"committed: WIP {rel} ({exact}/{len(s.functions)} exact, {detail})")
     hint(f"check {rel}", "next")
     return OK

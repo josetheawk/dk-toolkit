@@ -108,9 +108,6 @@ class CliTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class KillSessionTest(unittest.TestCase):
     def test_kills_children_that_changed_process_group(self):
@@ -173,3 +170,20 @@ class ToolkitSyncTest(unittest.TestCase):
             self.assertEqual(removed, ["playbook/stale.md"])
             self.assertFalse((dst / "src").exists())
             self.assertEqual(toolkitcmd.plan(src, dst), ([], [], []))
+
+
+class FloorGateTest(unittest.TestCase):
+    def test_judged_on_given_measures_against_the_committed_floor(self):
+        from unittest import mock
+        from tools.dk.core import floor
+        committed = {"matched_functions": 10, "complete_code": 100, "complete_units": 2}
+        with mock.patch.object(floor, "committed", return_value=committed):
+            below, text = floor.gate(None, {"matched_functions": 9, "complete_code": 120, "complete_units": 2})
+            self.assertEqual(below, ["matched_functions 9 < floor 10"])
+            below, text = floor.gate(None, {"matched_functions": 12, "complete_code": "120", "complete_units": 2})
+            self.assertEqual(below, [])
+            self.assertEqual(floor.parse(text), {"matched_functions": 12, "complete_code": 120, "complete_units": 2})
+
+
+if __name__ == "__main__":
+    unittest.main()

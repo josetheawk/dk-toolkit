@@ -52,6 +52,8 @@ class ProposeTest(unittest.TestCase):
         self.assertNotIn(".sbss", p.sections)
         self.assertEqual(p.extern_data, ["g"])
         self.assertEqual(p.extern_calls, ["ext_fn"])
+        p = propose(symbols, entries, 0x1000, 0x1020, {0x1010: 0x6008, 0x1020: 0x600C})
+        self.assertEqual(p.sections[".ctors"], (0x6008, 0x600C))     # f2's unnamed .ctors slot
 
 
 if __name__ == "__main__":
@@ -82,6 +84,20 @@ class TuBoundsTest(unittest.TestCase):
         self.assertEqual(out, ["t"])                         # thunk into the previous TU, right after its __sinit
         self.assertEqual(inn, ["__sinit_a_cpp", "v"])        # own initializer, then the inline virtual it points at
         self.assertEqual([f.name for f in fns], ["a", "b", "__sinit_a_cpp", "v"])
+
+    def test_header_static_sinit_moves_in(self):
+        from pathlib import Path as P
+        from tools.dk.platforms.gc_mwcc.propose import adjust_tu_bounds
+        f = lambda n, a: Symbol(n, ".text", a, {"type": "function", "size": "10"})
+        e = lambda n, file, refs=(), calls=(): AsmEntry(n, "fn", P(file + ".s"), "", list(refs), list(calls))
+        entries = {"a": e("a", "auto_03_a"), "s": e("s", "auto_fn_s", refs=["static"]),
+                   "n": e("n", "auto_03_n"), "static": AsmEntry("static", "obj", P("x.s"), "", [], []),
+                   "ctor": AsmEntry("ctor", "obj", P("x.s"), "", ["s"], [])}
+        fns, _, inn = adjust_tu_bounds([f("a", 0)], [], [f("s", 0x10), f("n", 0x20)], entries)
+        self.assertEqual(inn, ["s"])                          # touches only its own static: this TU's
+        entries["n"] = e("n", "auto_03_n", refs=["static"])
+        fns, _, inn = adjust_tu_bounds([f("a", 0)], [], [f("s", 0x10), f("n", 0x20)], entries)
+        self.assertEqual(inn, [])                             # the static is shared with the next TU
 
     def test_no_move_without_sinit(self):
         from pathlib import Path as P

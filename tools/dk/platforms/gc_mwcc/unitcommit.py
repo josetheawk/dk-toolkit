@@ -209,14 +209,27 @@ def commit_unit(cfg: Config, unit: dict, message: str) -> tuple[bool, str]:
     overlay[opts["splits"]] = compose_splits(_head(cfg, opts["splits"]), work_splits, rel_unit, absorbed).encode()
     overlay[opts["symbols"]] = compose_symbols(_head(cfg, opts["symbols"]), (cfg.root / opts["symbols"]).read_text(),
                                                ranges, words).encode()
-    floor_rel = cfg.rel(floor.path(cfg))
-    if (cfg.root / floor_rel).is_file():
-        overlay[floor_rel] = (cfg.root / floor_rel).read_bytes()
-    ok, detail = verify_overlay(cfg, overlay)
+    measures: dict = {}
+    ok, detail = verify_overlay(cfg, overlay, measures=measures)
     if not ok:
         return False, ("this unit's delta does not build on top of HEAD by itself (it probably depends on "
                        "another uncommitted change; retry after that lands):\n" + detail)
-    return commit_overlay(cfg, overlay, message)
+    return commit_with_floor(cfg, overlay, measures, message)
+
+
+def commit_with_floor(cfg: Config, overlay: dict, measures: dict, message: str) -> tuple[bool, str]:
+    """Commit a verified overlay if its clean-tree progress is not below the committed floor,
+    raising the floor to it. Judged on the clean tree, never on the shared one (where other
+    agents' half-edited units come and go)."""
+    below, floor_text = floor.gate(cfg, measures)
+    if below:
+        return False, "below the progress floor: " + "; ".join(below)
+    floor_rel = cfg.rel(floor.path(cfg))
+    overlay[floor_rel] = floor_text.encode()
+    ok, detail = commit_overlay(cfg, overlay, message)
+    if ok:
+        floor.path(cfg).write_text(floor_text)
+    return ok, detail
 
 
 def _mangled_names(cfg: Config, unit: dict) -> set[str]:

@@ -47,7 +47,7 @@
 - `objdiff.json` and dtk's split objects are regenerated only when **ninja** runs the split step, not by `configure.py` alone. Apply: after editing `splits.txt`, run the build before diffing (`dk unit add` does).
 - `objdiff-cli diff -1 <target.o> -2 <base.o> -o - --format json` gives a one-shot, scriptable score (`left` = target side).
 - **dtk's static-initializer auto units start with the previous TU's tail.** A TU's factory functions and virtual-base thunks follow its `__sinit`, so the real boundary is a few functions after each auto-unit start. dtk also gives each `__sinit` its own object.
-  - Detect: move a leading function back to the previous TU only when that TU ends in a `__sinit`, and only if it is a thunk into it (2 instructions: `addi r3, r3, N` then `b` into the TU) or references it by at least 2 more calls/objects than its own unit. Move the next `__sinit` in only when it touches this unit (one reference is enough), then pull later functions in the same way.
+  - Detect: move a leading function back to the previous TU only when that TU ends in a `__sinit`, and only if it is a thunk into it (2 instructions: `addi r3, r3, N` then `b` into the TU) or references it by at least 2 more calls/objects than its own unit. Move the next `__sinit` in when it touches this unit (one reference is enough), or when it touches only data no other function references (a header's static, initialised in every TU that includes it: `li r0, K; stw r0, x`), then pull later functions in the same way.
   - Verify against units you have already matched: this rule reproduced every accepted boundary, while a plain affinity count (no `__sinit` gate, margin 1) got 48 of 53.
 - **The linker dead-strips data objects, not just functions.** Literals and statics used only by stripped functions, and globals nothing uses, vanish from the middle of `.sdata2`/`.bss`, and the rest pack together at their alignment. A byte diff can't line that up. Detect: code exact, data DIFF, and a dead-stripped function list. Apply: score by removing those objects, re-packing the kept ones in order, and comparing; the accept-time hash stays the final proof.
 - **wibo puts itself in its own process group.** Killing a hung build means killing ninja's whole session, not just its group, or hung `mwldeppc` processes keep spinning for hours.
@@ -59,6 +59,10 @@
 - **CodeWarrior mangling for calls:** `name__F<params>`, `name__<len><Class>[C]F<params>`, `Q<n>` for nested names. Return types aren't mangled, so a declaration may choose one freely.
 
 ## Compilers
+
+- **`-char signed` with GC 1.3:** a char compare emitting `cmplwi` where the target has `extsb.` means the unit was built with `-char signed`. Set it per unit (`./dk unit flags`).
+- **GC 1.3 vs 1.3.2 in a realigned frame:** `psq_st fN, …, 1, qr7` is GC 1.3; GC 1.3.2 emits `0, qr0`. GC 1.3 also auto-inlines less, so treat the compiler as per unit.
+- **An asm function with interior global labels can hang `mwldeppc`** when its unit is linked on its own. Declare the unit linked instead of linking it in isolation.
 
 - The template's compilers bundle has GC 1.0 through 3.0a5.2, Wii versions, and ProDG 3.5–3.9.3. `build/compilers/info.txt` maps each label to its mwcc build number.
 - `mw_comment_version` in `config.yml`: 8 = GC 1.0+, 10 = GC 1.3.2+, 11 = GC 2.7+, 14 = GC 3.0a3+.

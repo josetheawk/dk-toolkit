@@ -35,4 +35,16 @@ Group entries under a heading per compiler family. Add an entry only after it pr
 | `cmplwi` against 0 on a count | The field is unsigned |
 | `lfs`/`stfs` per field vs `lwz`/`stw` words | Assigning an all-float struct vs initializing a by-value local |
 | A pooled float one ulp off | Write the exact literal (e.g. `0.025000002f`) |
+| `fmuls` operand order: constant first vs variable first | `q * 2.0f` puts the literal first; `x *= K` puts the variable first |
+| A global re-read after every compare or store | The global is `volatile` |
+| `if (!a \|\| !b) return;` shape: `bne next; b exit` | Exactly that `\|\|` early return (not two separate `if`s) |
+| `bge; b; fmr` vs `cror` for a min/max | A ternary `t < 0 ? t : 0` gives the branches; a plain `if` gives `cror` |
+| `mulli; addi; lfsx` on an array element | The element was read through a reference: `T& e = a[i];` |
+| Saved registers differ across consecutive loops | Declare one shared `int i` for all the loops |
+| Callee-saved register numbers swapped between two locals | Locals get registers from r31 downward in declaration order; an inline accessor's result gets a lower one |
+| Literals in a different pool order | Pool order is creation order: reorder the expressions that first use them |
+| Stack locals of an inlined function in reverse order | Inlined functions' locals are laid out in reverse; reorder their declarations there |
+| An implicit `operator=` emitted at the end of the unit | Give the struct an inline user `operator=` (or copy fields), so no implicit one is generated |
+| A 4-byte empty `__sinit` | A global of a class with an empty inline constructor |
+| A vtable in an unexpected unit | The unit that defines the class's first non-inline virtual (its key function) emits it |
 

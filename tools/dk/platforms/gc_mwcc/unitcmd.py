@@ -17,7 +17,8 @@ from .dol import Dol
 from .dtk_symbols import boundary_fix, build_errors, caused_by, read_symbols, read_units, set_symbol_size
 from .elf import Elf
 from .matching import MatchError, resolve_unit
-from .propose import adjust_tu_bounds, propose
+from .dol import Dol
+from .propose import adjust_tu_bounds, ctor_slots, propose, self_contained
 from .units import (add_object, add_split_unit, read_units_file, remove_object, remove_split_unit, set_flags,
                     render_units_file, replace_split_unit)
 
@@ -256,6 +257,18 @@ def _neighbour_tu(ordered: list, entries: dict) -> list:
 def run_propose(cfg: Config, args: argparse.Namespace) -> int:
     symbols = read_symbols(cfg.root / cfg.platform_options["symbols"])
     by_name = {s.name: s for s in symbols}
+    if args.end is None and args.start not in by_name:   # one address: the function holding it
+        try:
+            address = int(args.start, 16)
+        except ValueError:
+            print(f"error: {args.start} is not a symbol or a hex address")
+            return USAGE
+        holder = next((s for s in symbols if s.type == "function" and s.section == ".text"
+                       and s.address <= address < s.address + max(s.size, 1)), None)
+        if holder is None:
+            print(f"error: no function at 0x{address:08X}")
+            return USAGE
+        args.start = holder.name
     if args.start in by_name:   # a function name: use the dtk unit (or declared unit) holding it
         sym = by_name[args.start]
         entries = asmindex.index(asmindex.current_asm_files(cfg))
@@ -270,7 +283,12 @@ def run_propose(cfg: Config, args: argparse.Namespace) -> int:
         after = [s for s in text_fns if s.address > fns[-1].address]
         previous = list(reversed(_neighbour_tu(list(reversed(before)), entries)))
         following = _neighbour_tu(after, entries)
-        if not args.raw:
+        declared = not holder.file.stem.startswith("auto_")
+        if declared and following and self_contained(following[0].name, entries) \
+                and entries[following[0].name].file.stem.startswith("auto_fn_"):
+            print(f"note: {following[0].name} right after this declared unit initialises only its own data "
+                  f"(a header static?): it likely belongs here; widen with ./dk unit set")
+        if not args.raw and not declared:   # a declared unit's range was chosen and linked: keep it
             fns, moved_out, moved_in = adjust_tu_bounds(fns, previous, following, entries)
             if moved_out:
                 print(f"note: {len(moved_out)} leading function(s) belong to the previous TU "
@@ -285,10 +303,11 @@ def run_propose(cfg: Config, args: argparse.Namespace) -> int:
             print("error: give START END as hex addresses, or a function name")
             return USAGE
         entries = asmindex.index(asmindex.current_asm_files(cfg))
-    p = propose(symbols, entries, start, end)
+    p = propose(symbols, entries, start, end, ctor_slots(Dol.parse(cfg.original.read_bytes()), symbols))
     print(f"text 0x{start:08X}-0x{end:08X}: {len(p.functions)} function(s)")
     for sec, (lo, hi) in sorted(p.sections.items(), key=lambda kv: kv[1]):
-        print(f"  {sec:<8} 0x{lo:08X}-0x{hi:08X}  {', '.join(p.members[sec][:8])}{' …' if len(p.members[sec]) > 8 else ''}")
+        names = ", ".join(p.members[sec][:8]) or "(static-initializer slot)"
+        print(f"  {sec:<8} 0x{lo:08X}-0x{hi:08X}  {names}{' …' if len(p.members[sec]) > 8 else ''}")
     if p.extern_data:
         print(f"extern data ({len(p.extern_data)}): {', '.join(p.extern_data[:12])}")
     if p.extern_calls:
@@ -349,7 +368,7 @@ def _configure(p: argparse.ArgumentParser) -> None:
     ft = sub.add_parser("fit", help="trim data ranges to the compiled sizes where the target tail is padding")
     ft.add_argument("path", help="unit source path relative to src/")
     pr = sub.add_parser("propose", help="propose a unit's full split (text + data) from a text range or function")
-    pr.add_argument("start", help="text start (hex) or a function name (uses the unit holding it)")
+    pr.add_argument("start", help="a function name or address (uses the unit holding it), or START with END")
     pr.add_argument("end", nargs="?", help="text end (hex), when start is an address")
     pr.add_argument("--path", help="source path to print in the suggested command")
     pr.add_argument("--raw", action="store_true", help="use dtk's auto unit as is (no TU-boundary adjustment)")

@@ -5,6 +5,7 @@ changes (tools/dk, tests, playbook, docs, dk.toml). In order, refusing at the fi
   1. the toolkit tests pass
   2. doc-lint passes
   3. HEAD plus exactly these paths builds and matches in a clean worktree
+  4. that build is not below the committed progress floor (which it raises)
 Then the paths are committed like a unit's delta (private index, compare-and-swap on HEAD).
 """
 
@@ -14,7 +15,7 @@ import argparse
 import subprocess
 import sys
 
-from . import doclint, isolated
+from . import doclint, floor, isolated
 from .command import MISMATCH, OK, USAGE, Command
 from .config import Config
 
@@ -42,14 +43,22 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print(f"  {p}")
         return MISMATCH
     overlay = isolated.working_overlay(cfg, args.paths)
-    ok, detail = isolated.verify_overlay(cfg, overlay)
+    measures: dict = {}
+    ok, detail = isolated.verify_overlay(cfg, overlay, measures=measures)
     if not ok:
         print(f"REFUSED: HEAD plus these paths does not build and match on its own:\n{detail}")
         return MISMATCH
+    below, floor_text = floor.gate(cfg, measures)
+    if below:
+        print("REFUSED: below the progress floor: " + "; ".join(below))
+        return MISMATCH
+    overlay[cfg.rel(floor.path(cfg))] = floor_text.encode()
     message = args.message
     for trailer in args.trailer:
         message += ("\n\n" if trailer == args.trailer[0] else "\n") + trailer
     ok, detail = isolated.commit_overlay(cfg, overlay, message)
+    if ok:
+        floor.path(cfg).write_text(floor_text)
     print(f"committed: {detail}" if ok else f"REFUSED: {detail}")
     return OK if ok else MISMATCH
 

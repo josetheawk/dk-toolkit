@@ -11,7 +11,6 @@ from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
 from ...core.util import run_ninja
 from ...core.progress import load_report
-from ...core import floor
 from .dtk_symbols import build_errors
 from .matching import MatchError, commit_gate, render, resolve_unit, score
 from .unitcommit import commit_unit
@@ -63,25 +62,21 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
     ok, output = _build(cfg)
     after = _matched_functions(cfg)
-    below = floor.check(cfg) if ok else []
-    if not ok or after < before or below:
-        reason = ("hash mismatch or build error after linking" if not ok
-                  else f"matched functions fell {before} -> {after}" if after < before
-                  else "below progress floor: " + "; ".join(below))
-        if not ok:
-            print(build_errors(output, 30))
-            if cfg.built.is_file() and "did NOT match" in output:
-                from .firstdiff import first_diff             # where the linked binary differs
-                print("first differences in the linked binary:")
-                for line in first_diff(cfg, cfg.built, cfg.original, 6):
-                    print(f"  {line}")
-        units_path.write_text(original_units)
-        _build(cfg)
-        print(f"REJECTED: {reason}; units.toml restored")
-        return MISMATCH
+    # The shared tree also holds other agents' half-edited units, so its numbers only warn;
+    # the floor is enforced on the clean HEAD + this unit build that the commit is made from.
+    if ok and after < before:
+        print(f"note: matched functions in the shared tree fell {before} -> {after}; "
+              f"the commit's clean build is checked against the floor")
+    if not ok:
+        print(build_errors(output, 30))
+        if cfg.built.is_file() and "did NOT match" in output:
+            from .firstdiff import first_diff             # where the linked binary differs
+            print("first differences in the linked binary:")
+            for line in first_diff(cfg, cfg.built, cfg.original, 6):
+                print(f"  {line}")
+        return _restore(cfg, units_path, original_units, "hash mismatch or build error after linking")
     print(f"ACCEPTED: {unit['name']} linked, hash OK, matched functions {before} -> {after}")
 
-    floor.raise_floor(cfg)
     if args.no_commit:
         return OK
     names = ", ".join(f.name for f in s.functions) or "(data only)"
@@ -89,9 +84,18 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if args.trailer:
         message += "\n" + "\n".join(args.trailer) + "\n"
     ok, detail = commit_unit(cfg, unit, message)
+    if not ok and detail.startswith("below the progress floor"):
+        return _restore(cfg, units_path, original_units, detail)
     print(f"committed: Match {rel_source} ({detail})" if ok else f"note: not committed ({detail})")
     hint("next", "status")
     return OK
+
+
+def _restore(cfg: Config, units_path: Path, original: str, reason: str) -> int:
+    units_path.write_text(original)
+    _build(cfg)
+    print(f"REJECTED: {reason}; units.toml restored")
+    return MISMATCH
 
 
 def _configure(p: argparse.ArgumentParser) -> None:
