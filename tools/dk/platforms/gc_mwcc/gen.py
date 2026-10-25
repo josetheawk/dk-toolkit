@@ -215,6 +215,7 @@ class Lifted:
     ret: object | None = None
     ret_fp: bool = False
     void_first: bool = False
+    strides: dict = field(default_factory=dict)   # loop pointer -> bytes it steps per iteration
 
 
 _ROTATE_FORMS = {
@@ -497,8 +498,8 @@ class VarRef:           # a loop variable (a register carried around a loop)
 
 @dataclass
 class Loop:
-    kind: str           # "while" (test first) | "do" (test last)
-    cond: object        # the loop runs again while it holds (in terms of the updated variables)
+    kind: str           # "while" (test first) | "do" (test last) | "for" (counted: runs `cond` times)
+    cond: object        # the loop runs again while it holds (in terms of the updated variables); for: the count
     body: list
     inits: list         # [(VarRef, value)] before the loop
     updates: list       # [(VarRef, value)] at the end of each iteration
@@ -513,6 +514,7 @@ class VtStore:          # constructor mode: this->vptr = &__vt__X
 
 
 _BRANCH = re.compile(r"^b(eq|ne|lt|le|gt|ge)(-|\+)?$")
+_COUNTED = re.compile(r"^bdnz[+-]?$")          # decrement ctr, branch while it is not zero
 _CMP_OF = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _NEGATE = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
 _FUSED = {("eq", "gt", "eq"): ">=", ("eq", "lt", "eq"): "<="}     # cror: the eq bit now means >= / <=
@@ -922,7 +924,8 @@ class _Executor:
                 return
             if isinstance(src, Const):
                 put(a[0], Const(_s32(src.value + k)))
-            elif isinstance(src, (Param, Load, AddrOf, Offset)) and not (isinstance(src, Param) and src.reg in out.int_params):
+            elif isinstance(src, (Param, Load, AddrOf, Offset)) and not (isinstance(src, Param) and src.reg in out.int_params) \
+                    or isinstance(src, VarRef) and src in self.as_base:          # a loop pointer stepping
                 put(a[0], Offset(src.base, src.delta + k) if isinstance(src, Offset) else Offset(src, k))
             else:
                 put(a[0], Op("+", (self.as_value(src), Const(k)), "int"))
@@ -1306,10 +1309,12 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
     starts = {0}
     for i, insn in enumerate(insns):
         t = _target(insn)
-        if t is not None and (insn.op == "b" or _BRANCH.match(insn.op)):
+        if t is not None and (insn.op == "b" or _BRANCH.match(insn.op) or _COUNTED.match(insn.op)):
             j = resolve(t)
-            if j <= i and not _BRANCH.match(insn.op):
+            if j <= i and insn.op == "b":
                 raise Unsupported("loop closed by an unconditional branch")
+            if j > i and _COUNTED.match(insn.op):
+                raise Unsupported("a forward bdnz")
             starts.add(j)
             starts.add(i + 1)
         elif insn.op in ("blr", "b") or _BRANCH.match(insn.op) or insn.op.startswith("bdnz"):
@@ -1334,7 +1339,7 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
             return [EXIT]
         if last.op == "b":
             return [block_of[resolve(t)]]
-        if _BRANCH.match(last.op):
+        if _BRANCH.match(last.op) or _COUNTED.match(last.op):
             return [k + 1, block_of[resolve(t)]] if k + 1 < len(blocks) else [block_of[resolve(t)]]
         return [k + 1] if k + 1 < len(blocks) else [EXIT]
 
@@ -1346,7 +1351,7 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
     for k, (s0, e0) in enumerate(blocks):
         last = insns[e0 - 1]
         t = _target(last)
-        if t is not None and _BRANCH.match(last.op) and block_of[resolve(t)] <= k:
+        if t is not None and (_BRANCH.match(last.op) or _COUNTED.match(last.op)) and block_of[resolve(t)] <= k:
             latches[k] = block_of[resolve(t)]
     headers = list(latches.values())
     if len(set(headers)) != len(headers):
@@ -1496,6 +1501,9 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
         body_st.stored = set()
         body_st.cr = {}
         latch_s, latch_e = blocks[k]
+        counted = bool(_COUNTED.match(insns[latch_e - 1].op))
+        if counted and (rotated or st.ctr is None):
+            raise Unsupported("a counted loop entered at its test" if rotated else "a counted loop with no count")
         cond_stmts: list = []
         if rotated:                                         # the test runs first, on the variables
             test_st = body_st.copy()
@@ -1517,9 +1525,12 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
         executed.add(k)
         last = insns[latch_e - 1]
         field_ = last.args[0] if len(last.args) > 1 else "cr0"
-        if field_ not in test_st.cr:
+        if counted:
+            cond = st.ctr                                   # the count, read once before the loop
+        elif field_ not in test_st.cr:
             raise Unsupported("loop branch on a condition the lifter did not see")
-        cond, _ = _branch_conds(test_st.cr[field_], _BRANCH.match(last.op)[1])     # taken: loop again
+        else:
+            cond, _ = _branch_conds(test_st.cr[field_], _BRANCH.match(last.op)[1])     # taken: loop again
         updates = []
         new_values = {}
         for var, _ in inits:
@@ -1527,18 +1538,24 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
             new = end_st.regs.get(r)
             if new is None:
                 raise Unsupported(f"loop variable {r} clobbered in the loop")
+            if isinstance(new, Offset) and new.base == var:
+                if out.strides.setdefault(var, new.delta) != new.delta or new.delta <= 0:
+                    raise Unsupported("a loop pointer stepping by two amounts")
+            elif isinstance(new, Offset):
+                raise Unsupported("a loop variable set to another pointer plus a constant")
             if new != var:
                 updates.append((var, new))
                 new_values[new] = var
-        if not rotated:                                     # do-while: the test sees the updated values
+        if not rotated and not counted:                     # do-while: the test sees the updated values
             cond = _substitute(cond, new_values)
         for x_ in _walk(cond):
             if isinstance(x_, VarRef) and x_ in {v for v, _ in updates} and not rotated and x_ not in new_values.values():
                 pass
         for var, init in inits:
             out.var_types.setdefault(var, init)
-        stmts.append(Loop("while" if rotated else "do", cond, body, inits, updates, blocks[h][0]))
+        stmts.append(Loop("for" if counted else "while" if rotated else "do", cond, body, inits, updates, blocks[h][0]))
         after = st.copy()
+        after.ctr = None
         for r in written:
             after.regs.pop(r, None)
             after.clobbered.add(r)
@@ -1687,6 +1704,10 @@ def _merge_node(out: Lifted, b, r) -> None:
         q = out.bound.pop(b)
         if out.bound.setdefault(r, q) != q:
             raise Unsupported("one object used as two classes")
+    if b in out.strides:
+        k = out.strides.pop(b)
+        if out.strides.setdefault(r, k) != k:
+            raise Unsupported("one object stepped by two amounts")
     out.alias[b] = r
 
 
@@ -2022,7 +2043,7 @@ class Renderer:
         if isinstance(base, Param) and self.n.member and base.reg == "r3":
             return self.field_name(loc.offset)
         if self.scalar_deref(base):
-            return f"*{self.n.params[base.reg]}"
+            return f"*{self.expr(base, False)}"
         return f"{self.expr(base)}->{self.field_name(loc.offset)}"
 
     def expr(self, e, top: bool = True) -> str:
@@ -2110,6 +2131,8 @@ class Renderer:
         if isinstance(e, Phi):
             return self.ctype_of(e.then, bool_ret)
         if isinstance(e, VarRef):
+            if self.rep(e) in self.l.nodes and self.scalar_deref(e):
+                return f"{self.field_type(self.rep(e), 0)}*"
             if self.rep(e) in self.l.nodes:
                 return f"{self.type_name(e)}*"
             vp = self.via_pointer_type(e)
@@ -2353,15 +2376,15 @@ class Renderer:
             ctype = entries[off]
             if ctype == "@array":
                 key = arrays[off]
-                size = self.l.arrays[key]["size"]
+                esize = self.l.arrays[key]["size"]
                 later = [o for o in entries if o > off]
-                count = max(1, (min(later) - off) // size) if later else 1
+                count = max(1, (min(later) - off) // esize) if later else 1
                 if off > cur:
                     members.append(f"    char _pad{cur:X}[0x{off - cur:X}];")
                 if off < cur:
                     raise Unsupported(f"overlapping fields at +0x{off:X}")
                 members.append(f"    {self.elem_type(key)} {self.field_name(off)}[{count}];")
-                cur = off + count * size
+                cur = off + count * esize
                 continue
             if ctype == "@vptr":
                 if off > cur:
@@ -2480,11 +2503,59 @@ class Renderer:
             return None
         return tree[:-2] + [Return(Raw(text), tree[-1].seq)]
 
+    def stride(self, base) -> int:
+        """Bytes a loop pointer to this object steps per iteration (its element size), or 0."""
+        b = self.rep(base)
+        return next((k for v, k in self.l.strides.items() if self.rep(v) == b), 0)
+
+    def update_text(self, var, value) -> str:
+        """`var = value` at the end of an iteration; a pointer stepping is `p = p + 1` (its
+        element type has exactly the step's size)."""
+        if isinstance(value, Offset) and value.base == var:
+            width = self.stride(var) if not self.scalar_deref(var) else \
+                SIZES.get(self.field_type(self.rep(var), 0), 4)
+            if not width or value.delta % width:
+                raise Unsupported("a loop pointer step that is not whole elements")
+            return f"{var.name} = {var.name} + {value.delta // width};"
+        return f"{var.name} = {self.expr(value)};"
+
+    def counted_loop(self, st: "Loop", pad: str, lines: list, declare, checked, emit_body) -> None:
+        """for (i = 0; i < count; i++) { body }: a carried variable starting at 0 and stepping
+        by 1 is the counter; otherwise one is made up (the compiler counts in ctr). With the
+        cached-values variant, a count that is not a plain value is read into a local first."""
+        count = _simplify(st.cond)
+        counter = next((v for v, x in st.updates if x == Op("+", (v, Const(1)), "int")
+                        and dict(st.inits).get(v) == Const(0)), None)
+        for var, init in st.inits:
+            if var != counter:
+                checked(init)
+                lines.append(f"{pad}{self.ctype_of(var)} {declare(var.name)} = {self.expr(init)};")
+        checked(count)
+        limit = self.expr(count)
+        if counter is not None:
+            i = counter.name
+        else:                                   # nested counted loops: i, i2, i3, ...
+            self.loops += 1
+            i = "i" if self.loops == 1 else f"i{self.loops}"
+        if getattr(self, "cache", False) and not isinstance(count, (Const, Param, VarRef)):
+            n = declare("n" if self.loops <= 1 else f"n{self.loops}")
+            lines.append(f"{pad}{self.ctype_of(count)} {n} = {limit};")
+            limit = n
+        lines.append(f"{pad}int {declare(i)};")
+        lines.append(f"{pad}for ({i} = 0; {i} < {limit}; {i}++) {{")
+        emit_body()
+        for var, value in st.updates:
+            if var != counter:
+                checked(value.base if isinstance(value, Offset) else value)
+                lines.append(f"{pad}    {self.update_text(var, value)}")
+        lines.append(f"{pad}}}")
+
     def body_tree(self, ret_mode: str) -> list[str]:
         """Nested if/else and early returns, in address order. Temporaries as in body_flat:
         a load invalidated (by a store to it or any call) before its use is declared right
         after it was read; a call result used later gets one."""
         self.temps = {}
+        self.loops = 0
         tree = self.l.tree
         if getattr(self, "fold_bool", ""):
             folded = self.short_circuit(tree)
@@ -2605,6 +2676,10 @@ class Renderer:
                 elif isinstance(st, Assign):
                     checked(st.value)
                     lines.append(f"{pad}{st.var.name} = {self.expr(st.value)};")
+                elif isinstance(st, Loop) and st.kind == "for":
+                    scopes.append(set())
+                    self.counted_loop(st, pad, lines, declare, checked, lambda: emit(st.body, depth + 1, False))
+                    scopes.pop()
                 elif isinstance(st, Loop):
                     for var, init in st.inits:
                         checked(init)
@@ -2616,8 +2691,8 @@ class Renderer:
                     scopes.append(set())
                     emit(st.body, depth + 1, False)
                     for var, value in st.updates:
-                        checked(value)
-                        lines.append(f"{pad}    {var.name} = {self.expr(value)};")
+                        checked(value.base if isinstance(value, Offset) else value)
+                        lines.append(f"{pad}    {self.update_text(var, value)}")
                     scopes.pop()
                     lines.append(f"{pad}}}" if st.kind == "while" else f"{pad}}} while ({self.expr(_simplify(st.cond))});")
                 elif isinstance(st, Return):
@@ -2991,6 +3066,12 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
         if isinstance(b, StackObj) and ("embedded", b, 0) in lifted.bound:
             continue
         size = global_sizes.get(b.sym, 0) if isinstance(b, GlobalObj) else lifted.locals.get(b.offset, 0) if isinstance(b, StackObj) else 0
+        if r.stride(b):                                  # stepped through by a loop pointer
+            end = max(off + (4 if t.endswith("*") else SIZES.get(t, 1)) for off, t in lifted.nodes[b].items()) \
+                if lifted.nodes.get(b) else 0
+            if end > r.stride(b):
+                raise Unsupported("an element larger than its loop step")
+            size = r.stride(b)
         body = r.struct_body(b, [], size)
         if isinstance(b, GlobalObj):
             end = max([size] + [off + (4 if t.endswith("*") else SIZES.get(t, 1)) for off, t in lifted.nodes[b].items()])

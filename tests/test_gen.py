@@ -433,3 +433,19 @@ class CompoundConditionTest(unittest.TestCase):
         lifted = gen.lift(gen.parse(asm), no_literals, True)
         src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
         self.assertIn("if ((m0 != 0) && (m4 != 0)) {\n        m8 = 1;\n    } else {\n        m8 = 2;\n    }", src)
+
+
+class CountedLoopTest(unittest.TestCase):
+    def test_bdnz_is_a_for_loop(self):
+        asm = ("/* 80000000 00000000  38 00 00 04 */\tli r0, 0x4\n"
+               "/* 80000004 00000000  7C 09 03 A6 */\tmtctr r0\n"
+               ".L_80000008:\n"
+               "/* 80000008 00000000  90 83 00 00 */\tstw r4, 0x0(r3)\n"
+               "/* 8000000C 00000000  38 63 00 04 */\taddi r3, r3, 0x4\n"
+               "/* 80000010 00000000  42 00 FF F8 */\tbdnz .L_80000008\n"
+               "/* 80000014 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(gen.parse(asm), no_literals)
+        loop = next(st for st in lifted.tree if isinstance(st, gen.Loop))
+        self.assertEqual((loop.kind, loop.cond), ("for", gen.Const(4)))
+        src, _ = gen.render_tu(lifted, False, "", "f", gen.variants(lifted)[:1], {}, display=True)
+        self.assertIn("for (i = 0; i < 4; i++) {", src)

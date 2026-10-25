@@ -13,6 +13,7 @@ import re
 
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
+from . import dtkconfig
 from .dtk_symbols import is_auto_name
 from .unitcmd import Transaction, _finish, rebuild
 
@@ -108,7 +109,29 @@ def add_text(text: str, name: str, section: str, address: int, size: int | None,
     return "".join(line for j, line in enumerate(lines) if j not in gone), removed
 
 
+def run_force_active(cfg: Config, args: argparse.Namespace) -> int:
+    symbols = (cfg.root / cfg.platform_options["symbols"]).read_text()
+    defined = {m["name"] for line in symbols.splitlines() if (m := _LINE.match(line))}
+    missing = [n for n in args.names if n not in defined]
+    if missing:
+        print(f"error: not in symbols.txt: {', '.join(missing)} (rename first)")
+        return USAGE
+    cfg_path = cfg.root / dtkconfig.path(cfg)
+    text = cfg_path.read_text()
+    names = set(dtkconfig.force_active_names(text))
+    names = names - set(args.names) if args.remove else names | set(args.names)
+    tx = Transaction()
+    tx.write(cfg_path, dtkconfig.set_force_active(text, names))
+    verb = "no longer kept" if args.remove else "kept by the linker"
+    code = _finish(cfg, tx, rebuild(cfg, tx), f"{', '.join(args.names)} {verb}; build still matches")
+    if code == OK:
+        hint("accept <unit>")
+    return code
+
+
 def run(cfg: Config, args: argparse.Namespace) -> int:
+    if args.action == "force-active":
+        return run_force_active(cfg, args)
     path = cfg.root / cfg.platform_options["symbols"]
     try:
         if args.action == "split":
@@ -150,7 +173,10 @@ def _configure(p: argparse.ArgumentParser) -> None:
     ad.add_argument("size", nargs="?", help="hex size of an object (auto labels inside it are removed)")
     ad.add_argument("--label", action="store_true", help="a size-less label (may sit inside a function)")
     ad.add_argument("--scope", choices=("global", "local", "weak"), help="symbol scope (default: dtk's)")
+    fa = sub.add_parser("force-active", help="keep functions the original link kept although nothing references them")
+    fa.add_argument("names", nargs="+", help="symbol names (as in symbols.txt)")
+    fa.add_argument("--remove", action="store_true", help="drop them from the list again")
 
 
-COMMAND = Command("symbol", "analysis", "correct dtk's guessed data labels (split, size, add); proves the hash", run, _configure,
+COMMAND = Command("symbol", "analysis", "correct dtk's guessed data labels (split, size, add, force-active); proves the hash", run, _configure,
                   locked=True)

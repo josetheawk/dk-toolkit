@@ -21,6 +21,7 @@ from collections import defaultdict
 from ...core import floor
 from ...core.config import Config
 from ...core.isolated import commit_overlay, verify_overlay
+from . import dtkconfig
 from .matching import unit_commit_paths
 from .elf import Elf
 from .units import Lib, UnitsFile, render_units_file
@@ -207,6 +208,15 @@ def commit_unit(cfg: Config, unit: dict, message: str) -> tuple[bool, str]:
     overlay[opts["units"]] = compose_units(_head(cfg, opts["units"]), (cfg.root / opts["units"]).read_text(), rel_unit,
                                            absorbed).encode()
     overlay[opts["splits"]] = compose_splits(_head(cfg, opts["splits"]), work_splits, rel_unit, absorbed).encode()
+    work_symbols = (cfg.root / opts["symbols"]).read_text()
+    addr_of = {m["name"]: (m["section"], int(m["addr"], 16)) for line in work_symbols.splitlines()
+               if (m := _SYMBOL.match(line.strip()))}
+    in_unit = lambda n: n in addr_of and any(sec == addr_of[n][0] and lo <= addr_of[n][1] < hi for sec, lo, hi in ranges)
+    dtk_rel = dtkconfig.path(cfg)
+    head_cfg = _head(cfg, dtk_rel)
+    composed = dtkconfig.compose(head_cfg, (cfg.root / dtk_rel).read_text(), in_unit)
+    if composed != head_cfg:
+        overlay[dtk_rel] = composed.encode()
     overlay[opts["symbols"]] = compose_symbols(_head(cfg, opts["symbols"]), (cfg.root / opts["symbols"]).read_text(),
                                                ranges, words).encode()
     measures: dict = {}

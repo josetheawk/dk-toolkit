@@ -132,9 +132,6 @@ class MatchingHelpersTest(unittest.TestCase):
         self.assertEqual(UnitScore("u", [FunctionScore("f", 8, 50.0), FunctionScore("g", 8, 100.0)]).code_percent, 75.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class WeakExtrasTest(unittest.TestCase):
     def test_only_weak_extras(self):
@@ -402,7 +399,7 @@ class RelocatedDataTest(unittest.TestCase):
             from tools.dk.platforms.gc_mwcc.elf import ElfSection, ElfSymbol
             self.sections = tuple([ElfSection(0, "", 0, 0, 0, 0, 0, b"")] +
                                   [ElfSection(i + 1, n, 1, 0, len(d), 0, 0, d) for i, (n, d) in enumerate(sections)])
-            self.symbols = tuple(ElfSymbol(n, v, sz, 1, 0, idx) for n, v, sz, idx in symbols)
+            self.symbols = tuple(ElfSymbol(n, v, sz, 1, rest[0] if rest else 0, idx) for n, v, sz, idx, *rest in symbols)
             self._relocs = relocs
 
         def section(self, name):
@@ -426,3 +423,34 @@ class RelocatedDataTest(unittest.TestCase):
                           [("@153", 0x2C, 12, 2), ("__RTTI__x", 0, 8, 1)],
                           {1: [Reloc(0, 1, "@153", 0, ".data", 0x2C)]})
         self.assertFalse(_relocated_section_matches(target, other, ".sdata", {}))
+
+    def test_private_copies_pair_by_bytes_global_objects_by_name(self):
+        from tools.dk.platforms.gc_mwcc.elf import Reloc
+        from tools.dk.platforms.gc_mwcc.matching import _relocated_section_matches
+        rtti = bytes(8)
+        target = self.Fake([(".data", bytes(4)), (".sdata", rtti)], [("lbl_8038E04C", 0, 8, 2, 1)],
+                           {1: [Reloc(0, 1, "lbl_8038E04C", 0, ".sdata", 0)]})
+        local = self.Fake([(".data", bytes(4)), (".sdata", rtti)], [("__RTTI__7GObject", 0, 8, 2, 0)],
+                          {1: [Reloc(0, 1, "__RTTI__7GObject", 0, ".sdata", 0)]})
+        self.assertTrue(_relocated_section_matches(target, local, ".data", {}))      # the unit's own copy
+        exported = self.Fake([(".data", bytes(4)), (".sdata", rtti)], [("__RTTI__7GObject", 0, 8, 2, 1)],
+                             {1: [Reloc(0, 1, "__RTTI__7GObject", 0, ".sdata", 0)]})
+        self.assertFalse(_relocated_section_matches(target, exported, ".data", {}))  # a global must be the same one
+
+
+class ForceActiveTest(unittest.TestCase):
+    def test_list_edits_and_per_unit_composition(self):
+        from tools.dk.platforms.gc_mwcc import dtkconfig
+        base = "object: sys/main.dol\nwrite_asm: true\n"
+        one = dtkconfig.set_force_active(base, ["b", "a"])
+        self.assertEqual(dtkconfig.force_active_names(one), ["a", "b"])
+        self.assertEqual(dtkconfig.set_force_active(one, []), base)               # empty list: block gone
+        self.assertEqual(dtkconfig.force_active_names("force_active: [x, y]\n"), ["x", "y"])
+        head = dtkconfig.set_force_active(base, ["other_unit_old"])
+        work = dtkconfig.set_force_active(base, ["mine", "other_unit_new"])
+        composed = dtkconfig.compose(head, work, lambda n: n == "mine")
+        self.assertEqual(dtkconfig.force_active_names(composed), ["mine", "other_unit_old"])
+
+
+if __name__ == "__main__":
+    unittest.main()

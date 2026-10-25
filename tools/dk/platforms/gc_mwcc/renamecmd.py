@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 
+from . import dtkconfig
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
@@ -139,6 +140,11 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         for e in errors:
             print(f"error: {e}")
         return USAGE
+    cfg_path = cfg.root / dtkconfig.path(cfg)
+    kept = dtkconfig.force_active_names(cfg_path.read_text()) if cfg_path.is_file() else []
+    mapping = {old: new for old, new in pairs}
+    if any(n in mapping for n in kept):
+        tx.write(cfg_path, dtkconfig.set_force_active(cfg_path.read_text(), [mapping.get(n, n) for n in kept]))
     proc = fresh.build(cfg, timeout=120)
     if proc.returncode != 0:
         tx.rollback()

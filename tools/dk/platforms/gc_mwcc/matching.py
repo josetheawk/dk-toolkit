@@ -287,7 +287,9 @@ def _relocated_section_matches(target: Elf, base: Elf, section: str, dropped: di
     masked = lambda d, rels: bytes(0 if any(o <= i < o + 4 for o in rels) else x for i, x in enumerate(d))
     if masked(t.data[:len(data)], tr) != masked(data, br):
         return False
-    local = lambda name: not name or name.startswith(("@", "lbl_", "gap_")) or "$" in name
+    # a unit's private copy (an RTTI record, a literal) has a local binding; dtk names the
+    # original's copies lbl_/gap_, the compiler names ours, so only bytes and size must agree
+    local = lambda sym: sym.bind == 0 or not sym.name or sym.name.startswith(("@", "lbl_", "gap_")) or "$" in sym.name
     for off, r in tr.items():
         q = br[off]
         if r.type != q.type:
@@ -300,7 +302,7 @@ def _relocated_section_matches(target: Elf, base: Elf, section: str, dropped: di
         c = _object_at(base, q.target_section, q.target_value + q.addend)
         if a is None or c is None or a[1] != c[1] or a[0].size != c[0].size:
             return False
-        if a[0].name != c[0].name and not (local(a[0].name) and local(c[0].name)):
+        if a[0].name != c[0].name and not (local(a[0]) and local(c[0])):
             return False
         ta = target.section(r.target_section)
         cb = base.section(q.target_section)
