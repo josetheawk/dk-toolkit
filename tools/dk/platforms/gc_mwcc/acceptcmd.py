@@ -12,6 +12,7 @@ from ...core.config import Config
 from ...core.util import run_ninja
 from ...core.progress import load_report
 from ...core import floor
+from .dtk_symbols import build_errors
 from .matching import MatchError, commit_gate, render, resolve_unit, score
 from .unitcommit import commit_unit
 from .units import read_units_file, render_units_file, set_status
@@ -64,14 +65,18 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     after = _matched_functions(cfg)
     below = floor.check(cfg) if ok else []
     if not ok or after < before or below:
-        units_path.write_text(original_units)
-        _build(cfg)
         reason = ("hash mismatch or build error after linking" if not ok
                   else f"matched functions fell {before} -> {after}" if after < before
                   else "below progress floor: " + "; ".join(below))
         if not ok:
-            detail = [line for line in output.splitlines() if line.strip() and "Usage Warning" not in line]
-            print("\n".join(detail[-40:]))
+            print(build_errors(output, 30))
+            if cfg.built.is_file() and "did NOT match" in output:
+                from .firstdiff import first_diff             # where the linked binary differs
+                print("first differences in the linked binary:")
+                for line in first_diff(cfg, cfg.built, cfg.original, 6):
+                    print(f"  {line}")
+        units_path.write_text(original_units)
+        _build(cfg)
         print(f"REJECTED: {reason}; units.toml restored")
         return MISMATCH
     print(f"ACCEPTED: {unit['name']} linked, hash OK, matched functions {before} -> {after}")

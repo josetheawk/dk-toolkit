@@ -23,9 +23,31 @@ def rename_text(text: str, pairs: list[tuple[str, str]], local: bool = False) ->
     """
     lines = text.splitlines(keepends=True)
     names = [line.split(" = ", 1)[0] for line in lines if " = " in line]
+    # OLD may be an address (0x80391540): the one symbol there, even if its name repeats
+    by_address: dict[int, int] = {}
+    for i, line in enumerate(lines):
+        m = re.search(r" = [^:]+:0x([0-9A-Fa-f]+);", line)
+        if m:
+            by_address.setdefault(int(m[1], 16), i)
+    at_line: dict[int, str] = {}
+    resolved = []
+    for old, new in pairs:
+        if re.fullmatch(r"0x[0-9A-Fa-f]+", old):
+            i = by_address.get(int(old, 16))
+            if i is None:
+                return text, [f"no symbol at {old}"]
+            at_line[i] = new
+            resolved.append((lines[i].split(" = ", 1)[0], new, i))
+        else:
+            resolved.append((old, new, None))
     errors = []
     taken = set(names)
-    for old, new in pairs:
+    for old, new, line_no in resolved:
+        if line_no is not None:
+            if new in taken and new != old and not local:
+                errors.append(f"{new!r} already exists (a static of that name in another TU: use --local)")
+            taken.add(new)
+            continue
         if not _SYMBOL_NAME.match(new):
             errors.append(f"{new!r} is not a valid symbol name")
         if names.count(old) != 1:
@@ -35,15 +57,16 @@ def rename_text(text: str, pairs: list[tuple[str, str]], local: bool = False) ->
         taken.add(new)
     if errors:
         return text, errors
-    mapping = dict(pairs)
-    shared = {new for _, new in pairs} & set(names) if local else set()
+    mapping = {old: new for old, new, line_no in resolved if line_no is None}
+    shared = {new for _, new, _ in resolved} & set(names) if local else set()
     out = []
-    for line in lines:
+    for i, line in enumerate(lines):
         name, sep, rest = line.partition(" = ")
-        if sep and (name in mapping and local or name in shared):
+        target = at_line.get(i, mapping.get(name)) if sep else None
+        if sep and (target is not None and local or name in shared):
             rest = re.sub(r"scope:\w+", "scope:local", rest) if "scope:" in rest else rest.rstrip("\n") + " scope:local\n"
-        if sep and name in mapping:
-            line = f"{mapping[name]}{sep}{rest}"
+        if sep and target is not None:
+            line = f"{target}{sep}{rest}"
         elif sep and name in shared:
             line = f"{name}{sep}{rest}"
         out.append(line)
@@ -103,6 +126,13 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         print("error: give OLD NEW pairs")
         return USAGE
     pairs = list(zip(args.names[::2], args.names[1::2]))
+    text = (cfg.root / cfg.platform_options["symbols"]).read_text()
+    for i, (old, new) in enumerate(pairs):                 # addresses name one symbol each
+        if re.fullmatch(r"0x[0-9A-Fa-f]+", old):
+            m = re.search(rf"^(\S+) = [^:]+:0x0*{int(old, 16):X};", text, re.M | re.I)
+            if m is None:
+                print(f"error: no symbol at {old}")
+                return USAGE
     tx = Transaction()
     errors, changed, manual = stage_renames(cfg, tx, pairs, args.local, not args.no_sources)
     if errors:
@@ -126,7 +156,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _configure(p: argparse.ArgumentParser) -> None:
-    p.add_argument("names", nargs="+", help="OLD NEW pairs, e.g. fn_800ED408 __dl__FPv")
+    p.add_argument("names", nargs="+", help="OLD NEW pairs; OLD may be an address (0x80391540) for a repeated name")
     p.add_argument("--no-sources", action="store_true", help="do not rewrite placeholder references in src/ include/")
     p.add_argument("--local", action="store_true",
                    help="new names are scope:local and may repeat other TUs' local names (same-named statics)")

@@ -23,6 +23,13 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if not args.message:
         print("error: give -m MESSAGE")
         return USAGE
+    # the shared config files hold every agent's in-progress entries: committing one whole
+    # would land other agents' unfinished work (unit commits compose them entry by entry)
+    shared = {str(v) for k, v in cfg.platform_options.items() if k in ("units", "splits", "symbols")}
+    blocked = [p for p in args.paths if p in shared]
+    if blocked:
+        print(f"REFUSED: {', '.join(blocked)} must change through ./dk accept, save, unit or rename commands")
+        return USAGE
     tests = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests"], cwd=cfg.root, capture_output=True, text=True)
     if tests.returncode != 0:
         print("REFUSED: the toolkit tests fail:")

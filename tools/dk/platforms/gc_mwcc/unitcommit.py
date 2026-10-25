@@ -36,7 +36,7 @@ def _head(cfg: Config, rel: str) -> str:
 
 # --- units.toml ------------------------------------------------------------------------------
 
-def compose_units(head_text: str, work_text: str, path: str) -> str:
+def compose_units(head_text: str, work_text: str, path: str, absorbed: tuple = ()) -> str:
     def parse(text: str) -> UnitsFile:
         header = []
         for line in text.splitlines():
@@ -53,6 +53,10 @@ def compose_units(head_text: str, work_text: str, path: str) -> str:
     head, work = parse(head_text) if head_text else parse(work_text), parse(work_text)
     if not head_text:
         head.libs = []
+    for gone in absorbed:                         # merged into this unit: their entries go too
+        if work.find(gone) is None:
+            for lib in head.libs:
+                lib.objects = [o for o in lib.objects if o["path"] != gone]
     found = work.find(path)
     existing = head.find(path)
     if found is not None and existing is not None and existing[0].name == found[0].name:
@@ -99,11 +103,30 @@ def _first_address(block: list[str]) -> int:
     return min(addrs, default=0)
 
 
-def compose_splits(head_text: str, work_text: str, unit: str) -> str:
+def absorbed_units(head_text: str, work_text: str, unit: str) -> list[str]:
+    """HEAD units that this unit's new ranges overlap and that the working tree no longer
+    declares: merged into it (their blocks must leave the same commit, or splits overlap)."""
+    _, hblocks, _ = _blocks(head_text)
+    _, wblocks, _ = _blocks(work_text)
+    ranges = unit_ranges(work_text, unit)
+    out = []
+    for name, block in hblocks.items():
+        if name == unit or name in wblocks:
+            continue
+        if any(sec == rsec and a < rend and rstart < b
+               for sec, a, b in unit_ranges(head_text, name) for rsec, rstart, rend in ranges):
+            out.append(name)
+    return sorted(out)
+
+
+def compose_splits(head_text: str, work_text: str, unit: str, absorbed: tuple = ()) -> str:
     pre, blocks, order = _blocks(head_text or work_text)
     if not head_text:
         blocks, order = {}, []
     _, wblocks, _ = _blocks(work_text)
+    for gone in absorbed:
+        blocks.pop(gone, None)
+    order = [u for u in order if u not in absorbed]
     blocks.pop(unit, None)
     order = [u for u in order if u != unit]
     if unit in wblocks:
@@ -176,8 +199,14 @@ def commit_unit(cfg: Config, unit: dict, message: str) -> tuple[bool, str]:
     ranges = unit_ranges(work_splits, rel_unit)
     # mangled names of functions defined in the unit's source also count (rename targets)
     words |= _mangled_names(cfg, unit)
-    overlay[opts["units"]] = compose_units(_head(cfg, opts["units"]), (cfg.root / opts["units"]).read_text(), rel_unit).encode()
-    overlay[opts["splits"]] = compose_splits(_head(cfg, opts["splits"]), work_splits, rel_unit).encode()
+    absorbed = tuple(absorbed_units(_head(cfg, opts["splits"]), work_splits, rel_unit))
+    for gone in absorbed:                          # a merged unit's source leaves with it, if removed
+        src = f"{opts.get('src', 'src')}/{gone}"
+        if not (cfg.root / src).exists():
+            overlay[src] = None
+    overlay[opts["units"]] = compose_units(_head(cfg, opts["units"]), (cfg.root / opts["units"]).read_text(), rel_unit,
+                                           absorbed).encode()
+    overlay[opts["splits"]] = compose_splits(_head(cfg, opts["splits"]), work_splits, rel_unit, absorbed).encode()
     overlay[opts["symbols"]] = compose_symbols(_head(cfg, opts["symbols"]), (cfg.root / opts["symbols"]).read_text(),
                                                ranges, words).encode()
     floor_rel = cfg.rel(floor.path(cfg))

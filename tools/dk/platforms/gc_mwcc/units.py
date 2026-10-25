@@ -105,6 +105,30 @@ def set_status(units: UnitsFile, path: str, status: str) -> bool:
     return changed
 
 
+def set_flags(units: UnitsFile, path: str, mw_version: str | None, cflags: str | None,
+              extra: list[str] | None) -> list[str]:
+    """Set an object's compiler, flag set and extra flags (extra=[] clears them). Returns
+    what changed, as 'key: old -> new' lines."""
+    found = units.find(path)
+    if found is None:
+        raise KeyError(path)
+    _, obj = found
+    changes = []
+    for key, value in (("mw_version", mw_version), ("cflags", cflags), ("extra_cflags", extra)):
+        if value is None:
+            continue
+        old = obj.get(key)
+        if key == "extra_cflags" and value == []:
+            if "extra_cflags" in obj:
+                del obj["extra_cflags"]
+                changes.append(f"extra_cflags: {old} -> (none)")
+            continue
+        if old != value:
+            obj[key] = value
+            changes.append(f"{key}: {old} -> {value}")
+    return changes
+
+
 # --- splits.txt -----------------------------------------------------------------------------
 
 def _split_line(section: str, start: int, end: int) -> str:

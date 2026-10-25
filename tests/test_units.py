@@ -354,3 +354,75 @@ class RenameLocalTest(unittest.TestCase):
         # a discarded object before the others: compare packed offsets
         extra = obj([("unused", 0), ("CPUFifo", 4), ("GPFifo", 8), ("__GXCurrentThread", 12)])
         self.assertEqual(_nobits_layout_problems(target, extra, {".sbss": {"unused"}}), [])
+
+
+class UnitFlagsTest(unittest.TestCase):
+    def test_set_and_clear_flags(self):
+        import tempfile
+        from pathlib import Path
+        from tools.dk.platforms.gc_mwcc.units import read_units_file, render_units_file, set_flags
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "units.toml"
+            path.write_text('[[lib]]\nname = "game"\nobjects = [\n    { path = "game/a.cpp", status = "NonMatching", cflags = "game", mw_version = "GC/1.3.2" },\n]\n')
+            units = read_units_file(path)
+            changes = set_flags(units, "game/a.cpp", "GC/1.3", None, ["-char", "signed"])
+            self.assertEqual(len(changes), 2)
+            text = render_units_file(units)
+            self.assertIn('mw_version = "GC/1.3"', text)
+            self.assertIn('extra_cflags = ["-char", "signed"]', text)
+            path.write_text(text)
+            units = read_units_file(path)
+            self.assertEqual(set_flags(units, "game/a.cpp", None, None, []), ["extra_cflags: ['-char', 'signed'] -> (none)"])
+            with self.assertRaises(KeyError):
+                set_flags(units, "game/nope.cpp", "GC/1.3", None, None)
+
+
+class ByAddressTest(unittest.TestCase):
+    TEXT = ("ResetFunctionInfo = .data:0x80270000; // type:object size:0x8 scope:local\n"
+            "ResetFunctionInfo = .data:0x80271000; // type:object size:0x8 scope:local\n")
+
+    def test_rename_and_size_one_of_two_same_named_symbols(self):
+        from tools.dk.platforms.gc_mwcc.renamecmd import rename_text
+        from tools.dk.platforms.gc_mwcc.symbolcmd import size_text
+        text, errors = rename_text(self.TEXT, [("0x80271000", "ResetFunctionInfo2")])
+        self.assertEqual(errors, [])
+        self.assertIn("ResetFunctionInfo = .data:0x80270000;", text)
+        self.assertIn("ResetFunctionInfo2 = .data:0x80271000;", text)
+        sized, _ = size_text(self.TEXT, "0x80270000", 0x10)
+        self.assertIn("ResetFunctionInfo = .data:0x80270000; // type:object size:0x10", sized)
+        self.assertIn("ResetFunctionInfo = .data:0x80271000; // type:object size:0x8", sized)
+
+
+class RelocatedDataTest(unittest.TestCase):
+    """Pointers into a section that lost a weak object mid-way point at shifted offsets of the
+    same objects: equal when they point at the same bytes, not when the bytes differ."""
+
+    class Fake:
+        def __init__(self, sections, symbols, relocs):
+            from tools.dk.platforms.gc_mwcc.elf import ElfSection, ElfSymbol
+            self.sections = tuple([ElfSection(0, "", 0, 0, 0, 0, 0, b"")] +
+                                  [ElfSection(i + 1, n, 1, 0, len(d), 0, 0, d) for i, (n, d) in enumerate(sections)])
+            self.symbols = tuple(ElfSymbol(n, v, sz, 1, 0, idx) for n, v, sz, idx in symbols)
+            self._relocs = relocs
+
+        def section(self, name):
+            return next((s for s in self.sections if s.name == name), None)
+
+        def relocations(self, index):
+            return self._relocs.get(index, [])
+
+    def test_shifted_pointers_to_equal_objects(self):
+        from tools.dk.platforms.gc_mwcc.elf import Reloc
+        from tools.dk.platforms.gc_mwcc.matching import _relocated_section_matches
+        name = b"RaceManager\0"
+        target = self.Fake([(".sdata", bytes(8)), (".data", name)],
+                           [("lbl_a", 0, 12, 2), ("__RTTI__x", 0, 8, 1)],
+                           {1: [Reloc(0, 1, "lbl_a", 0, ".data", 0)]})
+        ours = self.Fake([(".sdata", bytes(8)), (".data", bytes(0x2C) + name)],
+                         [("__vt__weak", 0, 0x2C, 2), ("@153", 0x2C, 12, 2), ("__RTTI__x", 0, 8, 1)],
+                         {1: [Reloc(0, 1, "@153", 0, ".data", 0x2C)]})
+        self.assertTrue(_relocated_section_matches(target, ours, ".sdata", {}))
+        other = self.Fake([(".sdata", bytes(8)), (".data", bytes(0x2C) + b"Different\0\0\0")],
+                          [("@153", 0x2C, 12, 2), ("__RTTI__x", 0, 8, 1)],
+                          {1: [Reloc(0, 1, "@153", 0, ".data", 0x2C)]})
+        self.assertFalse(_relocated_section_matches(target, other, ".sdata", {}))

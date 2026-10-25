@@ -59,3 +59,23 @@ class ComposeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeTest(unittest.TestCase):
+    def test_a_merged_unit_leaves_with_the_unit_that_absorbed_it(self):
+        from tools.dk.platforms.gc_mwcc.unitcommit import absorbed_units, compose_splits, compose_units
+        head = ("Sections:\n\t.text type:code\n\n"
+                "game/a.cpp:\n\t.text       start:0x80001000 end:0x80001100\n\n"
+                "game/b.cpp:\n\t.text       start:0x80001100 end:0x80001200\n\n"
+                "game/c.cpp:\n\t.text       start:0x80002000 end:0x80002100\n")
+        work = ("Sections:\n\t.text type:code\n\n"
+                "game/a.cpp:\n\t.text       start:0x80001000 end:0x80001200\n\n"
+                "game/c.cpp:\n\t.text       start:0x80002000 end:0x80002100\n")
+        self.assertEqual(absorbed_units(head, work, "game/a.cpp"), ["game/b.cpp"])
+        merged = compose_splits(head, work, "game/a.cpp", ("game/b.cpp",))
+        self.assertNotIn("game/b.cpp", merged)
+        self.assertIn("start:0x80001000 end:0x80001200", merged)
+        units_head = ('[[lib]]\nname = "game"\nobjects = [\n    { path = "game/a.cpp", status = "Matching" },\n'
+                      '    { path = "game/b.cpp", status = "NonMatching" },\n]\n')
+        units_work = '[[lib]]\nname = "game"\nobjects = [\n    { path = "game/a.cpp", status = "Matching" },\n]\n'
+        self.assertNotIn("game/b.cpp", compose_units(units_head, units_work, "game/a.cpp", ("game/b.cpp",)))

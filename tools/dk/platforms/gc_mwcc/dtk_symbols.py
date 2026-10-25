@@ -206,7 +206,10 @@ def build_errors(output: str, lines: int = 25) -> str:
     """The last lines of a failed build without linker/compiler noise, plus a hint for the
     known split mistakes."""
     kept = [l for l in output.rstrip().splitlines() if not any(n in l for n in _NOISE)]
-    text = "\n".join(kept[-lines:])
+    # the linker's own error lines can be far from the tail: lead with them
+    errors = [l for i, l in enumerate(kept) if re.search(r"Linker Error|Error:|undefined|multiply defined", l)
+              or i and re.search(r"Linker Error", kept[i - 1])]
+    text = "\n".join(dict.fromkeys(errors[:20] + kept[-lines:]))
     if "gap_" in output and "out of section bounds" in output:
         text += ("\nhint: a few bytes of padding were left between two units as a tiny gap split; "
                  "extend the previous unit's split over them (./dk unit set)")

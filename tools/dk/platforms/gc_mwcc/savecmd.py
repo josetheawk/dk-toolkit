@@ -39,6 +39,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         return MISMATCH
     floor.raise_floor(cfg)
     message = f"WIP {rel}: {exact}/{len(s.functions)} functions exact\n"
+    if args.note:
+        message += "\n" + "\n".join(args.note) + "\n"
     if args.trailer:
         message += "\n" + "\n".join(args.trailer) + "\n"
     ok, detail = commit_unit(cfg, unit, message)
@@ -52,6 +54,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
 def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("target", help="unit (source path or name) or a function inside one")
+    p.add_argument("--note", action="append", default=[], help="what is left / what was tried (commit body; repeatable)")
     p.add_argument("--trailer", action="append", default=[], help="commit trailer line")
 
 

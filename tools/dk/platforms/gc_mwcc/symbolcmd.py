@@ -72,9 +72,12 @@ def size_text(text: str, name: str, size: int) -> tuple[str, list[str]]:
     """Set a symbol's size; auto labels it now covers whole are removed. Returns (text, removed)."""
     lines = text.splitlines(keepends=True)
     syms = read_symbols_from_text(lines)
-    hits = [s for s in syms if s["name"] == name]
+    if re.fullmatch(r"0x[0-9A-Fa-f]+", name):               # by address: one symbol even if its name repeats
+        hits = [s for s in syms if s["start"] == int(name, 16) and s["size"]]
+    else:
+        hits = [s for s in syms if s["name"] == name]
     if len(hits) != 1:
-        raise ValueError(f"{name} occurs {len(hits)} times")
+        raise ValueError(f"{name} occurs {len(hits)} times (give its address instead)")
     i = hits[0]["index"]
     gone = _absorb(syms, hits[0]["section"], hits[0]["start"], size, keep=i)
     line = lines[i]
@@ -139,7 +142,7 @@ def _configure(p: argparse.ArgumentParser) -> None:
     sp.add_argument("address", help="hex address inside the label, e.g. 0x80250F70")
     sp.add_argument("--name", help="name for the new symbol (default lbl_<ADDR>)")
     sz = sub.add_parser("size", help="set a symbol's size (auto labels it then covers whole are removed)")
-    sz.add_argument("name")
+    sz.add_argument("name", help="symbol name, or its address (0x...) when the name repeats")
     sz.add_argument("size", help="hex size, e.g. 0x30")
     ad = sub.add_parser("add", help="add an object dtk never labelled, or a label (e.g. __RAS_*_begin)")
     ad.add_argument("name")

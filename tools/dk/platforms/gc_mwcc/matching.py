@@ -239,6 +239,81 @@ def _nobits_layout_problems(target: Elf, base: Elf, dropped: dict[str, set[str]]
     return problems
 
 
+def _object_at(elf: Elf, section: str, offset: int):
+    """(symbol, offset inside it) of the sized object holding section+offset."""
+    sec = elf.section(section)
+    if sec is None:
+        return None
+    for s in elf.symbols:
+        if s.shndx == sec.index and s.size and s.value <= offset < s.value + s.size:
+            return s, offset - s.value
+    return None
+
+
+def _relocated_section_matches(target: Elf, base: Elf, section: str, dropped: dict[str, set[str]]) -> bool:
+    """A data section whose bytes match and whose pointers point at the same things.
+
+    objdiff compares a data relocation by where it points; when the original link dropped an
+    object earlier in the pointed-to section (a weak vtable), our pointers land at shifted
+    offsets of identical objects. Equal here: same size and bytes (relocated words masked),
+    relocations at the same offsets and of the same type, each pointing at an object with the
+    same bytes and the same offset inside it, under the same name unless both are local
+    compiler/auto names. Only one level deep: what the pointed-at objects point to is not
+    followed."""
+    t, b = target.section(section), base.section(section)
+    if t is None or b is None or t.type == 8:
+        return False
+    tr = {r.offset: r for r in target.relocations(t.index)}
+    br = {r.offset: r for r in base.relocations(b.index)}
+    data = b.data
+    gone = dropped.get(section, set())
+    if gone:                                       # re-pack the kept objects, relocations included
+        packed = _packed_offsets(base, section, gone)
+        syms = {x.name: x for x in base.symbols if x.shndx == b.index and x.size and x.name}
+        end = max((packed[n] + syms[n].size for n in packed), default=0)
+        buf = bytearray(end)
+        moved = {}
+        for n, new_off in packed.items():
+            x = syms[n]
+            buf[new_off:new_off + x.size] = b.data[x.value:x.value + x.size]
+            for o, r in br.items():
+                if x.value <= o < x.value + x.size:
+                    moved[new_off + o - x.value] = r
+        data, br = bytes(buf), moved
+    if len(data) > t.size or t.size - len(data) >= 8 or t.data[len(data):].strip(b"\0"):
+        return False                               # only zero alignment padding may follow
+    if set(tr) != set(br):
+        return False
+    masked = lambda d, rels: bytes(0 if any(o <= i < o + 4 for o in rels) else x for i, x in enumerate(d))
+    if masked(t.data[:len(data)], tr) != masked(data, br):
+        return False
+    local = lambda name: not name or name.startswith(("@", "lbl_", "gap_")) or "$" in name
+    for off, r in tr.items():
+        q = br[off]
+        if r.type != q.type:
+            return False
+        if not r.target_section or not q.target_section:
+            if r.symbol != q.symbol or r.addend != q.addend:
+                return False
+            continue
+        a = _object_at(target, r.target_section, r.target_value + r.addend)
+        c = _object_at(base, q.target_section, q.target_value + q.addend)
+        if a is None or c is None or a[1] != c[1] or a[0].size != c[0].size:
+            return False
+        if a[0].name != c[0].name and not (local(a[0].name) and local(c[0].name)):
+            return False
+        ta = target.section(r.target_section)
+        cb = base.section(q.target_section)
+        da = ta.data[a[0].value:a[0].value + a[0].size] if ta.type != 8 else b""
+        dc = cb.data[c[0].value:c[0].value + c[0].size] if cb.type != 8 else b""
+        if masked(da, {x.offset - a[0].value for x in target.relocations(ta.index)
+                        if a[0].value <= x.offset < a[0].value + a[0].size}) != \
+                masked(dc, {x.offset - c[0].value for x in base.relocations(cb.index)
+                            if c[0].value <= x.offset < c[0].value + c[0].size}):
+            return False
+    return True
+
+
 def _packed_section_matches(target: Elf, base: Elf, section: str, dropped: set[str]) -> bool:
     """Model the original link of one relocation-free section: remove the discarded objects,
     pack the kept ones in order at their alignment, and compare with the target. Alignment gaps
@@ -362,6 +437,9 @@ def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
             if pct < 100.0 and _packed_section_matches(target_elf, base_elf, sec["name"], dropped):
                 pct = 100.0
                 result.weak_copies += sorted(dropped)
+            if pct < 100.0 and _relocated_section_matches(target_elf, base_elf, sec["name"],
+                                                          {k: {n for _, _, n in v} for k, v in weak.items()}):
+                pct = 100.0
             result.data[sec["name"]] = pct
 
     # Layout after dead-stripping: functions the target lacks are dropped by the linker when

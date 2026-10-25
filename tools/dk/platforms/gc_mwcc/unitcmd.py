@@ -18,7 +18,7 @@ from .dtk_symbols import boundary_fix, build_errors, caused_by, read_symbols, re
 from .elf import Elf
 from .matching import MatchError, resolve_unit
 from .propose import adjust_tu_bounds, propose
-from .units import (add_object, add_split_unit, read_units_file, remove_object, remove_split_unit,
+from .units import (add_object, add_split_unit, read_units_file, remove_object, remove_split_unit, set_flags,
                     render_units_file, replace_split_unit)
 
 _SPLIT_ARG = re.compile(r"^(?P<section>\.?[\w$.]+):0x(?P<start>[0-9A-Fa-f]+)-0x(?P<end>[0-9A-Fa-f]+)$")
@@ -338,6 +338,12 @@ def _configure(p: argparse.ArgumentParser) -> None:
     st.add_argument("--local", action="store_true", help="--rename names are scope:local (see dk rename --local)")
     st.add_argument("--drop", action="append", default=[], metavar="SECTION",
                     help="remove this section from the unit (otherwise every current section must be listed)")
+    fl = sub.add_parser("flags", help="set a unit's compiler version / flag set / extra flags and prove the build")
+    fl.add_argument("path", help="unit source path relative to src/")
+    fl.add_argument("--mw-version", help="e.g. GC/1.3 (the compiler is per TU)")
+    fl.add_argument("--cflags", help="flag set name (a key of CFLAGS), e.g. game")
+    fl.add_argument("--extra-cflags", help='extra flags, e.g. "-char signed" or "-opt nostrength"')
+    fl.add_argument("--clear-extra", action="store_true", help="remove the unit's extra flags")
     rm = sub.add_parser("remove", help="undeclare a unit (splits + units.toml); the source file is kept")
     rm.add_argument("path", help="unit source path relative to src/")
     ft = sub.add_parser("fit", help="trim data ranges to the compiled sizes where the target tail is padding")
@@ -353,9 +359,36 @@ def _configure(p: argparse.ArgumentParser) -> None:
     pr.add_argument("--category", default="game")
 
 
+def run_flags(cfg: Config, args: argparse.Namespace) -> int:
+    """Per-unit compiler and flags (the compiler is per TU: some need GC/1.3 with -char signed)."""
+    _, units_path, _ = paths(cfg)
+    units = read_units_file(units_path)
+    extra = None
+    if args.clear_extra:
+        extra = []
+    elif args.extra_cflags is not None:
+        extra = args.extra_cflags.split()
+    try:
+        changes = set_flags(units, args.path, args.mw_version, args.cflags, extra)
+    except KeyError:
+        print(f"error: {args.path} not in {cfg.rel(units_path)}")
+        return USAGE
+    if not changes:
+        print("nothing to change")
+        return OK
+    tx = Transaction()
+    tx.write(units_path, render_units_file(units))         # a reconfigure dependency: ninja regenerates
+    code = _finish(cfg, tx, rebuild(cfg, tx), f"{args.path}: " + "; ".join(changes) + "; build still matches")
+    if code == OK:
+        hint(f"check {args.path}")
+    return code
+
+
 def run(cfg: Config, args: argparse.Namespace) -> int:
+    if getattr(args, "path", None):
+        args.path = args.path.removeprefix("src/")     # paths are relative to src/
     return {"add": run_add, "list": run_list, "propose": run_propose, "set": run_set,
-            "remove": run_remove, "fit": run_fit}[args.action](cfg, args)
+            "remove": run_remove, "fit": run_fit, "flags": run_flags}[args.action](cfg, args)
 
 
-COMMAND = Command("unit", "matching", "declare and edit translation units (propose, add, set, fit, remove, list)", run, _configure, locked=True)
+COMMAND = Command("unit", "matching", "declare and edit translation units (propose, add, set, flags, fit, remove, list)", run, _configure, locked=True)
