@@ -28,7 +28,7 @@ from pathlib import Path
 
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from . import asmindex, classgen, gen
+from . import asmgen, asmindex, classgen, gen
 from .ctxcmd import class_slots
 from .dol import Dol
 from .dtk_symbols import is_auto_name, read_symbols, read_units
@@ -363,13 +363,50 @@ def _verify_class_draft(ctx: Context, command: str, insns, draft, work: Path, re
     return result
 
 
-def solve_many(ctx: Context, names: list[str], jobs: int) -> list[Result]:
+def solve_asm(ctx: Context, name: str, work: Path) -> Result:
+    """A function the original wrote in assembly, as a CodeWarrior asm function, verified."""
+    sym = ctx.by_name.get(name)
+    if sym is None or name not in ctx.entries:
+        return Result(name, 0, "skipped", "no such function in the asm")
+    result = Result(name, sym.address, "unsupported")
+    command, why = ctx.command(sym.address)
+    if command is None:
+        result.status, result.detail = "skipped", why
+        return result
+    section_of = lambda s: ctx.by_name[s].section if s in ctx.by_name else None
+    try:
+        source, defined = asmgen.asm_function(name, ctx.entries[name].text, section_of, ctx.literal)
+    except gen.Unsupported as e:
+        result.detail = str(e)
+        return result
+    result.compiler = next((p.split("/")[-2] for p in shlex.split(command) if p.endswith("mwcceppc.exe")), "")
+    obj, err = _compile(ctx, command, source, work, re.sub(r"\W", "_", name)[:60] + "_asm")
+    if obj is None:
+        result.status, result.detail = "error", f"generator bug (assembly does not compile): {err}"
+        return result
+    # literals the draft defines must hold the original bytes; everything else it references by
+    # its own name (the unit's data defines it), so the names must be equal
+    own = lambda s, size, addend=0: ctx.literal(s, size, addend) if s in defined else None
+    diff, matched = gen.compare_detail(gen.parse(ctx.entries[name].text), obj, name, own,
+                                       literal_info=lambda s: ctx.literal_info(s) if s in defined else None)
+    if diff:
+        result.status, result.detail = "differs", diff
+        result.closest = f"{matched} instructions match, then: {diff}"
+        result.source = source
+        return result
+    result.status, result.source = "exact", source
+    result.notes = ["hand-written assembly: use this only where the original was assembly"]
+    return result
+
+
+def solve_many(ctx: Context, names: list[str], jobs: int, asm: bool = False) -> list[Result]:
     root = ctx.cfg.root / "build" / "dk" / "gen"
     root.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=root))
+    solver = solve_asm if asm else solve
     try:
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            return list(pool.map(lambda n: solve(ctx, n, work), names))
+            return list(pool.map(lambda n: solver(ctx, n, work), names))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -410,7 +447,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if not names:
         print("error: give functions, --unit or --survey")
         return USAGE
-    results = solve_many(ctx, names, args.jobs)
+    results = solve_many(ctx, names, args.jobs, asm=args.asm)
     for r in results:
         if r.status == "exact" or args.unverified and r.status == "differs" and r.source:
             print(format_draft(r) + "\n")
@@ -438,8 +475,9 @@ print(json.dumps({r.name: r.status for r in gencmd.solve_many(ctx, names, int(sy
 
 def _regress(ctx: Context, args: argparse.Namespace) -> int:
     """The generator at REV and the working tree's, on the same functions: nothing that was
-    exact may stop being exact (functions that left the asm meanwhile are not counted)."""
-    names = _survey_names(ctx, args)
+    exact may stop being exact (functions that left the asm meanwhile are not counted).
+    Named functions, or every survey function."""
+    names = [n for n in args.functions if n in ctx.entries] if args.functions else _survey_names(ctx, args)
     root = ctx.cfg.root / "build" / "dk" / "gen"
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root) as tmp:
@@ -529,6 +567,8 @@ def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel compiles")
     p.add_argument("--unverified", action="store_true",
                    help="also print the closest NOT-exact draft of a function that lifts but does not match")
+    p.add_argument("--asm", action="store_true",
+                   help="the function as a CodeWarrior asm function (only for code the original wrote in assembly)")
     p.add_argument("--regress", metavar="REV", help="compare with the generator at REV on the same functions (exit 1 if a draft is lost)")
 
 

@@ -321,9 +321,15 @@ def strip_frame(insns: list[Insn]) -> list[Insn]:
     helper = re.compile(r"^_(?:save|rest)(?:gpr|fpr)_\d+$")
     skip = set()
     for i in range(1, len(insns) - 1):
-        if insns[i].op == "addi" and insns[i].args[:2] == ("r11", "r1") and insns[i + 1].op == "bl" \
-                and helper.match(insns[i + 1].args[0]):
-            skip.update((i, i + 1))
+        if insns[i].op != "addi" or insns[i].args[:2] != ("r11", "r1"):
+            continue
+        # the scheduler may put a few unrelated instructions between the two
+        for j in range(i + 1, min(i + 6, len(insns))):
+            if insns[j].op == "bl" and helper.match(insns[j].args[0]):
+                skip.update((i, j))
+                break
+            if any(re.search(r"\br11\b", x) for x in insns[j].args) or insns[j].op in ("bl", "b", "blr", "bctrl"):
+                break
     for i, insn in enumerate(insns[1:], 1):
         if i in skip:
             continue
@@ -472,6 +478,13 @@ class If:
 
 
 @dataclass
+class CondNode:       # a short-circuit condition: blocks that only test, reduced to one branch
+    leaves: list      # its blocks, in address order (the first may also do other work)
+    exits: tuple      # (A, B): the two blocks it can continue at
+    parts: tuple | None = None   # None for one block; (X, Y, S): X, then Y when X does not go to S
+
+
+@dataclass
 class Return:
     value: object | None
     seq: int
@@ -502,6 +515,24 @@ class VtStore:          # constructor mode: this->vptr = &__vt__X
 _BRANCH = re.compile(r"^b(eq|ne|lt|le|gt|ge)(-|\+)?$")
 _CMP_OF = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _NEGATE = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
+_FUSED = {("eq", "gt", "eq"): ">=", ("eq", "lt", "eq"): "<="}     # cror: the eq bit now means >= / <=
+
+
+def _branch_conds(entry: tuple, suffix: str) -> tuple:
+    """(taken, fallthrough) conditions of `b<suffix>` on a condition-register field.
+
+    A float compare whose eq bit was or-ed with gt/lt (`fcmpo; cror eq, gt, eq`) is `x >= y`
+    (`x <= y`); its negation stays `!(x >= y)`, since `x < y` compiles to a plain `bge`."""
+    kind, x, y = entry
+    if kind in _FUSED.values() and suffix in ("eq", "ne"):
+        fused = Op(kind, (x, y), "float")
+        return (fused, Op("!", (fused,), "int")) if suffix == "eq" else (Op("!", (fused,), "int"), fused)
+    if kind in ("float", ">=", "<="):          # a float branch tests one bit: lt, gt or eq
+        bit = Op({"lt": "<", "ge": "<", "gt": ">", "le": ">", "eq": "==", "ne": "=="}[suffix], (x, y), "float")
+        holds = suffix in ("lt", "gt", "eq")
+        return (bit, _negate(bit)) if holds else (_negate(bit), bit)
+    taken = _CMP_OF[suffix]
+    return Op(taken, (x, y), "int"), Op(_NEGATE[taken], (x, y), "int")
 
 
 @dataclass
@@ -962,6 +993,11 @@ class _Executor:
             st.cr[field_] = (kind, x, y)
         elif op in ("fcmpu", "fcmpo"):
             st.cr[a[0]] = ("float", get(a[1]), get(a[2]))
+        elif op == "cror":
+            entry = st.cr.get("cr0")
+            if tuple(a) not in _FUSED or entry is None or entry[0] != "float":
+                raise Unsupported(f"instruction cror {', '.join(a)}")
+            st.cr["cr0"] = (_FUSED[tuple(a)], entry[1], entry[2])
         elif op == "bl":
             self.call(st, seq, a[0], stmts)
         elif op == "mtctr":
@@ -1359,6 +1395,77 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
         return all(i.op in _PURE and not (len(i.args) > 1 and i.args[1].endswith("(r1)")) for i in insns[s0:e0]) \
             and not any(h <= k <= l for l, h in latches.items())
 
+    # short-circuit conditions (Cifuentes' compound conditions): a block that only tests, whose
+    # single predecessor is another test sharing one of its exits, merges with it into
+    # `x || y` / `x && y`. Without this, `if (a || b) X` reaches X from two branches.
+    preds: dict[int, set[int]] = {k: set() for k in range(len(blocks) + 1)}
+    for k in range(len(blocks)):
+        for x in succs(k):
+            preds[x].add(k)
+    loops_of = lambda k: frozenset((h, l) for l, h in latches.items() if h <= k <= l)
+    _TESTS = {"cmpwi", "cmplwi", "cmpw", "cmplw", "fcmpu", "fcmpo", "cror", "andi."}
+
+    def test_only(k: int) -> bool:
+        s0, e0 = blocks[k]
+        for i in insns[s0:e0 - 1]:
+            op = i.op[:-1] if i.op.endswith(".") and i.op != "andi." else i.op
+            if op in ("b", "blr") or not (op in _PURE or op in _TESTS) or \
+                    len(i.args) > 1 and i.args[1].endswith("(r1)"):
+                return False
+        return True
+
+    compound: dict[int, CondNode] = {}
+    for k, (s0, e0) in enumerate(blocks):
+        last = insns[e0 - 1]
+        if _BRANCH.match(last.op) and k not in latches and k not in latches.values() and k + 1 < len(blocks):
+            t = block_of[resolve(_target(last))]
+            if t != k + 1:
+                compound[k] = CondNode([k], (t, k + 1))
+    changed = True
+    while changed:
+        changed = False
+        for x in sorted(compound):
+            X = compound[x]
+            for y in X.exits:
+                Y = compound.get(y)
+                if Y is None or y <= max(X.leaves) or not preds[y] <= set(X.leaves) or not test_only(y) \
+                        or loops_of(y) != loops_of(x):
+                    continue
+                S = X.exits[1] if X.exits[0] == y else X.exits[0]
+                if S == y or S not in Y.exits:
+                    continue
+                O = Y.exits[1] if Y.exits[0] == S else Y.exits[0]
+                compound[x] = CondNode(X.leaves + Y.leaves, (S, O), (X, Y, S))
+                del compound[y]
+                changed = True
+                break
+            if changed:
+                break
+
+    def eval_cond(node: CondNode, st: _State, stmts: list) -> dict:
+        """exit -> (condition to continue there, state there)."""
+        if node.parts is None:
+            k = node.leaves[0]
+            s0, e0 = blocks[k]
+            for i in range(s0, e0 - 1):
+                ex.step(st, i, insns[i], stmts)
+            last = insns[e0 - 1]
+            field_ = last.args[0] if len(last.args) > 1 else "cr0"
+            if field_ not in st.cr:
+                raise Unsupported("branch on a condition the lifter did not see")
+            taken, fall = _branch_conds(st.cr[field_], _BRANCH.match(last.op)[1])
+            return {node.exits[0]: (taken, st), node.exits[1]: (fall, st)}
+        X, Y, S = node.parts
+        rx = eval_cond(X, st, stmts)
+        to_y, st_y = rx[Y.leaves[0]]
+        inner: list = []
+        ry = eval_cond(Y, st_y.copy(), inner)
+        if inner:
+            raise Unsupported("a condition with side effects")
+        O = node.exits[1]
+        return {S: (Op("||", (rx[S][0], ry[S][0]), "int"), _meet(rx[S][1], ry[S][1])),
+                O: (Op("&&", (to_y, ry[O][0]), "int"), ry[O][1])}
+
     def loop_registers(h: int, k: int, rotated: bool) -> tuple[list[str], set[str]]:
         """(carried: read before written in one iteration and written in it, written)."""
         order = list(range(k, k + 1)) + list(range(h, k)) if rotated else list(range(h, k + 1))
@@ -1412,8 +1519,7 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
         field_ = last.args[0] if len(last.args) > 1 else "cr0"
         if field_ not in test_st.cr:
             raise Unsupported("loop branch on a condition the lifter did not see")
-        kind, x, y = test_st.cr[field_]
-        cond = Op(_CMP_OF[_BRANCH.match(last.op)[1]], (x, y), "float" if kind == "float" else "int")   # taken: loop again
+        cond, _ = _branch_conds(test_st.cr[field_], _BRANCH.match(last.op)[1])     # taken: loop again
         updates = []
         new_values = {}
         for var, _ in inits:
@@ -1455,6 +1561,27 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
                 continue
             if k in executed and not pure(k):
                 raise Unsupported("code shared by two branches (goto-like flow)")
+            if k in compound and compound[k].parts is not None:
+                node = compound[k]
+                res = eval_cond(node, st, stmts)
+                executed.update(node.leaves)
+                last_leaf = max(node.leaves)
+                a_, b_ = node.exits
+                then_exit = last_leaf + 1 if last_leaf + 1 in (a_, b_) else min(a_, b_)
+                other_exit = b_ if then_exit == a_ else a_
+                cond = res[then_exit][0]
+                site = blocks[last_leaf][1] - 1
+                j = ipdom(k)
+                then, st_then, exit_then = run(then_exit, j, res[then_exit][1].copy())
+                other, st_other, exit_other = run(other_exit, j, res[other_exit][1].copy())
+                node_if = If(cond, then, other, site)
+                ex.ifs[site] = node_if
+                stmts.append(node_if)
+                if exit_then and exit_other:
+                    return stmts, st_then, True
+                st = st_other if exit_then else st_then if exit_other else _merge(cond, st_then, st_other, site)
+                k = j
+                continue
             executed.add(k)
             s, e = blocks[k]
             body_end = e - 1 if (insns[e - 1].op in ("blr", "b") or _BRANCH.match(insns[e - 1].op)) else e
@@ -1479,9 +1606,7 @@ def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
                 field_ = last.args[0] if len(last.args) > 1 else "cr0"
                 if field_ not in st.cr:
                     raise Unsupported("branch on a condition the lifter did not see")
-                kind, x, y = st.cr[field_]
-                taken = _CMP_OF[_BRANCH.match(last.op)[1]]
-                cond = Op(_NEGATE[taken], (x, y), "float" if kind == "float" else "int")   # fallthrough runs when it holds
+                _, cond = _branch_conds(st.cr[field_], _BRANCH.match(last.op)[1])   # fallthrough runs when it holds
                 j = ipdom(k)
                 then, st_then, exit_then = run(k + 1, j, st.copy())
                 other, st_other, exit_other = run(block_of[resolve(_target(last))], j, st.copy())
@@ -1521,6 +1646,17 @@ def _merge(cond, a: _State, b: _State, site: int = -1) -> _State:
         regs[reg] = va if va == vb else Phi(cond, va, vb, site)
     return _State(regs, a.written | b.written, a.clobbered | b.clobbered, a.stored | b.stored, {},
                   None, a.fresh & b.fresh)
+
+
+def _meet(a: _State, b: _State) -> _State:
+    """The state where two paths join without a choice to record (the exits of a compound
+    condition): registers that differ are unknown afterwards."""
+    regs = {r: v for r, v in a.regs.items() if b.regs.get(r) == v}
+    dropped = (set(a.regs) | set(b.regs)) - set(regs)
+    when = {r: max(a.when.get(r, 0), b.when.get(r, 0)) for r in set(a.when) | set(b.when)}
+    return _State(regs, a.written | b.written, a.clobbered | b.clobbered | dropped, a.stored & b.stored, {},
+                  a.ctr if a.ctr == b.ctr else None, a.fresh & b.fresh,
+                  {k: v for k, v in a.stack.items() if b.stack.get(k) == v}, when)
 
 
 def location_key(b):
@@ -1934,6 +2070,8 @@ class Renderer:
         a = [self.expr(x, top=False) for x in e.args]
         if e.op == "neg" or e.op == "fneg":
             return f"-{a[0]}"
+        if e.op == "!":
+            return f"!{a[0]}"
         if e.op == "fabs":
             raise Unsupported("fabs")
         if e.op == "cntlzw":
@@ -2656,6 +2794,12 @@ class Renderer:
 
 
 def _negate(cond):
+    if isinstance(cond, Op) and cond.op == "!":
+        return cond.args[0]
+    if isinstance(cond, Op) and cond.op in ("||", "&&"):
+        return Op("&&" if cond.op == "||" else "||", tuple(_negate(x) for x in cond.args), "int")
+    if isinstance(cond, Op) and cond.ctype == "float" and cond.op in ("<", ">", ">=", "<="):
+        return Op("!", (cond,), "int")         # !(x < y) is not x >= y for floats, nor in codegen
     if isinstance(cond, Op) and cond.op in _NEGATE:
         return Op(_NEGATE[cond.op], cond.args, cond.ctype)
     return Op("!", (cond,), "int")
@@ -2724,7 +2868,7 @@ def _variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
     if has_flow(lifted):
         values = [st.value for st in _flatten(lifted.tree) if isinstance(st, Return)]
         if all(v is None for v in values):
-            return [Variant((), "void")]
+            return [Variant((), "void"), Variant((), "void", True)]
         modes = ["void", "return"] if lifted.void_first else ["return", "void"]
         if all(isinstance(_simplify(v), Op) and _simplify(v).op in ("==", "!=") or v == Const(0) or v == Const(1)
                for v in values if v is not None):

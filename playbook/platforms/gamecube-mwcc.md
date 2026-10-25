@@ -58,6 +58,11 @@
 - **CodeWarrior virtual destructor shape:** `mr. this; beq`, vtable store(s), base destructor (`li r4, 0; bl __dt__B`, or inlined: another vtable store and another null check), `extsh. flags; ble`, then `operator delete`. A class-specific `operator delete` appears as `__dl__<Class>FPv`. RTTI base lists hold every ancestor, root first, and point at per-unit RTTI copies.
 - **CodeWarrior mangling for calls:** `name__F<params>`, `name__<len><Class>[C]F<params>`, `Q<n>` for nested names. Return types aren't mangled, so a declaration may choose one freely.
 
+## Hand-written assembly
+
+- **What the original wrote in assembly stays assembly, as a whole `asm` function.** Why: no C source compiles to it, and the SDK's own sources do the same. Detect: instructions or register use the compiler never emits (`mftb`, `mtspr`, cache ops, paired-single math outside the frame, `fmadds` under fp_contract off, an `mflr`-first prologue in a 1.3-era unit). An `mftb` inside otherwise compiled code is an inline `asm { }` block in a C function instead.
+- **CodeWarrior's assembler syntax differs from a disassembler's.** `x@sda21(r0)` is `x(r13)` (or `x(r2)` for `.sdata2`/`.sbss2`), and `li rD, x@sda21` is `la rD, x(r13)`. `psq` takes a GQR number (`0`, not `qr0`), CR logic takes bit numbers (`crclr 6`, not `cr1eq`), and SPRs take numbers (`GQR0` = 912). It takes no qualified C++ names, so declare a callee `extern "C"` under its mangled name. Apply: `./dk gen --asm` converts and verifies.
+
 ## Compilers
 
 - **`-char signed` with GC 1.3:** a char compare emitting `cmplwi` where the target has `extsb.` means the unit was built with `-char signed`. Set it per unit (`./dk unit flags`).

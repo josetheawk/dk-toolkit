@@ -349,3 +349,87 @@ class MergedValueTest(unittest.TestCase):
         lifted = gen.lift(gen.parse(asm), no_literals, True)
         src, _ = gen.render_tu(lifted, True, "C", "f", [gen.Variant((), "void")], {}, display=True)
         self.assertIn("int m1;\n    if (arg1 != 0) {\n        m1 = 1;\n    } else {\n        m1 = 2;\n    }\n    m8 = m1;", src)
+
+
+class FloatCompareTest(unittest.TestCase):
+    def _body(self, asm):
+        lifted = gen.lift(gen.parse(asm), no_literals)
+        src, _ = gen.render_tu(lifted, False, "", "f", gen.variants(lifted)[:1], {}, display=True)
+        return src
+
+    def test_cror_is_greater_or_equal_and_its_negation_stays_negated(self):
+        asm = ("/* 80000000 00000000  FC 01 10 40 */\tfcmpo cr0, f1, f2\n"
+               "/* 80000004 00000000  4C 41 13 82 */\tcror eq, gt, eq\n"
+               "/* 80000008 00000000  40 82 00 0C */\tbne .L_80000014\n"
+               "/* 8000000C 00000000  38 00 00 01 */\tli r0, 0x1\n"
+               "/* 80000010 00000000  90 03 00 00 */\tstw r0, 0x0(r3)\n"
+               "/* 80000014 00000000  4E 80 00 20 */\tblr\n")
+        self.assertIn("if (farg0 >= farg1)", self._body(asm))
+        self.assertIn("if (!(farg0 >= farg1))", self._body(asm.replace("bne .L", "beq .L")))
+
+    def test_plain_float_branch_tests_one_bit(self):
+        asm = ("/* 80000000 00000000  FC 01 10 40 */\tfcmpo cr0, f1, f2\n"
+               "/* 80000004 00000000  40 80 00 0C */\tbge .L_80000010\n"
+               "/* 80000008 00000000  38 00 00 01 */\tli r0, 0x1\n"
+               "/* 8000000C 00000000  90 03 00 00 */\tstw r0, 0x0(r3)\n"
+               "/* 80000010 00000000  4E 80 00 20 */\tblr\n")
+        self.assertIn("if (farg0 < farg1)", self._body(asm))
+        self.assertIn("if (!(farg0 < farg1))", self._body(asm.replace("bge .L", "blt .L")))
+
+
+class FrameTest(unittest.TestCase):
+    def test_save_helper_with_a_scheduled_instruction_in_between(self):
+        asm = ("/* 80000000 00000000  94 21 FF E0 */\tstwu r1, -0x20(r1)\n"
+               "/* 80000004 00000000  7C 08 02 A6 */\tmflr r0\n"
+               "/* 80000008 00000000  90 01 00 24 */\tstw r0, 0x24(r1)\n"
+               "/* 8000000C 00000000  39 61 00 20 */\taddi r11, r1, 0x20\n"
+               "/* 80000010 00000000  48 00 00 01 */\tbl _savegpr_29\n"
+               "/* 80000014 00000000  7C 7D 1B 78 */\tmr r29, r3\n"
+               "/* 80000018 00000000  48 00 00 01 */\tbl fn_80001000\n"
+               "/* 8000001C 00000000  39 61 00 20 */\taddi r11, r1, 0x20\n"
+               "/* 80000020 00000000  7F A3 EB 78 */\tmr r3, r29\n"
+               "/* 80000024 00000000  48 00 00 01 */\tbl _restgpr_29\n"
+               "/* 80000028 00000000  80 01 00 24 */\tlwz r0, 0x24(r1)\n"
+               "/* 8000002C 00000000  7C 08 03 A6 */\tmtlr r0\n"
+               "/* 80000030 00000000  38 21 00 20 */\taddi r1, r1, 0x20\n"
+               "/* 80000034 00000000  4E 80 00 20 */\tblr\n")
+        body = gen.strip_frame(gen.parse(asm))
+        self.assertEqual([i.op for i in body], ["mr", "bl", "mr", "blr"])
+
+
+class CompoundConditionTest(unittest.TestCase):
+    OR = ("/* 80000000 00000000  80 03 00 00 */\tlwz r0, 0x0(r3)\n"
+          "/* 80000004 00000000  2C 00 00 00 */\tcmpwi r0, 0x0\n"
+          "/* 80000008 00000000  40 82 00 10 */\tbne .L_80000018\n"
+          "/* 8000000C 00000000  80 03 00 04 */\tlwz r0, 0x4(r3)\n"
+          "/* 80000010 00000000  2C 00 00 00 */\tcmpwi r0, 0x0\n"
+          "/* 80000014 00000000  41 82 00 0C */\tbeq .L_80000020\n"
+          ".L_80000018:\n"
+          "/* 80000018 00000000  38 00 00 01 */\tli r0, 0x1\n"
+          "/* 8000001C 00000000  90 03 00 08 */\tstw r0, 0x8(r3)\n"
+          ".L_80000020:\n"
+          "/* 80000020 00000000  4E 80 00 20 */\tblr\n")
+
+    def test_or_reaching_one_block_from_two_tests(self):
+        lifted = gen.lift(gen.parse(self.OR), no_literals, True)
+        src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
+        self.assertIn("if ((m0 != 0) || (m4 != 0)) {\n        m8 = 1;\n    }", src)
+
+    def test_and_with_an_else_arm(self):
+        asm = ("/* 80000000 00000000  80 03 00 00 */\tlwz r0, 0x0(r3)\n"
+               "/* 80000004 00000000  2C 00 00 00 */\tcmpwi r0, 0x0\n"
+               "/* 80000008 00000000  41 82 00 1C */\tbeq .L_80000024\n"
+               "/* 8000000C 00000000  80 03 00 04 */\tlwz r0, 0x4(r3)\n"
+               "/* 80000010 00000000  2C 00 00 00 */\tcmpwi r0, 0x0\n"
+               "/* 80000014 00000000  41 82 00 10 */\tbeq .L_80000024\n"
+               "/* 80000018 00000000  38 00 00 01 */\tli r0, 0x1\n"
+               "/* 8000001C 00000000  90 03 00 08 */\tstw r0, 0x8(r3)\n"
+               "/* 80000020 00000000  48 00 00 0C */\tb .L_8000002C\n"
+               ".L_80000024:\n"
+               "/* 80000024 00000000  38 00 00 02 */\tli r0, 0x2\n"
+               "/* 80000028 00000000  90 03 00 08 */\tstw r0, 0x8(r3)\n"
+               ".L_8000002C:\n"
+               "/* 8000002C 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(gen.parse(asm), no_literals, True)
+        src, _ = gen.render_tu(lifted, True, "C", "f", gen.variants(lifted)[:1], {}, display=True)
+        self.assertIn("if ((m0 != 0) && (m4 != 0)) {\n        m8 = 1;\n    } else {\n        m8 = 2;\n    }", src)

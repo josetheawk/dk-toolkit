@@ -15,7 +15,7 @@ already-matched neighbours in the unit, and the relevant headers.
 ## Ratchets: improvement may never make things worse
 
 - **Progress floor.** Matched functions, linked bytes and linked units are recorded in a committed floor file. Commits below it are refused, and successful commits raise it. Lowering the floor is a human decision with a recorded reason.
-- **Forbidden patterns stay at zero** (inline asm, pointer-plus-offset field access, workaround pragmas). They're checked on the unit's files at every commit.
+- **Forbidden patterns stay at zero** (pointer-plus-offset field access, workaround pragmas). They're checked on the unit's files at every commit.
 - **Placeholder debt is measured** (unnamed functions and globals, `Unk` types, offset-named members, slot-named virtuals, pad arrays). Refinement passes pay it down. The floor and the forbidden list keep those gains.
 - **Renames update the sources** that reference the old placeholder, so naming work can't silently break a match.
 - **Never prove against stale outputs.** Force the split or analysis step to re-run whenever its inputs changed, independent of the build system's dependency records, and periodically build HEAD in a clean worktree (`dk verify-head`) to prove every commit is self-contained.
@@ -47,7 +47,7 @@ Merge duplicate struct definitions into shared headers, and delete obsolete work
 
 - Hard-coded struct offsets or casts to `char*` + offset where a field belongs.
 - Register-forcing tricks, dummy variables or reordered statements with no source-level reason.
-- Inline asm in game code.
+- Assembly for code the compiler produced. Assembly is right only where the original was hand-written assembly: instructions or register use the compiler never emits (`mftb`, paired-single math, `fmadds` with fp_contract off), written as a whole `asm` function the way the original was.
 - Invented names presented as real. Use placeholders unless there's evidence.
 - Magic constants that have a symbolic meaning available (enum, define, sizeof).
 - Copy-paste duplicates of an existing inline or helper.
