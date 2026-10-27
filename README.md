@@ -46,3 +46,8 @@ NEW_PROJECT.md           how to start a decomp with this toolkit
 
 New lessons go in `playbook/`, in its format: rule → why → how to apply. Keep it within the
 budgets.
+
+## License
+
+MIT, see [LICENSE](LICENSE). A copy also sits in `tools/dk/LICENSE`, so it travels with every
+project's vendored toolkit.
