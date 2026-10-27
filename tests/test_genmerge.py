@@ -146,6 +146,21 @@ class PasteTest(unittest.TestCase):
         self.assertNotIn("struct Hdr {", ok)
 
 
+    def test_a_declaration_two_drafts_share_is_written_once(self):
+        a = 'extern "C" void shared(int);\nvoid fn_50() {\n    shared(1);\n}\n'
+        b = 'extern "C" void shared(int);\nvoid fn_200() {\n    shared(2);\n}\n'
+        src = self.paste().add(a, 0x50).add(b, 0x200).render()
+        self.assertEqual(src.count('extern "C" void shared(int);'), 1)
+        self.assertLess(src.index('extern "C" void shared(int);'), src.index("void fn_50()"))
+
+    def test_a_declaration_from_lower_in_the_source_moves_up(self):
+        lines = SOURCE.replace("// a later function\n", '// a later function\nextern "C" void low(int);\n').splitlines()
+        starts = {lines.index("void Foo::fn_100() {"): 0x100, lines.index("void Foo::fn_300() {}"): 0x300}
+        paste = genmerge.Paste.of("\n".join(lines) + "\n", PRE, starts)
+        src = paste.add('extern "C" void low(int);\nvoid fn_50() {\n    low(1);\n}\n', 0x50).render()
+        self.assertEqual(src.count('extern "C" void low(int);'), 1)
+        self.assertLess(src.index('extern "C" void low(int);'), src.index("void fn_50()"))
+
 
 HEADER = """class Box : public Base {
 public:
@@ -181,3 +196,57 @@ class HeaderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+DTOR_A = """struct M {
+    char _pad0[0x1];
+    ~M();
+};
+struct B {
+    virtual ~B();
+    static void operator delete(void*);
+};
+struct C : B {
+    char _pad4[0x4];
+    M m8;
+    virtual ~C();
+};
+C::~C() {}
+"""
+DTOR_B = """struct B {
+    virtual ~B();
+    static void operator delete(void*);
+};
+struct D : B {
+    virtual ~D();
+};
+struct C : B {
+    char _pad4[0xC];
+    int m10;
+    virtual ~C();
+};
+D::~D() {}
+"""
+
+
+class DerivedMembersTest(unittest.TestCase):
+    """A destructor's class keeps its member objects (they are destroyed in its destructor)."""
+
+    def test_members_stay_on_the_derived_class(self):
+        u = genmerge.Unit().add(DTOR_A, 1).add(DTOR_B, 2)
+        c = u.structs["C"]
+        self.assertEqual((c.base, c.start, sorted(c.fields)), ("B", 4, [8, 0x10]))
+        self.assertEqual(u.structs["B"].virtuals, ["virtual ~B();"])           # no slot for ~C or ~D
+        self.assertIn("virtual ~D();", u.structs["D"].methods)
+        lines = genmerge.struct_lines("C", c)
+        self.assertEqual(lines[1:4], ["    char _pad4[0x4];", "    M m8;", "    char _pad9[0x7];"])
+
+    def test_a_base_growing_over_the_members_conflicts(self):
+        grown = "struct B {\n    virtual ~B();\n    char _pad4[0x8];\n    int mC;\n};\nvoid f() {}\n"
+        with self.assertRaises(genmerge.Conflict):
+            genmerge.Unit().add(DTOR_A, 1).add(grown, 2)
+
+    def test_two_destructor_declarations_conflict(self):
+        inline = DTOR_B.replace("struct D : B {\n    virtual ~D();", "struct D : B {\n    virtual ~D() {}")
+        with self.assertRaises(genmerge.Conflict):
+            genmerge.Unit().add(DTOR_B, 1).add(inline, 2)

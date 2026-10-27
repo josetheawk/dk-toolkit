@@ -47,7 +47,7 @@ class CompareTest(unittest.TestCase):
     """The verifier must reject a relocation to the right symbol with the wrong addend."""
 
     def test_addend_mismatch_is_rejected(self):
-        from tools.dk.platforms.gc_mwcc.elf import Elf, ElfSection, ElfSymbol, Function, Reloc
+        from tools.dk.platforms.gc_mwcc.elf import Function, Reloc
         insns = gen.parse("/* 80000000 00000000  80 6D 00 00 */\tlwz r3, lbl_80390000@sda21(r0)\n"
                           "/* 80000004 00000000  4E 80 00 20 */\tblr\n")
 
@@ -421,7 +421,7 @@ class CallArgumentTest(unittest.TestCase):
 """
         lifted = gen.lift(gen.parse(asm), no_literals, False, lambda name: (8, 8))
         src, _ = gen.render_tu(lifted, False, "G", "f", [gen.Variant((), "void")], {}, display=True)
-        self.assertIn('extern "C" void printf(int, ...);', src)
+        self.assertIn('extern "C" int printf(const char*, ...);', src)     # the C library's prototype
         self.assertIn("    printf(arg0, 5);", src)
 
     def test_a_locals_address_in_a_later_register_is_an_argument(self):
@@ -591,3 +591,138 @@ class CountedLoopTest(unittest.TestCase):
         self.assertEqual((loop.kind, loop.cond), ("for", gen.Const(4)))
         src, _ = gen.render_tu(lifted, False, "", "f", gen.variants(lifted)[:1], {}, display=True)
         self.assertIn("for (i = 0; i < 4; i++) {", src)
+
+
+FACTORY = """
+/* 801F92E8 001F6208  94 21 FF F0 */\tstwu r1, -0x10(r1)
+/* 801F92EC 001F620C  7C 08 02 A6 */\tmflr r0
+/* 801F92F0 001F6210  38 80 00 00 */\tli r4, 0x0
+/* 801F92F4 001F6214  38 AD C3 A4 */\tli r5, lbl_80390DE4@sda21
+/* 801F92F8 001F6218  90 01 00 14 */\tstw r0, 0x14(r1)
+/* 801F92FC 001F621C  93 E1 00 0C */\tstw r31, 0xc(r1)
+/* 801F9300 001F6220  7C 7F 1B 78 */\tmr r31, r3
+/* 801F9304 001F6224  38 60 01 14 */\tli r3, 0x114
+/* 801F9308 001F6228  48 00 88 09 */\tbl __nw__7GObjectFUliPCc
+/* 801F930C 001F622C  7C 60 1B 79 */\tmr. r0, r3
+/* 801F9310 001F6230  41 82 00 10 */\tbeq .L_801F9320
+/* 801F9314 001F6234  7F E4 FB 78 */\tmr r4, r31
+/* 801F9318 001F6238  48 03 41 89 */\tbl __ct__7GWidgetFP3GUI
+/* 801F931C 001F623C  7C 60 1B 78 */\tmr r0, r3
+.L_801F9320:
+/* 801F9320 001F6240  7C 03 03 78 */\tmr r3, r0
+/* 801F9324 001F6244  80 01 00 14 */\tlwz r0, 0x14(r1)
+/* 801F9328 001F6248  83 E1 00 0C */\tlwz r31, 0xc(r1)
+/* 801F932C 001F624C  7C 08 03 A6 */\tmtlr r0
+/* 801F9330 001F6250  38 21 00 10 */\taddi r1, r1, 0x10
+/* 801F9334 001F6254  4E 80 00 20 */\tblr
+"""
+
+
+class NewExpressionTest(unittest.TestCase):
+    def test_new_with_placement_and_constructor(self):
+        lifted = gen.lift(gen.parse(FACTORY), lambda s, n, o=0: None)
+        (call,) = lifted.calls
+        self.assertEqual((call.callee, call.new.callee, call.new.size, call.new.cls),
+                         ("__ct__7GWidgetFP3GUI", "__nw__7GObjectFUliPCc", 0x114, ("GWidget",)))
+        v = next(v for v in gen.variants(lifted) if v.ret_mode == "return")
+        src, _ = gen.render_tu(lifted, False, "G", "f", [v], {"lbl_80390DE4": 8}, standalone=True)
+        self.assertIn("struct GObject {\n    static void* operator new(unsigned long, int, const char*);\n};", src)
+        self.assertIn("struct GWidget : GObject {", src)
+        self.assertIn("char _pad0[0x114];", src)
+        self.assertIn("extern const char lbl_80390DE4[8];", src)
+        self.assertIn('extern "C" GWidget* f(GUI* arg0) {\n    return new (0, lbl_80390DE4) GWidget(arg0);\n}', src)
+
+    def test_the_null_check_is_only_dropped_around_a_constructor(self):
+        insns, news = gen._new_expressions(gen.strip_frame(gen.parse(FACTORY)))
+        self.assertEqual([i.op for i in insns][:8], ["li", "li", "mr", "li", "bl", "mr", "bl", "mr"])
+        self.assertEqual(news, {6: 4})
+        plain = FACTORY.replace("bl __nw__7GObjectFUliPCc", "bl fn_80001000")
+        self.assertEqual(gen._new_expressions(gen.strip_frame(gen.parse(plain)))[1], {})
+
+
+class OwnParamsTest(unittest.TestCase):
+    """Parameter types from the function's own mangled name."""
+
+    def test_reference_parameter(self):
+        from tools.dk.platforms.gc_mwcc.demangle import demangle
+        insns = gen.parse("/* 80001000 00000000  80 64 00 04 */\tlwz r3, 0x4(r4)\n/* 80001004 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(insns, lambda s, n, o=0: None, True, own=demangle("get__1CFRC1G"))
+        v = next(v for v in gen.variants(lifted) if v.ret_mode == "return")
+        src, _ = gen.render_tu(lifted, True, "C", "get", [v], {}, standalone=True)
+        self.assertIn("int C::get(const G& arg1) {\n    return arg1.m4;\n}", src)
+
+    def test_unused_parameters_stay_in_the_signature(self):
+        from tools.dk.platforms.gc_mwcc.demangle import demangle
+        insns = gen.parse("/* 80001000 00000000  38 60 00 01 */\tli r3, 0x1\n/* 80001004 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(insns, lambda s, n, o=0: None, False, own=demangle("f__FiPCcf"))
+        v = next(v for v in gen.variants(lifted) if v.ret_mode == "return")
+        src, _ = gen.render_tu(lifted, False, "G", "f", [v], {}, standalone=True)
+        self.assertIn("int f(int arg0, const char* arg1, float farg0)", src)
+
+    def test_operator_calls_are_member_calls(self):
+        insns = gen.parse("/* 80001000 00000000  48 00 00 01 */\tbl __as__6GUIStrFRC6GUIStr\n"
+                          "/* 80001004 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(insns, lambda s, n, o=0: None)
+        self.assertEqual(lifted.calls[0].cxx.name, "operator=")
+
+
+class FunctionPointerTest(unittest.TestCase):
+    def test_call_through_a_global_function_pointer(self):
+        insns = gen.parse("/* 80001000 00000000  94 21 FF F0 */\tstwu r1, -0x10(r1)\n"
+                          "/* 80001004 00000000  7C 08 02 A6 */\tmflr r0\n"
+                          "/* 80001008 00000000  90 01 00 14 */\tstw r0, 0x14(r1)\n"
+                          "/* 8000100C 00000000  38 80 00 3C */\tli r4, 0x3c\n"
+                          "/* 80001010 00000000  81 8D B7 D4 */\tlwz r12, lbl_80390214@sda21(r0)\n"
+                          "/* 80001014 00000000  7D 89 03 A6 */\tmtctr r12\n"
+                          "/* 80001018 00000000  4E 80 04 21 */\tbctrl\n"
+                          "/* 8000101C 00000000  80 01 00 14 */\tlwz r0, 0x14(r1)\n"
+                          "/* 80001020 00000000  7C 08 03 A6 */\tmtlr r0\n"
+                          "/* 80001024 00000000  38 21 00 10 */\taddi r1, r1, 0x10\n"
+                          "/* 80001028 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(insns, lambda s, n, o=0: None, False, params=(2, 0))
+        (call,) = lifted.calls
+        self.assertIsNotNone(call.fnptr)
+        src, _ = gen.render_tu(lifted, False, "G", "f", [gen.Variant((), "void")], {}, standalone=True)
+        self.assertIn("extern void (*lbl_80390214)(int, int);", src)
+        self.assertIn("    lbl_80390214(arg0, 60);", src)
+
+
+class CodeAddressTest(unittest.TestCase):
+    def test_a_parameter_compared_with_a_static_function(self):
+        from tools.dk.platforms.gc_mwcc.demangle import demangle
+        insns = gen.parse("/* 8004C90C 00000000  3C 60 80 05 */\tlis r3, ClassName__3GUIFv@ha\n"
+                          "/* 8004C910 00000000  38 03 C9 28 */\taddi r0, r3, ClassName__3GUIFv@l\n"
+                          "/* 8004C914 00000000  7C 04 00 50 */\tsubf r0, r4, r0\n"
+                          "/* 8004C918 00000000  7C 00 00 34 */\tcntlzw r0, r0\n"
+                          "/* 8004C91C 00000000  54 00 D9 7E */\tsrwi r0, r0, 5\n"
+                          "/* 8004C920 00000000  54 03 06 3E */\tclrlwi r3, r0, 24\n"
+                          "/* 8004C924 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(insns, lambda s, n, o=0: None, True, own=demangle("vf3__3GUIFPFv_PCc"))
+        v = next(v for v in gen.variants(lifted) if v.ret_mode == "return")
+        src, _ = gen.render_tu(lifted, True, "GUI", "vf3", [v], {}, standalone=True)
+        self.assertIn("    static const char* ClassName();", src)
+        self.assertIn("int GUI::vf3(const char* (*arg1)()) {\n    return (arg1 == &GUI::ClassName) & 0xFF;", src)
+        self.assertNotIn("extern", src)
+
+
+class MangledNameTest(unittest.TestCase):
+    """A mangled name is never drafted as an extern "C" function (that duplicates the member)."""
+
+    def test_nested_class_member_and_free_function(self):
+        from tools.dk.platforms.gc_mwcc import gencmd
+        self.assertEqual(gencmd._mangled_prefix("fn_800CD9B0__Q22AI9AINetworkFv"), "fn_800CD9B0")
+        self.assertEqual(gencmd._mangled_prefix("__ct__Q22AI7CopBaseFPv"), "__ct")
+        self.assertEqual(gencmd._cxx_free("fn_80084438__Fi"), "fn_80084438")
+        self.assertIsNone(gencmd._cxx_free("fn_800CD9B0__Q22AI9AINetworkFv"))
+        self.assertIsNone(gencmd._cxx_free("fn_80084438"))
+        draft = 'extern "C" void fn_800CD9B0__Q22AI9AINetworkFv() {}\n'
+        self.assertEqual([m[1] for m in gencmd._C_DEFINITION.finditer(draft)], ["fn_800CD9B0__Q22AI9AINetworkFv"])
+
+    def test_free_cxx_function_head(self):
+        from tools.dk.platforms.gc_mwcc.demangle import demangle
+        insns = gen.parse("/* 80001000 00000000  1C 63 00 03 */\tmulli r3, r3, 0x3\n/* 80001004 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(insns, lambda s, n, o=0: None, False, own=demangle("fn_80084438__Fi"))
+        v = next(v for v in gen.variants(lifted) if v.ret_mode == "return")
+        src, _ = gen.render_tu(lifted, False, "G", "fn_80084438", [v], {}, standalone=True, cxx_free=True)
+        self.assertIn("int fn_80084438(int arg0) {", src)
+        self.assertNotIn('extern "C"', src)

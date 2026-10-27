@@ -8,7 +8,6 @@ cannot be committed, and progress is monotonic by construction.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import tomllib
 from pathlib import Path
 
@@ -41,6 +40,19 @@ def parse(text: str) -> dict[str, int]:
     return {k: int(data.get(k, 0)) for k in KEYS}
 
 
+def units(text: str) -> dict[str, int]:
+    """The floor file's per-unit table: exact functions per unit at the commit that wrote it."""
+    return {k: int(v) for k, v in tomllib.loads(text).get("units", {}).items()}
+
+
+def committed_units(cfg: Config) -> dict[str, int]:
+    """HEAD's per-unit exact-function counts, from its floor file (empty before the first
+    commit that records them)."""
+    from . import isolated
+    data = isolated.show(cfg, cfg.rel(path(cfg)))
+    return units(data.decode()) if data is not None else {}
+
+
 def committed(cfg: Config) -> dict[str, int]:
     """The floor as committed at the verified (pinned) HEAD; the shared working copy may be
     ahead or behind. A newer floor lands with a newer HEAD, and then the commit is retried."""
@@ -55,27 +67,23 @@ def gate(cfg: Config, measures: dict) -> tuple[list[str], str]:
     now = {k: int(measures.get(k, 0) or 0) for k in KEYS}
     floor = committed(cfg)
     below = [f"{k} {now[k]} < floor {floor[k]}" for k in KEYS if now[k] < floor[k]]
-    return below, render({k: max(now[k], floor[k]) for k in KEYS})
+    return below, render({k: max(now[k], floor[k]) for k in KEYS}, measures.get("units"))
 
 
-def render(values: dict[str, int]) -> str:
-    return ("# Progress floor: may only go up. Written by ./dk accept and ./dk save.\n"
+def render(values: dict[str, int], per_unit: dict[str, int] | None = None) -> str:
+    text = ("# Progress floor: may only go up. Written by ./dk accept and ./dk save.\n"
             + "".join(f"{k} = {values[k]}\n" for k in KEYS))
+    if per_unit:
+        text += ("\n# Exact functions per unit at this commit (not a floor: an integration holds back a unit\n"
+                 "# whose count fell below it).\n[units]\n"
+                 + "".join(f'"{name}" = {count}\n' for name, count in sorted(per_unit.items())))
+    return text
 
 
 def check(cfg: Config) -> list[str]:
     """Regressions against the floor, as messages (empty = OK)."""
     now, floor = current(cfg), read(cfg)
     return [f"{k} {now[k]} < floor {floor[k]}" for k in KEYS if now[k] < floor[k]]
-
-
-def raise_floor(cfg: Config) -> bool:
-    now, floor = current(cfg), read(cfg)
-    new = {k: max(now[k], floor[k]) for k in KEYS}
-    if new == floor and path(cfg).is_file():
-        return False
-    path(cfg).write_text(render(new))
-    return True
 
 
 def run(cfg: Config, args: argparse.Namespace) -> int:

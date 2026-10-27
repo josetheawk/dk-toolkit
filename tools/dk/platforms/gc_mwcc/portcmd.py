@@ -22,7 +22,6 @@ from pathlib import Path
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from ...core.util import run_ninja
 from ...core.doclint import GENERATED_MARK
 from . import acceptcmd
 from .dol import Dol

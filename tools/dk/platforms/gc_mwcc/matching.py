@@ -42,6 +42,7 @@ class UnitScore:
     stripped: list[str] = field(default_factory=list)    # in source, absent from target (linker drops them)
     weak_copies: list[str] = field(default_factory=list)  # data the original link discarded (weak copies, stripped-only)
     data_problems: list[str] = field(default_factory=list)  # vtable slots pointing at other functions
+    link_notes: list[str] = field(default_factory=list)     # what the link will do differently (not scored)
 
     @property
     def code_percent(self) -> float:
@@ -611,6 +612,227 @@ def _names_by_address(cfg: Config) -> dict[int, str]:
     return _NAMES[key]
 
 
+_INDEX: dict = {}
+
+
+def _placeholders_by_size(cfg: Config) -> tuple[set[str], dict[int, list[tuple[int, str]]]]:
+    """(every symbols.txt name, size -> [(address, name)] of its fn_ADDR functions), cached per file version."""
+    path = cfg.root / cfg.platform_options["symbols"]
+    key = (path, path.stat().st_mtime_ns)
+    if key not in _INDEX:
+        _INDEX.clear()
+        symbols = read_symbols(path)
+        by_size: dict[int, list[tuple[int, str]]] = {}
+        for x in symbols:
+            if x.type == "function" and x.name.startswith("fn_") and _AUTO_NAME.match(x.name):
+                by_size.setdefault(x.size, []).append((x.address, x.name))
+        _INDEX[key] = ({x.name for x in symbols}, by_size)
+    return _INDEX[key]
+
+
+_LINKED: dict = {}
+
+
+def _in_linked_unit(cfg: Config, address: int) -> bool:
+    """Is `address` inside a linked unit's .text (whose compiled object carries the real names)?"""
+    path = cfg.root / cfg.platform_options["splits"]
+    key = (path, path.stat().st_mtime_ns)
+    if key not in _LINKED:
+        _LINKED.clear()
+        done = {u["name"].split("/", 1)[-1] for u in load_objdiff_units(cfg) if u.get("metadata", {}).get("complete")}
+        _LINKED[key] = [(a, b) for unit in read_units(path) if unit.name.rsplit(".", 1)[0] in done
+                        for sec, a, b in unit.splits if sec == ".text"]
+    return any(a <= address < b for a, b in _LINKED[key])
+
+
+def weak_only(target: Elf, base: Elf, elsewhere: set[str]) -> dict[str, list[tuple[int, int, str]]]:
+    """Per section, our non-weak objects that only weak copies the target lacks while another
+    unit has them (`elsewhere`: names symbols.txt defines) reach, directly or through each other:
+    the link discards those copies as duplicates and strips what only they use. A copy that is
+    merely dead-stripped (no unit keeps one) keeps its literals."""
+    want = {x.name for x in target.symbols if x.name and x.shndx}
+    sized = [x for x in base.symbols if x.name and x.size and 0 < x.shndx < len(base.sections)]
+    by_sec: dict[int, list[tuple[int, int, str]]] = {}
+    for x in sized:
+        by_sec.setdefault(x.shndx, []).append((x.value, x.value + x.size, x.name))
+    at = lambda shndx, off: next((n for lo, hi, n in by_sec.get(shndx, []) if lo <= off < hi), None)
+    index = {x.name: x for x in sized}
+    referrers: dict[str, set[str]] = {}
+    for sec in base.sections:
+        if sec.type != 4 or not 0 < sec.info < len(base.sections):
+            continue
+        for r in base.relocations(sec.info):
+            holder = at(sec.info, r.offset) or "?"
+            tsec = next((t.index for t in base.sections if t.name == r.target_section), None) if r.target_section else None
+            target_name = at(tsec, r.target_value + r.addend) if tsec is not None else None
+            referrers.setdefault(target_name or r.symbol, set()).add(holder)
+    gone = {x.name for x in sized if x.bind == STB_WEAK and x.name not in want and x.name in elsewhere}
+    forced = base.force_active()                 # kept by the link whatever uses them
+    closure: set[str] = set()
+    while True:
+        more = {n for n, x in index.items() if n not in gone and n not in closure and x.bind != STB_WEAK
+                and x.type != 2 and n not in forced and referrers.get(n) and referrers[n] <= gone | closure}
+        if not more:
+            break
+        closure |= more
+    out: dict[str, list[tuple[int, int, str]]] = {}
+    for n in sorted(closure):
+        x = index[n]
+        out.setdefault(base.sections[x.shndx].name, []).append((x.value, x.value + x.size, n))
+    return out
+
+
+def vtables_out_of_order(target: Elf, base: Elf) -> list[str]:
+    """A vtable the target has earlier than ours, behind weak vtable copies the target lacks: the
+    class's own RTTI and vtable come out where its key function (first declared non-inline
+    virtual) is defined and the copies where first stored, in reverse order of first need."""
+    ts, bs = target.section(".data"), base.section(".data")
+    if ts is None or bs is None:
+        return []
+    names = {x.name for x in target.symbols if x.shndx == ts.index and x.name}
+    tat = {x.name: x.value for x in target.symbols if x.shndx == ts.index and x.name.startswith("__vt__")}
+    ours = sorted((x.value, x.name, x.bind) for x in base.symbols if x.shndx == bs.index and x.name.startswith("__vt__"))
+    out = []
+    for value, name, bind in ours:
+        if name not in tat or value <= tat[name]:
+            continue
+        before = [n for v, n, b in ours if v < value and b == STB_WEAK and n not in names]
+        if before:
+            cls = demangle_class(name[6:])
+            out.append(f"{name} sits after the weak copies {', '.join(before[:3])} in ours, earlier in the target: "
+                       f"make another virtual than the destructor the first one {cls or 'the class'} declares (its key "
+                       f"function), so its RTTI and vtable come first")
+    return out
+
+
+def demangle_class(mangled: str) -> str | None:
+    m = re.match(r"(\d+)(\w+)", mangled)
+    return m.group(2)[:int(m.group(1))] if m else None
+
+
+SMALL_DATA = (".sdata", ".sdata2")
+
+
+def kept_by_original(target: Elf, base: Elf, elsewhere: set[str]) -> list[str]:
+    """Small-data objects of ours that only discarded weak copies use (the link strips them there;
+    in .data it keeps them in place)
+    while the original holds the same, non-zero bytes at the same place: the original kept them,
+    so ours must too (`#pragma force_active on` over the code that emits them is the project's
+    documented way for data the original kept unreferenced)."""
+    out = []
+    for sec_name, ranges in sorted(weak_only(target, base, elsewhere).items()):
+        if sec_name not in SMALL_DATA:
+            continue                             # .data keeps them in place (vtables zero-filled)
+        ts, bs = target.section(sec_name), base.section(sec_name)
+        if ts is None or bs is None or ts.type == 8 or bs.type == 8:
+            continue
+        kept = [(name, hi - lo) for lo, hi, name in ranges
+                if bs.data[lo:hi].strip(b"\0") and ts.data[lo:hi] == bs.data[lo:hi]]
+        if kept:
+            out.append(f"the original keeps 0x{sum(n for _, n in kept):X} bytes of {sec_name} that only discarded weak copies "
+                       f"use ({', '.join(name for name, _ in kept[:5])}{' …' if len(kept) > 5 else ''}): the link strips "
+                       f"them; consider #pragma force_active on over the code that emits them")
+    return out
+
+
+def _reloc_sites(elf: Elf) -> dict[str, list[tuple[str, int]]]:
+    """Symbol name -> [(referencing object or function, offset in it)] over every relocation."""
+    owner: dict[int, list[tuple[int, int, str]]] = {}
+    for x in elf.symbols:
+        if x.name and x.type in (1, 2) and 0 < x.shndx < len(elf.sections):
+            owner.setdefault(x.shndx, []).append((x.value, x.value + max(x.size, 1), x.name))
+    out: dict[str, list[tuple[str, int]]] = {}
+    for sec in elf.sections:
+        if sec.type != 4 or not 0 < sec.info < len(elf.sections):
+            continue
+        for r in elf.relocations(sec.info):
+            hit = next(((n, r.offset - lo) for lo, hi, n in owner.get(sec.info, []) if lo <= r.offset < hi), None)
+            if hit:
+                out.setdefault(r.symbol, []).append(hit)
+    return out
+
+
+def undefined_at_link(cfg: Config, target: Elf, base: Elf, exact: set[str] | None = None,
+                      shifted: set[str] = frozenset()) -> list[str]:
+    """Names our object needs that nothing will define at link: ones symbols.txt lacks (with the
+    placeholder the original has in the same vtable slot or call, to rename), and ones the original
+    defines in this unit while ours only declares them (an `extern` for the unit's own data).
+    `exact`: our exact functions; a call site in another function is no evidence (offsets drift),
+    nor is a slot of a vtable in `shifted` (its other slots disagree: a missing or extra virtual)."""
+    names, _ = _placeholders_by_size(cfg)
+    mine = {x.name for x in base.symbols if x.name and 0 < x.shndx < len(base.sections)}
+    theirs = {x.name for x in target.symbols if x.name and 0 < x.shndx < len(target.sections)}
+    undefined = sorted({x.name for x in base.symbols if x.name and x.shndx == 0 and x.type in (0, 1, 2)} - mine)
+    if not undefined:
+        return []
+    ours_at, target_at = _reloc_sites(base), None
+    funcs = {x.name for x in base.symbols if x.type == 2}
+    data = {x.name for x in target.symbols if x.type == 1 and 0 < x.shndx < len(target.sections)}
+    out = []
+    for name in undefined:
+        kept = [site for site in ours_at.get(name, []) if site[0] in theirs]   # used by what the link keeps
+        if not kept:
+            continue
+        evidence = [site for site in kept if site[0] not in shifted
+                    and (exact is None or site[0] not in funcs or site[0] in exact)]
+        if target_at is None:
+            target_at = {site: n for n, sites in _reloc_sites(target).items() for site in sites}
+        if name not in theirs and all(target_at.get(site) == name for site in kept):
+            continue                       # the original references it there too: its link defines it
+        if name in theirs:
+            if name not in data:
+                continue                   # an unwritten function: its absence shows in the layout already
+            out.append(f"undefined at link: ours references {name}, which the original defines in this unit, but ours "
+                       f"does not define it (an extern for the unit's own data: define it, or write the literal)")
+        elif name not in names:
+            was = sorted({target_at[site] for site in evidence if site in target_at} - {name})
+            fix = f": rename {was[0]} to {name}" if len(was) == 1 and _AUTO_NAME.match(was[0]) else \
+                f" (the original has {', '.join(was[:3])} there)" if was else ""
+            out.append(f"undefined at link: {name} is not in symbols.txt{fix}")
+    return out
+
+
+_ORIGINAL: dict = {}
+
+
+def unnamed_copies(cfg: Config, base: Elf, stripped: list[str]) -> list[str]:
+    """Force-active weak copies (inline functions in a `#pragma force_active` unit) that the target
+    unit lacks and symbols.txt does not name, while a placeholder (fn_ADDR) of the same size outside
+    the linked units holds the same code: the original's surviving copy, still unnamed. The link
+    finds no other definition of the name and keeps ours, so the linked unit grows by its size."""
+    if not stripped or not getattr(cfg, "original", None) or not cfg.original.is_file():
+        return []
+    names, by_size = _placeholders_by_size(cfg)
+    weak = {x.name for x in base.symbols if x.type == 2 and x.bind == STB_WEAK and x.name in stripped
+            and x.name not in names}
+    weak = sorted(weak & base.force_active())           # force-active copies the link always keeps
+    if not weak:
+        return []
+    from .dol import Dol
+    if cfg.original not in _ORIGINAL:
+        _ORIGINAL.clear()
+        _ORIGINAL[cfg.original] = Dol.parse(cfg.original.read_bytes())
+    dol, fns, out = _ORIGINAL[cfg.original], base.functions(), []
+    for name in weak:
+        f = fns.get(name)
+        mine = _masked(f.code, f.relocs) if f is not None and f.code else None
+        if mine is None:
+            continue
+        hits = []
+        for address, placeholder in by_size.get(len(f.code), []):
+            try:
+                if _masked(dol.read(address, len(f.code)), f.relocs) == mine:
+                    hits.append(placeholder)
+            except (ValueError, IndexError):
+                continue
+        hits = [h for h in hits if not _in_linked_unit(cfg, int(h[3:], 16))]   # a linked unit defines the real name
+        if 0 < len(hits) <= 3:
+            out.append(f"rename {hits[0]} to {name}" + (f" (or {', '.join(hits[1:])})" if len(hits) > 1 else "")
+                       + f": it holds the original's copy of this weak function, so while it is unnamed the link "
+                         f"keeps ours (+0x{len(f.code):X} bytes)")
+    return out
+
+
 def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
     objdiff = cfg.root / "build" / "tools" / "objdiff-cli"
     # data_value: a relocation only matches if the data it points at matches too (catches a wrong
@@ -683,6 +905,12 @@ def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
             result.layout_problems.append(f"{name}: at {got[0]}+0x{shift[name]:X} (after stripping), target {sec}+0x{off:X}")
     result.stripped = stripped
     result.data_problems = vtable_problems(target_elf, base_elf)
+    result.link_notes += kept_by_original(target_elf, base_elf, _placeholders_by_size(cfg)[0])
+    if result.data.get(".data", 100.0) < 100.0:          # an exact .data shows the link packs it anyway
+        result.link_notes += vtables_out_of_order(target_elf, base_elf)
+    shifted = {p.split("+", 1)[0] for p in result.data_problems}       # vtables whose slots disagree elsewhere
+    result.link_notes = result.link_notes + unnamed_copies(cfg, base_elf, stripped) + undefined_at_link(
+        cfg, target_elf, base_elf, {f.name for f in result.functions if f.percent == 100.0}, shifted)
     result.layout_problems += _nobits_layout_problems(
         target_elf, base_elf, {sec: {name for _, _, name in ranges} for sec, ranges in weak.items()})
     return result
@@ -705,6 +933,9 @@ def render(s: UnitScore) -> list[str]:
         lines += [f"    {p}" for p in s.data_problems]
     lines.append("  layout: " + ("OK" if not s.layout_problems else "MISMATCH"))
     lines += [f"    {p}" for p in s.layout_problems]
+    lines += [f"  link: {n}" for n in s.link_notes[:8]]
+    if len(s.link_notes) > 8:
+        lines.append(f"  link: … {len(s.link_notes) - 8} more")
     return lines
 
 

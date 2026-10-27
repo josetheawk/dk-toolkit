@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 
 from .. import platforms
 from .command import BUILD_ERROR, MISMATCH, OK, USAGE, Command, hint

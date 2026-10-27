@@ -60,14 +60,6 @@ class SymbolIndex:
         i = bisect.bisect_right(self._addresses, address) - 1
         return self._symbols[i] if i >= 0 else None
 
-    def first_at_or_after(self, address: int, section: str) -> int | None:
-        i = bisect.bisect_left(self._addresses, address)
-        while i < len(self._symbols):
-            if self._symbols[i].section == section:
-                return self._symbols[i].address
-            i += 1
-        return None
-
     def describe(self, address: int) -> str:
         sym = self.at_or_before(address)
         if sym is None:

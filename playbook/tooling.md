@@ -9,7 +9,7 @@
 | Per-function diff, progress report | objdiff (GUI + `objdiff-cli`) | Reads the `objdiff.json` the build writes. |
 | Windows compilers on Linux | wibo | Downloaded by the template; fall back to wine. |
 | Asm → C first draft | m2c | Supports MIPS and PowerPC. |
-| Near-miss brute force | decomp-permuter | Supports mwcc. |
+| Near-miss brute force | decomp-permuter | Supports mwcc. Try it last: random rewrites closed no mwcc near miss in three sessions of parallel agents, while register-numbering diffs follow the allocation rule in the platform notes. |
 | Shared scratch / compiler presets | decomp.me | Good for asking others. Local `dk` commands are faster for search. |
 | Browsing | Ghidra (+ platform loader) | Import dtk symbols for names. |
 
@@ -47,7 +47,8 @@
 - **Judge ratchets on the clean build a commit is made from, never on the shared tree.** Why: the shared tree also holds other agents' half-edited units, so its numbers come and go; a floor raised from them crept above what HEAD builds and then refused honest commits. Apply: build HEAD + the change in a clean worktree, compare that report with the committed floor, and commit the floor raised to it.
 - **Never wait while holding a shared lock.** Why: a retry loop (waiting for another agent's broken source) inside a locked command made every queued command wait in turn; one broken file stalled 16 agents for 20 minutes. Apply: fail fast, name the culprit, and let the caller retry.
 - **Renaming a placeholder to a member's mangled name breaks every unit that still uses it as a C name** (`extern "C"` declarations or blocks, asm `bl`, C files): their link fails with `undefined`, and a hash proof that links only matched units does not notice. Apply: find those uses before renaming and refuse (`dk rename` does).
-- **Shared config files change entry by entry.** A unit's commit composes HEAD's copy plus only that unit's entries; committing the whole file would land other agents' unfinished entries.
+- **A unit's commit carries the headers its source includes, and with them other agents' half-done edits.** Why: one agent's in-progress shared-header edit broke or floor-dropped everyone's saves. Apply: when the clean verify fails, retry with each header that differs from HEAD left at HEAD, and keep an edit only if the units compile and score worse without it.
+- **An integration commit (the whole working state) carries only the decomp's sources and config.** Why: integrations swept toolsmiths' half-finished tool files into HEAD, and one in-progress test blocked every integration. Toolkit and doc changes are committed by their authors when done.
 
 ## GC/Wii template quick start
 

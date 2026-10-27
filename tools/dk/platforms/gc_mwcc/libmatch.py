@@ -12,7 +12,7 @@ from __future__ import annotations
 import bisect
 import os
 import subprocess
-from collections import Counter, defaultdict
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,13 +124,6 @@ class DolIndex:
     def functions_between(self, lo: int, hi: int) -> int:
         """Number of known functions starting in [lo, hi)."""
         return bisect.bisect_left(self.sorted_addresses, hi) - bisect.bisect_left(self.sorted_addresses, lo)
-
-    def read_words(self, address: int, count: int) -> tuple[int, ...] | None:
-        try:
-            raw = self.dol.read(address, count * 4)
-        except ValueError:
-            return None
-        return tuple(int.from_bytes(raw[i:i + 4], "big") for i in range(0, count * 4, 4))
 
     def candidates(self, fn: RefFunction) -> list[int]:
         return [a for a in self.by_size.get(fn.size, []) if masked_equal(self.words[a], fn.words, fn.keep)]

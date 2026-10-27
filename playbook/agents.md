@@ -46,8 +46,8 @@ Merge duplicate struct definitions into shared headers, and delete obsolete work
 ## Review checklist (reject if any apply)
 
 - Hard-coded struct offsets or casts to `char*` + offset where a field belongs.
-- Register-forcing tricks, dummy variables or reordered statements with no source-level reason.
-- Assembly for code the compiler produced. Assembly is right only where the original was hand-written assembly: instructions or register use the compiler never emits (`mftb`, paired-single math, `fmadds` with fp_contract off), written as a whole `asm` function the way the original was.
+- Register-forcing tricks, dummy variables, dummy functions placed to force a layout, or reordered statements with no source-level reason.
+- Assembly for code the compiler produced. Assembly is right only where the original was hand-written assembly (instructions or register use the compiler never emits; the platform notes list them), written as a whole `asm` function the way the original was.
 - Invented names presented as real. Use placeholders unless there's evidence.
 - Magic constants that have a symbolic meaning available (enum, define, sizeof).
 - Copy-paste duplicates of an existing inline or helper.

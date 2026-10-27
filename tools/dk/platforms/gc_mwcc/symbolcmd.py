@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import re
 
-from ...core.command import MISMATCH, OK, USAGE, Command, hint
+from ...core.command import OK, USAGE, Command, hint
 from ...core.config import Config
 from . import dtkconfig
 from .dtk_symbols import is_auto_name

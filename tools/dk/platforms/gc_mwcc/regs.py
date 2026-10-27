@@ -10,11 +10,16 @@ values get registers one at a time, in rank order, and each takes the lowest-num
 already handed out that no interfering value holds, else a new one below (r31 first). Rank:
 compiler temporaries (newest first; a local or parameter merged with one takes its rank), then
 named locals in declaration order, then parameters, last one first.
+
+It also compares how loops index arrays (an offset induction variable, `addi r0, rOff, K; lwzx`,
+versus a stepped pointer: a signed counter converted to unsigned gives the offset). `--try` climbs:
+it compiles loop-indexing and declaration-order variants, keeps the best, and starts again from it.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -166,6 +171,38 @@ def register_map(target: list[dict], ours: list[dict]) -> dict[str, Counter]:
         for x, y in zip(b, a):
             pairs[x][y] += 1
     return pairs
+
+
+IV_ADDI = re.compile(r"addi r0, (r\d+), -?(?:0x[0-9a-f]+|\d+)")
+INDEXED = re.compile(r"(?:lbz|lhz|lha|lwz|lfs|lfd|stb|sth|stw|stfs|stfd)x [rf]\d+, r\d+, r0")
+STEP = re.compile(r"addi (r\d+), \1, -?(?:0x[0-9a-f]+|\d+)")
+
+
+def offset_ivs(instructions: list[dict]) -> int:
+    """Indexed accesses through an offset induction variable: `addi r0, rOff, K` then an `x`-form
+    load/store on r0 within two instructions, rOff stepped by a constant somewhere in the function.
+    The pointer form of the same loop is `lwz rD, K(rPtr)` with rPtr stepped instead."""
+    text = [e.get("instruction", {}).get("formatted", "") for e in instructions]
+    steps = {m.group(1) for t in text if (m := STEP.fullmatch(t))}
+    n = 0
+    for i, t in enumerate(text):
+        m = IV_ADDI.fullmatch(t)
+        if m and m.group(1) in steps and any(INDEXED.fullmatch(u) for u in text[i + 1:i + 3]):
+            n += 1
+    return n
+
+
+def index_advice(iv_target: int, iv_ours: int) -> list[str]:
+    if iv_target > iv_ours:
+        return ["the target indexes an array in a loop through an offset (`addi r0, rOff, K; lwzx`) where ours "
+                "steps a pointer: there the index is a signed loop counter converted to unsigned (an accessor with an "
+                "`unsigned int` index parameter called with an `int` counter, or `a[(unsigned int)i]`); an unsigned "
+                "counter or a plain `a[i]` gives the pointer (`--try` compiles these variants)"]
+    if iv_ours > iv_target:
+        return ["ours indexes an array in a loop through an offset (`addi r0, rOff, K; lwzx`) where the target steps "
+                "a pointer: drop the signed-to-unsigned conversion of the index (index with the `int` counter, or make "
+                "the counter `unsigned int` when an accessor takes `unsigned int`) (`--try` compiles these variants)"]
+    return []
 
 
 def callee_saved(reg: str) -> bool:
@@ -323,6 +360,22 @@ def _strip_declaration(line: str, name: str, init: str | None) -> str | None:
     return f"{m.group('indent')}{name} = {init.strip()};{tail}" if init is not None else None
 
 
+def _block_paths(lines: list[str], lo: int, hi: int) -> dict[int, tuple[int, ...]]:
+    """line -> the open blocks (ids of their `{`) at the start of that line, lo..hi."""
+    stack: list[int] = []
+    out: dict[int, tuple[int, ...]] = {}
+    seq = 0
+    for i in range(lo, hi + 1):
+        out[i] = tuple(stack)
+        for ch in lines[i]:
+            if ch == "{":
+                seq += 1
+                stack.append(seq)
+            elif ch == "}" and stack:
+                stack.pop()
+    return out
+
+
 def reorder(text: str, symbol: str, order: list[str], minimal: bool = True) -> str | None:
     """Make `order` the declaration order of those locals. minimal: move only the declarations
     that must come earlier, each to just before the one it has to precede; otherwise declare all of
@@ -357,6 +410,11 @@ def reorder(text: str, symbol: str, order: list[str], minimal: bool = True) -> s
         inserts[lo + 1] = list(order)
     if not moved:
         return None
+    path = _block_paths(lines, lo, hi)
+    for n in moved:                        # a declaration may only move out to an enclosing block
+        dest, home = path[anchor[n]] if minimal else path[lo + 1], path[found[n][0]]
+        if home[:len(dest)] != dest:
+            return None
     out: list[str | None] = list(lines)
     for n in moved:
         i, _typ, init = found[n]
@@ -394,6 +452,306 @@ def tie_orders(order: list[str], target: dict[str, int], limit: int = 6) -> list
     return out
 
 
+FOR_HEAD = re.compile(r"\bfor\s*\(\s*(?P<type>unsigned\s+int|unsigned|signed\s+int|int)\s+(?P<name>[A-Za-z_]\w*)\s*=")
+
+
+def _close(text: str, i: int, open_ch: str, close_ch: str) -> int | None:
+    """Index just past the bracket that closes the one at text[i]."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == open_ch:
+            depth += 1
+        elif text[j] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return None
+
+
+def counted_loops(text: str, symbol: str) -> list[tuple[re.Match, int, int]]:
+    """`for (int i = …)` / `for (unsigned int i = …)` loops of the function: (header match, body
+    start, body end) as offsets into text. The body is the braced block or the one statement."""
+    span = body_lines(text, symbol)
+    if span is None:
+        return []
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    lo, hi = starts[span[0]], starts[span[1] + 1]
+    out = []
+    for m in FOR_HEAD.finditer(text, lo, hi):
+        head_end = _close(text, text.index("(", m.start()), "(", ")")
+        if head_end is None:
+            continue
+        k = head_end
+        while k < hi and text[k].isspace():
+            k += 1
+        end = _close(text, k, "{", "}") if text.startswith("{", k) else text.find(";", k) + 1
+        if end:
+            out.append((m, k, end))
+    return out
+
+
+def index_variants(text: str, symbol: str, more_offsets: bool):
+    """(label, source) variants that change how loops index arrays. more_offsets (the target has
+    more offset induction variables than ours): a signed counter's subscripts cast to unsigned, an
+    unsigned counter made signed (an accessor's `unsigned int` parameter then converts it).
+    Otherwise the reverse: the casts dropped, a signed counter made unsigned."""
+    for m, b0, b1 in counted_loops(text, symbol):
+        name, typ = m.group("name"), m.group("type")
+        signed = not typ.startswith("unsigned")
+        sub = re.compile(r"\[\s*" + re.escape(name) + r"\s*\]")
+        cast = re.compile(r"\(\s*unsigned(?:\s+int)?\s*\)\s*" + re.escape(name) + r"\b")
+        body = text[b0:b1]
+        if more_offsets and signed and sub.search(body):
+            yield f"subscripts [(unsigned int){name}]", text[:b0] + sub.sub(f"[(unsigned int){name}]", body) + text[b1:]
+        if more_offsets and not signed:
+            yield f"counter int {name}", text[:m.start("type")] + "int" + text[m.end("type"):]
+        if not more_offsets and cast.search(body):
+            yield f"casts of {name} dropped", text[:b0] + cast.sub(name, body) + text[b1:]
+        if not more_offsets and signed:
+            yield f"counter unsigned int {name}", text[:m.start("type")] + "unsigned int" + text[m.end("type"):]
+
+
+# ---- expression shape (volatile registers) -----------------------------------------------------
+
+def line_table(elf: Elf, symbol: str) -> list[tuple[int, int]]:
+    """(offset in the function, source line) from the DWARF 1 `.line` section, ascending. Each
+    chunk is a length, a base address relocated to its .text section, then 10-byte entries (line,
+    column, offset from the base)."""
+    sec = elf.section(".line")
+    sym = next((s for s in elf.symbols if s.name == symbol and s.type == 2), None)
+    if sec is None or sym is None:
+        return []
+    base_of: dict[int, int] = {}             # chunk offset -> section index of its base address
+    for s in elf.sections:
+        if s.type == 4 and s.info == sec.index:          # SHT_RELA for .line
+            for off, info, _addend in struct.iter_unpack(">IIi", s.data):
+                base_of[off - 4] = elf.symbols[info >> 8].shndx
+    out = []
+    off = 0
+    while off + 8 <= len(sec.data):
+        length, base = struct.unpack_from(">II", sec.data, off)
+        if length < 8:
+            break
+        if base_of.get(off) == sym.shndx:
+            for p in range(off + 8, off + length - 9, 10):
+                line, _col, addr = struct.unpack_from(">IHI", sec.data, p)
+                if sym.value <= base + addr < sym.value + sym.size:
+                    out.append((base + addr - sym.value, line))
+        off += length
+    return sorted(out)
+
+
+def mismatched_lines(table: list[tuple[int, int]], target: list[dict], ours: list[dict]) -> Counter:
+    """Source line -> how many of our instructions on rows objdiff marks as different come from it."""
+    lines: Counter = Counter()
+    k = -1
+    for t, o in zip(target, ours):
+        if "instruction" not in o:
+            continue
+        k += 1
+        if not (t.get("diff_kind") or o.get("diff_kind")):
+            continue
+        at = 4 * k
+        hit = [ln for off, ln in table if off <= at]
+        if hit:
+            lines[hit[-1]] += 1
+    return lines
+
+
+def float_rows(target: list[dict], ours: list[dict]) -> bool:
+    """Whether most differing instructions are floating-point ones."""
+    kinds = Counter(str(_mnemonic(o) or "").startswith(("f", "lf", "stf", "ps")) for t, o in zip(target, ours)
+                    if "instruction" in o and (t.get("diff_kind") or o.get("diff_kind")))
+    return kinds[True] > kinds[False]
+
+
+TOKEN = re.compile(r"\s*(?:(?P<num>(?:0x[0-9A-Fa-f]+|\d+\.?\d*(?:[eE][-+]?\d+)?)[fFuUlL]*)|(?P<id>[A-Za-z_]\w*)"
+                   r"|(?P<op>->|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%<>&|^!~?:.,()\[\]]))")
+BINARY = {"||": 1, "&&": 2, "|": 3, "^": 4, "&": 5, "==": 6, "!=": 6, "<": 7, ">": 7, "<=": 7, ">=": 7,
+          "<<": 8, ">>": 8, "+": 9, "-": 9, "*": 10, "/": 10, "%": 10}
+COMMUTATIVE = {"+", "*", "&", "|", "^", "==", "!="}
+
+
+@dataclass
+class Node:
+    start: int
+    end: int
+    op: str = ""                 # binary operator, "()" group, "u" unary operator or cast, "" operand
+    left: "Node | None" = None
+    right: "Node | None" = None
+    args: list["Node"] = field(default_factory=list)   # call arguments and subscripts of a postfix operand
+
+
+def _tokens(s: str) -> list[tuple[str, int, int]] | None:
+    out, p = [], 0
+    while p < len(s):
+        if s[p:].strip() == "":
+            break
+        m = TOKEN.match(s, p)
+        if not m:
+            return None
+        kind = m.lastgroup
+        out.append((m.group(kind), m.start(kind), m.end(kind)))
+        p = m.end()
+    return out
+
+
+def parse_expression(s: str) -> Node | None:
+    """Binary-operator tree (with character spans) of a C expression; None when it uses something
+    this small parser does not handle (assignment, `?:`, comma, casts it cannot tell apart)."""
+    toks = _tokens(s)
+    if not toks:
+        return None
+    pos = 0
+
+    def peek() -> str | None:
+        return toks[pos][0] if pos < len(toks) else None
+
+    def primary() -> Node | None:
+        nonlocal pos
+        if pos >= len(toks):
+            return None
+        tok, a, b = toks[pos]
+        if tok in ("-", "!", "~", "*", "&", "+"):
+            pos += 1
+            inner = unary()
+            if inner is None:
+                return None
+            return Node(a, inner.end, "u", inner) if tok in ("-", "!", "~") else Node(a, inner.end)
+        if tok == "(":
+            pos += 1
+            inner = binary(0)
+            if inner is None or peek() != ")":
+                return None
+            close = toks[pos][2]
+            pos += 1
+            nxt = peek()
+            if nxt is not None and (nxt[0].isalnum() or nxt[0] == "_" or nxt == "("):
+                cast_of = unary()                  # `(T)x` or `(T)(x)`: a conversion
+                return Node(a, cast_of.end, "u", cast_of) if cast_of else None
+            return Node(a, close, "()", inner) if inner.op else Node(a, close)
+        if tok[0].isalnum() or tok[0] == "_":
+            pos += 1
+            return Node(a, b)
+        return None
+
+    def unary() -> Node | None:
+        nonlocal pos
+        node = primary()
+        while node is not None and peek() in ("(", "[", ".", "->"):
+            tok = peek()
+            if tok in (".", "->"):
+                pos += 1
+                if peek() is None or not (peek()[0].isalpha() or peek()[0] == "_"):
+                    return None
+                node = Node(node.start, toks[pos][2])
+                pos += 1
+                continue
+            close = {"(": ")", "[": "]"}[tok]
+            pos += 1
+            args = list(node.args)
+            if peek() != close:
+                while True:
+                    arg = binary(0)
+                    if arg is None:
+                        return None
+                    args.append(arg)
+                    if peek() == ",":
+                        pos += 1
+                        continue
+                    break
+            if peek() != close:
+                return None
+            node = Node(node.start, toks[pos][2], args=args)
+            pos += 1
+        return node
+
+    def binary(level: int) -> Node | None:
+        nonlocal pos
+        left = unary()
+        while left is not None and peek() in BINARY and BINARY[peek()] > level:
+            op = peek()
+            pos += 1
+            right = binary(BINARY[op])
+            if right is None:
+                return None
+            left = Node(left.start, right.end, op, left, right)
+        return left
+
+    tree = binary(0)
+    return tree if tree is not None and pos == len(toks) else None
+
+
+def _nodes(n: Node | None):
+    if n is not None:
+        yield n
+        yield from _nodes(n.left)
+        yield from _nodes(n.right)
+        for a in n.args:
+            yield from _nodes(a)
+
+
+STATEMENT = re.compile(r"^(?P<indent>\s*)(?P<lhs>(?:[A-Za-z_][\w:<>]*[\s*&]+)?[A-Za-z_][\w.\[\]>-]*(?:\[[^\]]*\])?\s*"
+                       r"(?:[-+*/|&^]?=)\s*|return\s+|if\s*\(|)(?P<expr>.*?)(?P<close>\)\s*\{?|;)\s*(?://.*)?$")
+
+
+def _statement(line: str) -> tuple[str, int] | None:
+    """(expression, its offset in the line) of an assignment, declaration, `return`, `if (…)` or
+    expression statement on one line; None for anything else (`else if`, loops, multi-line)."""
+    m = STATEMENT.match(line)
+    if not m or m.group("lhs").startswith("if") != m.group("close").startswith(")"):
+        return None
+    return m.group("expr"), m.start("expr")
+
+
+def expression_variants(text: str, symbol: str, lines: Counter, floaty: bool):
+    """(label, source) variants for the given 1-based source lines of the function: the operands of
+    a commutative operator between two plain operands swapped (their source order sets the
+    instruction's operand order), and a compound operand moved into a named local first (the
+    compiler orders compound operands itself; a named local is a plain operand again), in both
+    orders. floaty: name the local `float`, else `int`."""
+    span = body_lines(text, symbol)
+    if span is None:
+        return
+    lines_of = text.splitlines(keepends=True)
+    typ = "float" if floaty else "int"
+    for ln, _n in lines.most_common():
+        i = ln - 1
+        if not (span[0] < i < span[1]):
+            continue
+        line = lines_of[i]
+        st = _statement(line.rstrip("\n"))
+        if st is None:
+            continue
+        expr, e0 = st
+        indent = re.match(r"\s*", line).group(0)
+        tree = parse_expression(expr)
+        if tree is None:
+            continue
+        for k, n in enumerate(_nodes(tree)):
+            if n.op not in COMMUTATIVE:
+                continue
+            a, b = expr[n.left.start:n.left.end], expr[n.right.start:n.right.end]
+            swapped = f"{b} {n.op} {a}"
+            if not n.left.op and not n.right.op:
+                new = line[:e0 + n.start] + swapped + line[e0 + n.end:]
+                yield f"line {ln}: {swapped}", "".join(lines_of[:i] + [new] + lines_of[i + 1:])
+                continue
+            for side, part in (("left", n.left), ("right", n.right)):
+                if not part.op:
+                    continue
+                name = f"t{ln}_{k}{side[0]}"
+                keep = expr[(n.right if side == "left" else n.left).start:(n.right if side == "left" else n.left).end]
+                decl = f"{indent}{typ} {name} = {expr[part.start:part.end]};\n"
+                for order in ((name, keep), (keep, name)):
+                    piece = f"{order[0]} {n.op} {order[1]}"
+                    new = line[:e0 + n.start] + piece + line[e0 + n.end:]
+                    yield (f"line {ln}: {typ} {name} = {expr[part.start:part.end]}; {piece}",
+                           "".join(lines_of[:i] + [decl, new] + lines_of[i + 1:]))
+
+
 # ---- command -----------------------------------------------------------------------------------
 
 def _compile(cfg: Config, unit: dict, source: Path | None, work: Path) -> tuple[Path | None, str]:
@@ -429,7 +787,21 @@ def analyse(cfg: Config, unit: dict, symbol: str, source: Path | None, work: Pat
     elf = Elf.parse(obj.read_bytes())
     dbg = elf.section(".debug")
     fn = find_function(parse_dwarf1(dbg.data, debug_refs(elf)), symbol) if dbg else None
-    return (float(pair[0].get("match_percent", 0.0)), fn, register_map(pair[0]["instructions"], pair[1]["instructions"])), ""
+    left, right = pair[0]["instructions"], pair[1]["instructions"]
+    return Analysis(float(pair[0].get("match_percent", 0.0)), fn, register_map(left, right),
+                    offset_ivs(left), offset_ivs(right), mismatched_lines(line_table(elf, symbol), left, right),
+                    float_rows(left, right)), ""
+
+
+@dataclass
+class Analysis:
+    percent: float
+    fn: DwarfFunction | None
+    pairs: dict[str, Counter]
+    iv_target: int = 0           # offset induction variables (see offset_ivs), target and ours
+    iv_ours: int = 0
+    lines: Counter = field(default_factory=Counter)   # source lines of our differing instructions
+    floaty: bool = False
 
 
 def _print(percent: float, fn: DwarfFunction | None, pairs: dict[str, Counter], symbol: str) -> list[Row]:
@@ -447,26 +819,40 @@ def _print(percent: float, fn: DwarfFunction | None, pairs: dict[str, Counter], 
             print(f"    {mark} ours {r.ours:<4} target {r.target:<4} {', '.join(r.names) or '(temporary)'}{extra}")
     vol = sorted((o, t) for o, c in pairs.items() for t in c if not callee_saved(o) and o != t and o not in ("r1", "r2", "r13"))
     if vol:
-        print("  volatile registers differ too (not covered by the rank rule): "
+        print("  volatile registers differ too: "
               + ", ".join(f"{o}->{t}" for o, t in vol[:12]) + (" …" if len(vol) > 12 else ""))
+        print("    (only partly covered by the rank rule: an inline helper's parameters rank above CSE temporaries, "
+              "which rank above named locals; a pointer kept in a local for repeated element access may be an "
+              "inline helper's parameter in the target)")
     if fn is None:
         print("  (no debug info for this function: names unknown)")
     return every
 
 
-def _candidates(text: str, symbol: str, fn: DwarfFunction, table: list[Row], volatile: list[Row] = ()):
-    """(label, source) variants to compile: the target's order for inverted locals first (ties
-    permuted, minimal moves then hoisting), then every single move of one register local's
-    declaration to just before another declared earlier."""
-    current, want, target_of = wanted_order(fn, table)
+def _candidates(text: str, symbol: str, res: "Analysis", table: list[Row], volatile: list[Row] = ()):
+    """(label, source) variants to compile: loop-indexing variants when the target and ours index
+    differently, the target's order for inverted locals (ties permuted, minimal moves then hoisting),
+    then every single move of one register local's declaration to just before another declared
+    earlier."""
+    fn = res.fn
     seen = {text}
+
+    def fresh(items):
+        for label, new in items:
+            if new is not None and new not in seen:
+                seen.add(new)
+                yield label, new
+
+    if res.iv_target != res.iv_ours:
+        yield from fresh(index_variants(text, symbol, res.iv_target > res.iv_ours))
+    if fn is None:
+        return
+    current, want, target_of = wanted_order(fn, table)
     if want != current:
-        for order in tie_orders(want, target_of):
-            for minimal in (True, False):
-                new = reorder(text, symbol, order, minimal)
-                if new is not None and new not in seen:
-                    seen.add(new)
-                    yield f"{'moved' if minimal else 'hoisted'} {', '.join(order)}", new
+        yield from fresh((f"{'moved' if minimal else 'hoisted'} {', '.join(order)}", reorder(text, symbol, order, minimal))
+                         for order in tie_orders(want, target_of) for minimal in (True, False))
+    if res.lines:
+        yield from fresh(expression_variants(text, symbol, res.lines, res.floaty))
     decl = [v.name for v in fn.vars if v.kind == "local"]
     every = list(table) + list(volatile)       # declaration order also moves volatile registers
     in_regs = {n.split(" ", 1)[1] for r in every for n in r.names if n.startswith("local ")}
@@ -474,47 +860,65 @@ def _candidates(text: str, symbol: str, fn: DwarfFunction, table: list[Row], vol
     names = [n for n in decl if n in in_regs and decl.count(n) == 1]
     pairs = [(x, y) for i, x in enumerate(names) for y in names[:i]]
     pairs.sort(key=lambda p: (p[0] not in differing and p[1] not in differing, p[0] not in differing))
-    for x, y in pairs:
-        order = [x, y]
-        new = reorder(text, symbol, order, True)
-        if new is not None and new not in seen:
-            seen.add(new)
-            yield f"moved {x} before {y}", new
+    yield from fresh((f"moved {x} before {y}", reorder(text, symbol, [x, y], True)) for x, y in pairs)
 
 
-def _try(cfg: Config, unit: dict, args: argparse.Namespace, source: Path | None, work: Path,
-         fn: DwarfFunction, table: list[Row], pairs: dict[str, Counter], percent: float) -> None:
+def _tables(res: "Analysis") -> tuple[list[Row], list[Row]]:
+    saved = [r for cls in ("r", "f") for r in rows(res.fn, res.pairs, cls)]
+    volatile = [r for cls in ("r", "f") for r in rows(res.fn, res.pairs, cls, saved=False)]
+    return saved, volatile
+
+
+def _try(cfg: Config, unit: dict, args: argparse.Namespace, source: Path | None, work: Path, res: "Analysis") -> None:
+    """Greedy climb: compile the variants of the current best source, keep the best one, and start
+    again from it while it improves (a loop-shape change often needs a declaration move after it)."""
     src_path = source or cfg.root / unit["metadata"]["source_path"]
     text = src_path.read_text()
     out_dir = cfg.root / "build" / "dk" / "regs"
     out_dir.mkdir(parents=True, exist_ok=True)
-    cand = out_dir / f"{re.sub(r'[^A-Za-z0-9_]', '_', args.function)[:60]}_{src_path.name}"
-    best: tuple[float, str, str] | None = None
-    tried = 0
-    volatile = [r for cls in ("r", "f") for r in rows(fn, pairs, cls, saved=False)]
-    for label, new in _candidates(text, args.function, fn, table, volatile):
-        if tried >= args.limit:
-            print(f"  --try: stopped after {tried} variants (--limit)")
+    # a short name: the compiler runs under wibo, which truncates long paths
+    tag = hashlib.sha1(args.function.encode()).hexdigest()[:8]
+    cand = out_dir / f"{src_path.stem[:24]}_{tag}{src_path.suffix}"
+    start = res.percent
+    best_text, best, labels = text, res, []
+    tried, failed, last_err = 0, 0, ""
+    for _round in range(3):
+        if best.percent == 100.0:
             break
-        tried += 1
-        cand.write_text(new)
-        res, _err = analyse(cfg, unit, args.function, cand, work)
-        if res is None:
-            continue
-        if res[0] > percent:
-            print(f"  --try: {label}: {res[0]:.2f}%")
-        if best is None or res[0] > best[0]:
-            best = (res[0], new, label)
-        if res[0] == 100.0:
+        round_best: tuple["Analysis", str, str] | None = None
+        table, volatile = _tables(best)
+        n = 0
+        for label, new in _candidates(best_text, args.function, best, table, volatile):
+            if n >= args.limit:
+                print(f"  --try: stopped after {n} variants of this source (--limit)")
+                break
+            n += 1
+            tried += 1
+            cand.write_text(new)
+            got, err = analyse(cfg, unit, args.function, cand, work)
+            if got is None:
+                failed, last_err = failed + 1, err
+                continue
+            if got.percent > (round_best[0] if round_best else best).percent:
+                print(f"  --try: {' + '.join(labels + [label])}: {got.percent:.2f}%")
+            if round_best is None or got.percent > round_best[0].percent:
+                round_best = (got, new, label)
+            if got.percent == 100.0:
+                break
+        if round_best is None or round_best[0].percent <= best.percent:
             break
-    if best is None or best[0] <= percent:
+        best, best_text = round_best[0], round_best[1]
+        labels.append(round_best[2])
+    if failed:
+        print(f"  --try: {failed} of {tried} variants did not compile; the last error:\n{last_err[-800:]}")
+    if not labels:
         cand.unlink(missing_ok=True)
-        print(f"  --try: none of {tried} declaration-order variants beat {percent:.2f}%")
+        print(f"  --try: none of {tried} variants beat {start:.2f}%")
         return
-    cand.write_text(best[1])
-    print(f"  --try: best {best[0]:.2f}% (was {percent:.2f}%) with {best[2]}; written to {cfg.rel(cand)}")
-    if best[0] == 100.0 and args.apply and source is None:
-        src_path.write_text(best[1])
+    cand.write_text(best_text)
+    print(f"  --try: best {best.percent:.2f}% (was {start:.2f}%) with {' + '.join(labels)}; written to {cfg.rel(cand)}")
+    if best.percent == 100.0 and args.apply and source is None:
+        src_path.write_text(best_text)
         print(f"  applied to {cfg.rel(src_path)}")
 
 
@@ -531,20 +935,20 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         if res is None:
             print(f"BUILD ERROR or missing function:\n{err[-2000:]}")
             return BUILD_ERROR
-        percent, fn, pairs = res
+        percent, fn, pairs = res.percent, res.fn, res.pairs
         table = _print(percent, fn, pairs, args.function)
         if fn is not None:
             hidden = [f"{v.name} ({v.reg})" for v in fn.vars if v.reg and v.reg != "stack" and not callee_saved(v.reg)]
             if hidden and any(not r.names for r in table):
                 print("  debug info puts these in volatile registers; an unnamed row may be one of them: " + ", ".join(hidden))
-        tips = advice(fn, table)
+        tips = index_advice(res.iv_target, res.iv_ours) + advice(fn, table)
         for t in tips:
             print("  - " + t)
         if percent == 100.0:
             print("MATCH")
             return OK
-        if args.try_ and fn is not None:
-            _try(cfg, unit, args, source, work, fn, table, pairs, percent)
+        if args.try_:
+            _try(cfg, unit, args, source, work, res)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     hint(f"diff {args.unit} --function {args.function}", f"check {args.unit} --private")
@@ -556,9 +960,10 @@ def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("function", help="function symbol, as dk check lists it")
     p.add_argument("--source", help="compile this file instead of the unit's source (a private copy)")
     p.add_argument("--try", dest="try_", action="store_true",
-                   help="compile declaration-order variants of the locals in a private copy (target order first, then single moves)")
+                   help="compile variants in a private copy (loop indexing, declaration order: target order first, then single "
+                        "moves), climbing from the best while it improves")
     p.add_argument("--apply", action="store_true", help="with --try: write the copy into the unit's source if exact")
-    p.add_argument("--limit", type=int, default=40, help="with --try: most variants to compile (default 40)")
+    p.add_argument("--limit", type=int, default=40, help="with --try: most variants to compile per climbing step (default 40, at most 3 steps)")
 
 
 COMMAND = Command("regs", "matching", "per-variable registers ours vs target (register-numbering near misses)", run, _configure)

@@ -10,6 +10,9 @@ function under its own name). Merging them:
   * a struct with a base (`struct C : B {`, a class whose inherited methods a draft calls on
     this) keeps only its methods: every base sits at offset 0, so its fields, vtable pointer and
     virtual slots belong to the root of its chain, where drafts that saw C alone are merged too.
+    Except a derived struct whose members start after its base (`char _pad<sizeof B>`, a
+    destructor's class model: its member objects must stay its own): it keeps its fields, its
+    `virtual ~C();` is an override (not a new slot), and its base must end before them.
   * the merged TU is compiled with the unit's command and every function is compared with
     the original again. A draft that stops being exact after merging is left out (greedy, in
     address order, so earlier drafts win), and the report says which and why.
@@ -64,6 +67,7 @@ class Layout:
     size: int = 0                                   # bytes up to the trailing padding's end
     placeholder: bool = False                       # `{ char _unknown; }`: layout unknown
     base: str | None = None                         # `struct C : base` (at offset 0)
+    start: int = 0                                  # > 0: C's own members start here (after its base)
 
     def end(self) -> int:
         ends = [off + size for off, (_, size) in self.fields.items()] + ([self.vptr + 4] if self.vptr is not None else [])
@@ -80,10 +84,15 @@ def _width(ctype: str, sizes: dict) -> int | None:
     return gen.SIZES.get(ctype, sizes.get(ctype))
 
 
-def parse_layout(members: list[str], sizes: dict) -> Layout | None:
+def parse_layout(members: list[str], sizes: dict, start: int | None = None) -> Layout | None:
     """The generator's struct body as a Layout, or None for anything else (bases, inline
-    bodies, members it does not write)."""
+    bodies, members it does not write). `start` (a derived struct): the size of its base,
+    where its own members begin when it lists them from there; its virtual destructor is an
+    override, not a slot of its own."""
     out, cur = Layout(), 0
+    if start and members and (pad := _PAD.match(members[0])) and int(pad[1], 16) == start or \
+            start and members and (f := _FIELD.match(members[0])) and int(f["off"], 16) == start:
+        out.start = cur = start
     if members[:1] == ["char _unknown;"] and all("(" in m and "{" not in m and not m.startswith("virtual ")
                                                   for m in members[1:]):
         return Layout(size=1, placeholder=True, methods=members[1:])
@@ -93,12 +102,14 @@ def parse_layout(members: list[str], sizes: dict) -> Layout | None:
                 return None
             cur = int(pad[1], 16) + int(pad[2], 16)
             out.size = cur
+        elif m.startswith("virtual ") and start is not None and re.fullmatch(r"virtual ~\w+\(\)(?:;| \{\})", m):
+            out.methods.append(m)                   # overrides the base's
         elif m.startswith("virtual "):
             if out.vptr is None:
                 out.vptr, cur = cur, cur + 4
             out.virtuals.append(m)
         elif "(" in m:
-            if "{" in m:
+            if "{" in m and not re.fullmatch(r"(?:virtual )?~\w+\(\) \{\}", m):     # (an empty inline destructor)
                 return None
             out.methods.append(m)
         elif f := _FIELD.match(m):
@@ -141,8 +152,15 @@ def merge_layouts(a: Layout, b: Layout, name: str) -> Layout:
                 out.virtuals[i] = v
             elif v != default:
                 raise Conflict(f"{name} slot {i}: {out.virtuals[i]} vs {v}")
+    dtor = lambda m: re.match(r"(?:virtual )?(~\w+)\(", m)
+    for m in b.methods:
+        if m not in out.methods and dtor(m) and any(dtor(o) and dtor(o)[1] == dtor(m)[1] for o in out.methods):
+            raise Conflict(f"{name}: {next(o for o in out.methods if dtor(o) and dtor(o)[1] == dtor(m)[1])} vs {m}")
     out.methods += [m for m in b.methods if m not in out.methods]
     out.size = max(out.size, b.size)
+    out.start = max(a.start, b.start)
+    if out.start and (any(off < out.start for off in out.fields) or out.vptr is not None):
+        raise Conflict(f"{name}: members below its own start +0x{out.start:X} (they belong to a base)")
     spans = sorted([(off, size) for off, (_, size) in out.fields.items()] +
                    ([(out.vptr, 4)] if out.vptr is not None else []))
     for (o1, s1), (o2, _) in zip(spans, spans[1:]):
@@ -158,7 +176,7 @@ def render_layout(l: Layout) -> list[str]:
     sizes = {off: size for off, (_, size) in l.fields.items()}
     if l.vptr is not None:
         entries[l.vptr], sizes[l.vptr] = list(l.virtuals), 4
-    out, cur = [], 0
+    out, cur = [], l.start
     for off in sorted(entries):
         if off > cur:
             out.append(f"char _pad{cur:X}[0x{off - cur:X}];")
@@ -224,7 +242,7 @@ class Unit:
             if self.structs.setdefault(name, body) != body:
                 raise Conflict(f"struct {name} defined two ways")
             return
-        layout = parse_layout(body, sizes)
+        layout = parse_layout(body, sizes, sizes.get(base, 0) if base else None)
         old = self.structs.get(name)
         if layout is None or isinstance(old, str):
             head = f"struct {name}" + (f" : {base}" if base else "")
@@ -240,6 +258,15 @@ class Unit:
         """The fields, vtable pointer and virtual slots of a derived struct move to the root of
         its chain (all bases at offset 0, so every offset stays)."""
         for name, s in self.structs.items():
+            if isinstance(s, Layout) and s.start:     # its own members: its base must end before them
+                b = self.structs.get(s.base)
+                end = b.sizeof() if isinstance(b, Layout) else s.start
+                if end > s.start:
+                    if any(off < end for off in s.fields):
+                        raise Conflict(f"struct {name}: its base {s.base} grew over its members")
+                    s.start = end
+                    s.size = max(s.size, end)
+                continue
             if not isinstance(s, Layout) or not s.base or not (s.fields or s.vptr is not None or s.virtuals or s.size):
                 continue
             root, seen = name, {name}
@@ -384,7 +411,7 @@ class Paste:
             m = _OPEN.match(lines[i])
             end = lines.index("};", i) if m and "};" in lines[i:] else None
             if m and end is not None:
-                layout = parse_layout([x.strip() for x in lines[i + 1:end]], sizes)
+                layout = parse_layout([x.strip() for x in lines[i + 1:end]], sizes, sizes.get(m[2], 0) if m[2] else None)
                 if layout is not None and m[1] not in editable:
                     layout.base = m[2]
                     editable[m[1]], original[m[1]] = (i, end), layout
@@ -521,10 +548,10 @@ class Paste:
         definitions = self.unit.type_lines(skip, declarations=False)
         if self.placed and definitions:
             before[first] += definitions + [""]
-        declared: set = set()
+        placed_at: dict = {}                            # declaration -> the first place it goes
         for at, address, decls, text in sorted(self.placed, key=lambda x: (x[0], x[1])):
-            fresh = [d for d in decls if (at, d) not in declared]
-            declared |= {(at, d) for d in decls}         # (one copy per place: redeclaring is legal)
+            fresh = [d for d in decls if d not in placed_at]    # one copy, at the highest place
+            placed_at.update((d, at) for d in fresh)
             if at == len(lines) and lines and lines[-1].strip() and not before[at]:
                 before[at].append("")
             before[at] += fresh + [text, ""]
@@ -536,6 +563,9 @@ class Paste:
                 name, end = spans[i]
                 out += [] if name in self.moved else struct_lines(name, self.unit.structs[name])
                 i = end + 1
+                continue
+            if lines[i].startswith("extern ") and placed_at.get(lines[i], i + 1) <= i:
+                i += 1                                  # the source's own copy, now declared higher up
                 continue
             out.append(lines[i])
             i += 1

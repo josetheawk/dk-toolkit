@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 from collections import defaultdict
 from pathlib import Path
 
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from ...core.util import run_ninja
 from ...core.doclint import GENERATED_MARK
 from .dol import Dol
 from .dtk_symbols import overlap_victim, read_symbols, remove_symbol, rename_symbols

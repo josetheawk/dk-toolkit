@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 from pathlib import Path
 
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from ...core.util import run_ninja
 from ...core.progress import load_report
 from .dtk_symbols import build_errors
 from .matching import MatchError, commit_gate, render, resolve_unit, score
@@ -25,6 +23,73 @@ def _matched_functions(cfg: Config) -> int:
 def _build(cfg: Config, own: tuple[str, ...] = ()) -> tuple[bool, str]:
     proc = fresh.build(cfg, fresh.hash_target(cfg), own=own)
     return proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def dropped_by_link(cfg: Config, unit: dict) -> list[str]:
+    """The unit's functions (as the original has them) that the linked ELF lacks."""
+    from .elf import Elf
+    from .matching import _function_offsets
+    elf_path = cfg.built.with_suffix(".elf")
+    if not elf_path.is_file():
+        return []
+    linked_elf = Elf.parse(elf_path.read_bytes())
+    linked = {x.name for x in linked_elf.symbols if x.name and x.shndx}
+    ours = {x.name: x.bind for x in Elf.parse((cfg.root / unit["base_path"]).read_bytes()).symbols if x.type == 2}
+    original = {name: size for name, (_sec, _off, size) in _function_offsets(cfg.root / unit["target_path"]).items()}
+    return dropped_lines(original, linked, ours) + data_shortfall(cfg, unit, linked_elf)
+
+
+def data_shortfall(cfg: Config, unit: dict, linked_elf) -> list[str]:
+    """Data sections of the unit that link shorter than the original's (the shift of the symbols
+    after its range against those before it), with the objects of ours that only weak copies the
+    link discards reference: the original kept those bytes (in place) where ours lost them."""
+    from collections import Counter
+    from .dtk_symbols import read_symbols, read_units
+    from .matching import _weak_extras
+    symbols = read_symbols(cfg.root / cfg.platform_options["symbols"])
+    count = Counter(x.name for x in symbols)
+    lcount = Counter(x.name for x in linked_elf.symbols if x.name)
+    at = {x.name: x.value for x in linked_elf.symbols if x.name and x.shndx and lcount[x.name] == 1}
+    source = unit["metadata"]["source_path"].removeprefix(cfg.platform_options.get("src", "src") + "/")
+    split = next((u for u in read_units(cfg.root / cfg.platform_options["splits"]) if u.name == source), None)
+    if split is None:
+        return []
+    extras, _ = _weak_extras(cfg.root / unit["target_path"], cfg.root / unit["base_path"])
+    out = []
+    for sec, start, end in split.splits:
+        if sec == ".text":
+            continue
+        known = [x for x in symbols if x.section == sec and count[x.name] == 1 and x.name in at]
+        before = max((x for x in known if x.address < start), key=lambda x: x.address, default=None)
+        after = min((x for x in known if x.address >= end), key=lambda x: x.address, default=None)
+        if before is None or after is None:
+            continue
+        delta = (at[after.name] - after.address) - (at[before.name] - before.address)
+        if delta >= 0:
+            continue
+        lost = extras.get(sec, [])
+        out.append(f"this unit's {sec} links 0x{-delta:X} bytes short of the original's 0x{end - start:X}"
+                   + (": the original kept what only discarded weak copies use: "
+                      + ", ".join(f"{name} (0x{hi - lo:X})" for lo, hi, name in lost[:6]) if lost else ""))
+    return out
+
+
+def dropped_lines(original: dict[str, int], linked: set[str], ours: dict[str, int]) -> list[str]:
+    """`original`: the unit's functions and sizes; `linked`: names the linked ELF defines; `ours`:
+    our object's functions and their binding. Dead-stripped ones nothing references were kept by
+    the original (force-active); weak ones the link took from an earlier object."""
+    missing = sorted((name, size) for name, size in original.items() if name not in linked and not name.startswith("gap_"))
+    if not missing:
+        return []
+    strong = [name for name, _ in missing if ours.get(name) != 2]
+    weak = [name for name, _ in missing if ours.get(name) == 2]
+    out = [f"the link lacks 0x{sum(size for _, size in missing):X} bytes of this unit's functions: "
+           + ", ".join(f"{name} (0x{size:X})" for name, size in missing[:8]) + (" …" if len(missing) > 8 else "")]
+    if strong:
+        out.append("nothing references them, but the original kept them: ./dk symbol force-active " + " ".join(strong))
+    if weak:
+        out.append("weak copies the link took from another object (an earlier copy of the same name wins): " + ", ".join(weak))
+    return out
 
 
 def run(cfg: Config, args: argparse.Namespace) -> int:
@@ -69,6 +134,10 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
               f"the commit's clean build is checked against the floor")
     if not ok:
         print(build_errors(output, 30))
+        for note in s.link_notes:                      # a weak copy the link keeps because the original's is unnamed
+            print(f"hint: {note}")
+        for line in dropped_by_link(cfg, unit):
+            print(f"hint: {line}")
         if cfg.built.is_file() and "did NOT match" in output:
             from .firstdiff import first_diff             # where the linked binary differs
             print("first differences in the linked binary:")

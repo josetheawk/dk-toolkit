@@ -243,6 +243,9 @@ def _display_names(ctx: Context, name: str, address: int) -> tuple[str, str, boo
     m = re.match(r"^(?P<m>[A-Za-z_]\w*?)__(?P<n>\d+)(?P<rest>\w+)$", name)
     if m and len(m["rest"]) >= int(m["n"]):
         return m["rest"][:int(m["n"])], m["m"], True
+    fn = _demangled(name)
+    if fn is not None and fn.quals:                 # a nested class (Q2AI7CarBase): its member
+        return "::".join(fn.quals), _mangled_prefix(name), True
     _, owner = class_slots(ctx.cfg, address)
     if owner:
         return owner, name, True
@@ -320,22 +323,53 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
         result.status, result.detail = "skipped", why
         return result
     asm_of = lambda n: ctx.entries[n].text if n in ctx.entries else None
+    plan = classgen.plan_ctor(name, sym.address, insns, ctx.classes, asm_of, ctx.class_records, ctx.literal,
+                              ctx.signature, ctx.caller_args)
+    modelled = None
+    if isinstance(plan, classgen.CtorPlan):       # the class model first; the older field-only one after
+        modelled = _verify_plan(ctx, command, insns, plan, work, Result(name, sym.address, "unsupported"))
+        if modelled.status == "exact":
+            return modelled
+    elif isinstance(plan, gen.Unsupported):
+        modelled = Result(name, sym.address, "unsupported", str(plan))
     ctors = classgen.solve_ctor(insns, ctx.classes, asm_of, ctx.class_records, ctx.literal, ctx.signature)
     if isinstance(ctors, gen.Unsupported):
         result.detail = str(ctors)
-        return result
+        return modelled if modelled is not None and modelled.status != "unsupported" else result
     if ctors:
         for draft in ctors:
             result = _verify_class_draft(ctx, command, insns, draft, work, Result(name, sym.address, "unsupported"))
             if result.status == "exact":
                 return result
-        return result
+        return modelled if modelled is not None and modelled.status != "unsupported" else result
     draft = classgen.solve_dtor(insns, ctx.classes, asm_of, ctx.class_records)
+    plan = classgen.plan_dtor(name, sym.address, insns, ctx.classes, asm_of, ctx.class_records, ctx.literal,
+                              ctx.signature, ctx.caller_args)
+    if plan is not None:                                 # a destructor: the class model, else the vtable-only one
+        if isinstance(plan, classgen.DtorPlan):
+            result = _verify_plan(ctx, command, insns, plan, work, result)
+            if result.status == "exact":
+                return result
+        else:
+            result.detail = str(plan)
+        if isinstance(draft, classgen.ClassDraft):
+            old = _verify_class_draft(ctx, command, insns, draft, work, Result(name, sym.address, "unsupported"))
+            if old.status == "exact" or result.status == "unsupported":
+                return old
+        return result
     if isinstance(draft, gen.Unsupported):
         result.detail = str(draft)
         return result
     if draft is not None:
         return _verify_class_draft(ctx, command, insns, draft, work, result)
+    own = _demangled(name)
+    if own is not None and own.params:
+        # the parameter types of the mangled name first: the draft then has the function's own
+        # symbol, and its class pointers bound to their classes (as the unit's headers have them)
+        typed = _solve_lifted(ctx, name, sym, insns, command, work, Result(name, sym.address, "unsupported"),
+                              ctx.caller_args, own=own)
+        if typed.status == "exact":
+            return typed
     first = _solve_lifted(ctx, name, sym, insns, command, work, Result(name, sym.address, "unsupported"), ctx.caller_args)
     if first.status == "exact":
         return first
@@ -353,19 +387,64 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
     return first
 
 
+def _global_sizes(ctx: Context, lifted) -> dict:
+    """The size of each global a draft uses (a small one without a size in the symbols: its
+    string's, read from the binary)."""
+    out = {}
+    for g in set(lifted.global_objs) | set(lifted.small_globals):
+        s = ctx.by_name.get(g)
+        if s is None:
+            continue
+        out[g] = s.size
+        if (not s.size or s.size > 8) and g in lifted.small_globals:       # (a symbol may hold several strings)
+            try:
+                data = ctx.dol.read(s.address, 8)
+            except ValueError:
+                continue
+            if b"\0" in data and all(32 <= b < 127 for b in data[:data.index(b"\0")]):
+                out[g] = data.index(b"\0") + 1
+    return out
+
+
+def _mangled_prefix(name: str) -> str:
+    """The function-name part of a mangled name (`fn_X` of fn_X__Q22AI7CarBaseFv, `__ct`)."""
+    return name[:name.index("__", 2 if name.startswith("__") else 0)]
+
+
+def _cxx_free(name: str) -> str | None:
+    """A free C++ function's name (fn_X of fn_X__FPCc), else None."""
+    fn = _demangled(name)
+    return _mangled_prefix(name) if fn is not None and not fn.quals and not fn.special else None
+
+
+def _demangled(name: str):
+    """The demangled function (None for a C name or one the demangler does not read)."""
+    from .demangle import demangle
+    return demangle(name) if "__" in name.lstrip("_") else None
+
+
 def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path, result: Result, callers,
-                  tight: bool = False) -> Result:
+                  tight: bool = False, own=None) -> Result:
     """The lifted (not class-model) draft of one function, verified; `callers` gives other
     call sites' argument counts (None: only this function's own evidence); `tight`: struct
-    locals as small as their fields."""
+    locals as small as their fields; `own`: its demangled name, whose parameter types it keeps."""
     this_type, method, known_class = _display_names(ctx, name, sym.address)
+    free = _cxx_free(name)
+    if free is not None:
+        if own is None:
+            # as extern "C" it would carry the mangled name as a C name: a duplicate of the real one
+            result.detail = "a C++ function: drafted only with its mangled parameter types"
+            return result
+        method = free
     if method == "__dt":
         result.detail = "a destructor without a vtable (member destructors need the class model)"
         return result
     try:
         lifted = gen.lift(insns, ctx.literal, known_class, ctx.signature, ctx.vsignature(this_type if known_class else None),
-                          callers=callers, params=_own_params(ctx, name))
+                          callers=callers, params=_own_params(ctx, name), own=own)
         result.caller_evidence = lifted.caller_evidence
+        lifted.polymorphic = {c.new.cxx.quals for c in lifted.calls if c.new is not None
+                              and "::".join(c.new.cxx.quals) in ctx.classes}
         if tight:
             sized = gen.tight_locals(lifted)
             if sized == lifted.locals:
@@ -374,7 +453,22 @@ def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path,
         member = gen.Param("r3") in lifted.nodes or (known_class and "r3" not in lifted.int_params)
         # a member call on this names this's class: the scratch class must carry that name
         this_q = lifted.bound.get(("this",)) or lifted.bound.get(gen.Param("r3"))
+        if this_q and not known_class and gen.Param("r3") not in lifted.receivers and not lifted.nodes.get(gen.Param("r3")) \
+                and not lifted.vptrs.get(gen.Param("r3")):
+            this_q, member = None, False          # only passed on as a class pointer: a parameter, not this
         chain = None                              # [base, ..., this_type]: inherited methods called on this
+        if lifted.this_classes:                   # several classes' methods on this: all of this_type's chain
+            if not known_class or not this_q:
+                raise gen.Unsupported("one object used as two classes")
+            names = {"::".join(q) for q in lifted.this_classes | {this_q}} - {this_type}
+            paths = {n: ctx.base_path(this_type, n) for n in names}
+            if any(p is None for p in paths.values()):
+                raise gen.Unsupported(f"calls {', '.join(sorted(n for n, p in paths.items() if p is None))} "
+                                      f"methods on this ({this_type})")
+            root = max(paths, key=lambda n: len(paths[n]))
+            if any(n not in paths[root] for n in names):
+                raise gen.Unsupported("classes called on this that are not one inheritance chain")
+            this_q = tuple(root.split("::"))
         if this_q and known_class and "::".join(this_q) != this_type:
             chain = ctx.base_path(this_type, "::".join(this_q))
             if chain is None:
@@ -385,18 +479,18 @@ def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path,
         used = ctx.result_used(name)
         if used is not None and gen.return_value(lifted) is not None:
             lifted.void_first = not used          # the callers say whether a value comes back
-        sizes = {g: ctx.by_name[g].size for g in lifted.global_objs if g in ctx.by_name}
+        sizes = _global_sizes(ctx, lifted)
         # a variant that cannot be written down (e.g. returning a branch-local value) is skipped
         chosen, first_error = [], None
         for v in gen.variants(lifted):
             try:
-                gen.render_tu(lifted, member, verify_type, "v", [v], sizes, chain=chain)
+                gen.render_tu(lifted, member, verify_type, "v", [v], sizes, chain=chain, cxx_free=free is not None)
                 chosen.append(v)
             except gen.Unsupported as e:
                 first_error = first_error or e
         if not chosen:
             raise first_error or gen.Unsupported("no variant can be written")
-        source, _ = gen.render_tu(lifted, member, verify_type, "v", chosen, sizes, chain=chain)
+        source, _ = gen.render_tu(lifted, member, verify_type, "v", chosen, sizes, chain=chain, cxx_free=free is not None)
     except gen.Unsupported as e:
         result.detail = str(e)
         return result
@@ -409,7 +503,7 @@ def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path,
         objects = []
         for i, v in enumerate(chosen):
             try:
-                one, _ = gen.render_tu(lifted, member, verify_type, "v", [v], sizes, chain=chain)
+                one, _ = gen.render_tu(lifted, member, verify_type, "v", [v], sizes, chain=chain, cxx_free=free is not None)
             except gen.Unsupported:
                 objects.append(None)
                 continue
@@ -429,13 +523,13 @@ def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path,
             best = (matched, v, diff)
         if diff is None:
             try:
-                result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [v], sizes, display=True, chain=chain)
+                result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [v], sizes, display=True, chain=chain, cxx_free=free is not None)
             except gen.Unsupported as e:
                 result.status, result.detail = ("unsupported", str(e)) if method == "__ct" else \
                     ("error", f"generator bug (display): {e}")
                 return result
             try:
-                result.standalone, _ = gen.render_tu(lifted, member, this_type, method, [v], sizes, standalone=True, chain=chain)
+                result.standalone, _ = gen.render_tu(lifted, member, this_type, method, [v], sizes, standalone=True, chain=chain, cxx_free=free is not None)
             except gen.Unsupported:
                 pass                            # --write leaves it out
             if method == "__ct":                 # verify the constructor form under its own symbol
@@ -458,7 +552,7 @@ def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path,
                 if gen.compare(insns, obj_j, sym_j, ctx.literal, literal_info=ctx.literal_info) is None:
                     try:
                         alt, _ = gen.render_tu(lifted, member, this_type, method, [chosen[j]], sizes, standalone=True,
-                                               chain=chain)
+                                               chain=chain, cxx_free=free is not None)
                     except gen.Unsupported:
                         continue
                     if alt != result.standalone and alt not in result.alternatives:
@@ -468,7 +562,7 @@ def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path,
     result.status, result.detail = "differs", f"no variant matched ({len(chosen)} tried): {first_diff}"
     if best[1] is not None:                     # the closest variant, for --unverified
         try:
-            result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [best[1]], sizes, display=True, chain=chain)
+            result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [best[1]], sizes, display=True, chain=chain, cxx_free=free is not None)
             result.notes += lifted.notes
             result.closest = f"{best[0]}/{len(insns)} instructions match, then: {best[2]}"
         except gen.Unsupported:
@@ -506,6 +600,41 @@ def _verify_class_draft(ctx: Context, command: str, insns, draft, work: Path, re
                                   if result.name != draft.function and gen.is_auto(result.name)] \
         if result.name != draft.function else draft.notes + [f"then: {a}" for a in draft.advice]
     return result
+
+
+def _verify_plan(ctx: Context, command: str, insns, plan, work: Path, result: Result) -> Result:
+    """Each (void) variant of a constructor's or destructor's body in its class model, until
+    one is exact."""
+    lifted = plan.lifted
+    sizes = _global_sizes(ctx, lifted)
+    sources, first_error = [], None
+    for v in gen.variants(lifted):
+        if v.ret_mode != "void":
+            continue
+        try:
+            if isinstance(plan, classgen.CtorPlan):
+                source, _ = gen.render_tu(lifted, True, plan.model.cls, "__ct", [v], sizes, standalone=True,
+                                          ctor_model=plan.model)
+            else:
+                source, _ = gen.render_tu(lifted, True, plan.model.cls, "__dt", [v], sizes, standalone=True, dtor=plan.model)
+        except gen.Unsupported as e:
+            first_error = first_error or e
+            continue
+        if source not in sources:
+            sources.append(source)
+    if not sources:
+        what = "constructor" if isinstance(plan, classgen.CtorPlan) else "destructor"
+        result.status, result.detail = "unsupported", f"{what}: {first_error or 'no variant can be written'}"
+        return result
+    first = None
+    for source in sources:
+        draft = classgen.ClassDraft(source, plan.function, dict(plan.renames), list(plan.advice), list(plan.notes))
+        r = _verify_class_draft(ctx, command, insns, draft, work, Result(result.name, result.address, "unsupported"))
+        if r.status == "exact":
+            r.notes += lifted.notes
+            return r
+        first = first or r
+    return first
 
 
 def solve_asm(ctx: Context, name: str, work: Path) -> Result:
@@ -671,6 +800,10 @@ def _write(ctx: Context, args: argparse.Namespace, results: list[Result], unit_s
     if not args.into and _has_code(target):
         print(f"error: {ctx.cfg.rel(target)} already has code: --into PATH writes the merged drafts elsewhere")
         return USAGE
+    for r in results:
+        if r.status == "exact" and r.name.startswith("__sinit_"):        # (see _merge)
+            print(f"  left out {r.name}: compiler-generated (write the globals it initializes, see the draft: ./dk gen {r.name})")
+    results = [r for r in results if not r.name.startswith("__sinit_")]
     drafts = [r for r in results if r.status == "exact" and r.standalone]
     headers = _class_headers(ctx, drafts) if unit is not None else {}
     if headers:
@@ -758,7 +891,13 @@ def _merge(ctx: Context, args: argparse.Namespace, results: list[Result], unit: 
     drafts in. `start_source`/`out`: --write starts from the headers it includes."""
     path = ctx.cfg.root / unit["metadata"]["source_path"]
     source = start_source if start_source is not None else path.read_text() if path.is_file() else ""
+    # a static initializer is compiler-generated: written by hand it has no .ctors entry (and a
+    # unit with initialized globals already emits it), so its draft is only shown
+    sinits = [r for r in results if r.status == "exact" and r.name.startswith("__sinit_") and start_source is None]
+    results = [r for r in results if not r.name.startswith("__sinit_")]
     drafts = sorted((r for r in results if r.status == "exact" and r.standalone), key=lambda r: r.address)
+    for r in sinits:
+        print(f"  left out {r.name}: compiler-generated (write the globals it initializes, see the draft: ./dk gen {r.name})")
     if not drafts:
         print("no exact drafts to merge")
         return MISMATCH
@@ -1102,11 +1241,17 @@ def _regress(ctx: Context, args: argparse.Namespace) -> int:
     return MISMATCH if lost else OK
 
 
+_C_DEFINITION = re.compile(r'^extern "C" [^;{]*?\b(\w+)\s*\([^;]*\)\s*\{', re.M)
+
+
 def _writable(ctx: Context, name: str, standalone: str, work: Path) -> bool:
-    """Does this draft compile under its own names and stay exact there?"""
+    """Does this draft compile under its own names and stay exact there? (Not when it defines
+    a mangled C++ name as an extern "C" function: that duplicates the real function.)"""
     sym = ctx.by_name.get(name)
     command = ctx.command(sym.address)[0] if sym else None
     if not standalone or command is None:
+        return False
+    if any(_demangled(m[1]) is not None for m in _C_DEFINITION.finditer(standalone)):
         return False
     obj, _ = _compile(ctx, command, standalone, work, f"w{sym.address:08X}")
     if obj is None:
@@ -1115,6 +1260,8 @@ def _writable(ctx: Context, name: str, standalone: str, work: Path) -> bool:
     # a special member (__ct__, __dt__, __as__...) must come out under exactly its symbol: a
     # member literally named __ct is a different function
     found = name if name in obj.functions() else None if name.startswith("__") else _symbol_in(obj, ctx, r)
+    if found != name and _demangled(name) is not None:
+        return False                    # a mangled name must come out as exactly that symbol
     return found is not None and gen.compare(gen.parse(ctx.entries[name].text), obj, found, ctx.literal,
                                              literal_info=ctx.literal_info) is None
 

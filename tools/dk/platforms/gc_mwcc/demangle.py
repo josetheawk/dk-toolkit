@@ -19,6 +19,13 @@ _BUILTIN = {"v": "void", "i": "int", "l": "long", "s": "short", "c": "char", "b"
 _UNSIGNED = {"i": "unsigned int", "l": "unsigned long", "s": "unsigned short", "c": "unsigned char"}
 SPECIAL = {"__ct": "ctor", "__dt": "dtor", "__nw": "operator new", "__dl": "operator delete",
            "__nwa": "operator new[]", "__dla": "operator delete[]", "__as": "operator="}
+_OPERATORS = {"pl": "+", "mi": "-", "ml": "*", "dv": "/", "md": "%", "er": "^", "ad": "&", "or": "|", "co": "~",
+              "nt": "!", "lt": "<", "gt": ">", "le": "<=", "ge": ">=", "eq": "==", "ne": "!=", "aa": "&&", "oo": "||",
+              "ls": "<<", "rs": ">>", "apl": "+=", "ami": "-=", "amu": "*=", "adv": "/=", "amd": "%=", "aer": "^=",
+              "aad": "&=", "aor": "|=", "als": "<<=", "ars": ">>=", "pp": "++", "mm": "--", "cm": ",", "rf": "->",
+              "cl": "()", "vc": "[]"}
+SPECIAL.update({f"__{code}": f"operator{op}" for code, op in _OPERATORS.items()})
+OPERATORS = frozenset(f"operator{op}" for op in list(_OPERATORS.values()) + ["="])     # (plain member functions)
 
 
 @dataclass(frozen=True)

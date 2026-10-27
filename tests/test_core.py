@@ -196,5 +196,23 @@ class FloorGateTest(unittest.TestCase):
             self.assertEqual(floor.parse(text), {"matched_functions": 12, "complete_code": 120, "complete_units": 2})
 
 
+class SweepDeadTest(unittest.TestCase):
+    def test_only_worktrees_of_finished_processes_are_dropped(self):
+        import os
+        import subprocess
+        import sys
+        from tools.dk.core import isolated
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_project(Path(d))
+            names = [f"verify-{dead.pid}", f"verify-{os.getpid()}", "verify-head", "probe"]
+            for n in names:
+                (cfg.root / "build" / "dk" / n).mkdir(parents=True)
+            self.assertEqual(isolated.sweep_dead(cfg), [f"verify-{dead.pid}"])
+            left = sorted(p.name for p in (cfg.root / "build" / "dk").iterdir())
+            self.assertEqual(left, sorted(names[1:]))
+
+
 if __name__ == "__main__":
     unittest.main()

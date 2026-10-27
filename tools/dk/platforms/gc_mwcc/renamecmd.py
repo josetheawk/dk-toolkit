@@ -9,7 +9,6 @@ from . import dtkconfig
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from ...core.util import run_ninja, tail
 from .dtk_symbols import build_errors
 from .unitcmd import Transaction
 
@@ -120,15 +119,36 @@ def rewrite_sources(cfg: Config, pairs: list[tuple[str, str]], tx: Transaction |
             for m in word.finditer(text):
                 if m[1] in manual_names:
                     manual.append(f"{cfg.rel(f)}: {m[1]}")
-            new_text = word.sub(lambda m: rewrite.get(m[1], m[1]), text)
+            new_text = _drop_new_duplicates(text, word.sub(lambda m: rewrite.get(m[1], m[1]), text))
             if new_text != text:
                 (tx.write(f, new_text) if tx else f.write_text(new_text))
                 changed.append(cfg.rel(f))
     return sorted(changed), sorted(set(manual))
 
 
+_DECL = re.compile(r"^extern [^{\n]*;\s*$")
+
+
+def _drop_new_duplicates(old: str, new: str) -> str:
+    """`new` without the one-line extern declarations the rewrite turned into a repeat of an
+    earlier one (a placeholder declared beside the real name it was renamed to)."""
+    before, after = old.split("\n"), new.split("\n")
+    if len(before) != len(after):
+        return new
+    seen_old, seen_new, out = set(), set(), []
+    for o, n in zip(before, after):
+        if _DECL.match(n) and n in seen_new and o not in seen_old:
+            continue
+        seen_old.add(o)
+        seen_new.add(n)
+        out.append(n)
+    return "\n".join(out)
+
+
 _COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
 _EXTERN_C = re.compile(r'\bextern\s+"C"\s*')
+# a branch mnemonic (`b`, `bl`, `beq+`, `bdnz`…) before its target; not a C type such as `bool`
+_BRANCH = r"\bb(?:eq|ne|lt|le|gt|ge|so|ns|dnz|dz|c)?(?:l|a|la)?[+-]?\s+"
 
 
 def _extern_c_spans(text: str) -> list[tuple[int, int]]:
@@ -163,7 +183,7 @@ def c_uses(text: str, names: set[str], c_file: bool = False) -> list[tuple[str, 
     for m in word.finditer(text):
         line_start = text.rfind("\n", 0, m.start()) + 1
         line = text[line_start:text.find("\n", m.end()) if "\n" in text[m.end():] else len(text)]
-        asm = re.search(r"\bb[a-z]*\s+" + re.escape(m[1]) + r"\b", line) or re.search(re.escape(m[1]) + r"@(?:ha|h|l|sda21)\b", line)
+        asm = re.search(_BRANCH + re.escape(m[1]) + r"\b", line) or re.search(re.escape(m[1]) + r"@(?:ha|h|l|sda21)\b", line)
         if c_file or asm or any(a <= m.start() < b for a, b in spans):
             out.append((m[1], text.count("\n", 0, m.start()) + 1))
     return out

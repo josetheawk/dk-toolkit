@@ -230,6 +230,19 @@ class RewriteSourcesTest(unittest.TestCase):
             self.assertEqual(manual, ["src/game/a.cpp: fn_800ED408"])
             self.assertIn("gThing", (Path(tmp) / "include/game/a.h").read_text())
 
+    def test_a_declaration_renamed_into_a_repeat_is_dropped(self):
+        from tests.helpers import make_project
+        from tools.dk.platforms.gc_mwcc.renamecmd import rewrite_sources
+        src = ('extern "C" void OSInitMutex(void*);\nextern int lbl_1;\nextern int lbl_1;\n'
+               'extern "C" void fn_801C3E1C(void*);\nvoid f(void* m) { fn_801C3E1C(m); }\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_project(Path(tmp), files={"src/game/a.cpp": src})
+            rewrite_sources(cfg, [("fn_801C3E1C", "OSInitMutex")])
+            text = (Path(tmp) / "src/game/a.cpp").read_text()
+            self.assertEqual(text.count('extern "C" void OSInitMutex(void*);'), 1)
+            self.assertIn("OSInitMutex(m);", text)
+            self.assertEqual(text.count("extern int lbl_1;"), 2)          # an older repeat is left alone
+
 
 class FreshnessTest(unittest.TestCase):
     def test_stale_split_output_removed(self):

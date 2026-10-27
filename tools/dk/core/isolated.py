@@ -48,8 +48,30 @@ def show(cfg: Config, rel: str) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_dead(cfg: Config) -> list[str]:
+    """Drop `verify-<pid>` worktrees whose process is gone (a killed verify leaves ~60 MB behind)."""
+    gone = []
+    for tree in sorted((cfg.root / "build" / "dk").glob("verify-*")):
+        pid = tree.name.removeprefix("verify-")
+        if pid.isdigit() and int(pid) != os.getpid() and not _alive(int(pid)):
+            _drop(cfg, tree)
+            gone.append(tree.name)
+    return gone
+
+
 def _worktree(cfg: Config, name: str) -> Path:
     tree = cfg.root / "build" / "dk" / name
+    sweep_dead(cfg)
     subprocess.run(["git", "worktree", "remove", "--force", str(tree)], cwd=cfg.root, capture_output=True)
     shutil.rmtree(tree, ignore_errors=True)
     subprocess.run(["git", "worktree", "prune"], cwd=cfg.root, capture_output=True)
@@ -110,7 +132,11 @@ def verify_overlay(cfg: Config, overlay: Overlay, timeout: int = 900, keep: bool
                 return False, (head + "\n...\n" if head else "") + tail("\n".join(lines), 10)
         report = tree / cfg.rel(cfg.report)
         if measures is not None and report.is_file():
-            measures.update(json.loads(report.read_text()).get("measures", {}))
+            data = json.loads(report.read_text())
+            measures.update(data.get("measures", {}))
+            # per unit, for the floor's table (an integration holds back a unit that fell below it)
+            measures["units"] = {u["name"]: int(u.get("measures", {}).get("matched_functions", 0) or 0)
+                                 for u in data.get("units", []) if u.get("name")}
         return True, "builds and matches"
     finally:
         if not keep:

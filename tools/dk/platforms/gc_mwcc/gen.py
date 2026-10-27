@@ -21,7 +21,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 
-from .demangle import demangle
+from .demangle import OPERATORS, demangle
 from .elf import Elf
 
 # --- parse -----------------------------------------------------------------------------------
@@ -166,6 +166,21 @@ class Call:
     virtual: bool = False
     cxx: object = None    # demangle.Function for a C++ callee (args follow its parameter order)
     variadic: bool = False    # crclr/crset cr1eq before it: a varargs call (printf-like)
+    new: object = None    # NewInfo: `new (placement) T(args)`, this the constructor (args: its, then placement)
+    fnptr: object = None  # a call through a function pointer: the Load of the pointer (callee "@fnptr")
+
+
+@dataclass(frozen=True)
+class NewInfo:        # the operator new half of a new-expression
+    callee: str       # operator new's symbol
+    cxx: object       # its demangle.Function (params: the size, then the placement arguments)
+    size: int         # sizeof(T)
+    cls: tuple        # T
+
+
+@dataclass(frozen=True)
+class NewPending:     # operator new's result before its constructor ran (only the constructor may use it)
+    seq: int
 
 
 @dataclass(frozen=True)
@@ -186,6 +201,17 @@ LOADS = {"lwz": ("int", 4), "lhz": ("unsigned short", 2), "lha": ("short", 2), "
 STORES = {"stw": ("int", 4), "sth": ("short", 2), "stb": ("unsigned char", 1), "stfs": ("float", 4), "stfd": ("double", 8)}
 SIZES = {"int": 4, "unsigned int": 4, "short": 2, "unsigned short": 2, "unsigned char": 1, "signed char": 1,
          "float": 4, "double": 8, "bool": 1}
+# the C library's prototypes (MSL): their pointer parameters type the arguments, and drafts declare
+# them as the headers do, so a draft merged into a source that includes <string.h> still compiles
+PROTOTYPES = {
+    "strcmp": ("int", ("const char*", "const char*")), "strncmp": ("int", ("const char*", "const char*", "unsigned long")),
+    "strcpy": ("char*", ("char*", "const char*")), "strncpy": ("char*", ("char*", "const char*", "unsigned long")),
+    "strcat": ("char*", ("char*", "const char*")), "strlen": ("unsigned long", ("const char*",)),
+    "strchr": ("char*", ("const char*", "int")), "strrchr": ("char*", ("const char*", "int")),
+    "memcpy": ("void*", ("void*", "const void*", "unsigned long")), "memmove": ("void*", ("void*", "const void*", "unsigned long")),
+    "memset": ("void*", ("void*", "int", "unsigned long")), "memcmp": ("int", ("const void*", "const void*", "unsigned long")),
+    "sprintf": ("int", ("char*", "const char*", "...")), "printf": ("int", ("const char*", "...")),
+}
 _INT_OPS = {"add": "+", "subf": "-", "mullw": "*", "and": "&", "or": "|", "xor": "^"}
 _FLOAT_OPS = {"fadds": ("+", "float"), "fsubs": ("-", "float"), "fmuls": ("*", "float"), "fdivs": ("/", "float"),
               "fadd": ("+", "double"), "fsub": ("-", "double"), "fmul": ("*", "double"), "fdiv": ("/", "double")}
@@ -219,6 +245,14 @@ class Lifted:
     ret_fp: bool = False
     void_first: bool = False
     strides: dict = field(default_factory=dict)   # loop pointer -> bytes it steps per iteration
+    own: dict = field(default_factory=dict)       # parameter register -> its type from the function's mangled name
+    own_order: list = field(default_factory=list)  # those registers in declaration order
+    init_stores: list = field(default_factory=list)  # a constructor model's member initializers (typing only)
+    init_args: list = field(default_factory=list)    # and the arguments of its base and member constructors
+    receivers: set = field(default_factory=set)      # objects a member function was called on
+    proto_expected: set = field(default_factory=set)  # values typed only by a C library prototype
+    polymorphic: set = field(default_factory=set)     # classes known to have a vtable (RTTI): a vptr at 0
+    this_classes: set = field(default_factory=set)    # more classes whose methods are called on this (its bases?)
 
 
 _ROTATE_FORMS = {
@@ -527,10 +561,32 @@ class Loop:
 
 
 @dataclass(frozen=True)
-class VtStore:          # constructor mode: this->vptr = &__vt__X
+class VtStore:          # constructor/destructor mode: this->vptr = &__vt__X
     vtable: str
     offset: int
     seq: int
+
+
+@dataclass(frozen=True)
+class MemberCtor:       # constructor mode: a member object's constructor (or __construct_array)
+    callee: str         # the constructor (for an array: the element's default constructor)
+    offset: int         # where the member sits in this
+    args: tuple         # the constructor's arguments (after the object)
+    seq: int
+    cxx: object = None  # its demangle.Function
+    size: int = 0       # an array: element size
+    count: int = 0      # an array: element count (0: one object)
+    dtor: str = ""      # an array: the element destructor (empty: none)
+
+
+@dataclass(frozen=True)
+class DtorCall:         # destructor mode: the destructor of an object inside this (or __destroy_arr)
+    callee: str         # the destructor (for an array: the element destructor passed to __destroy_arr)
+    offset: int         # where the object sits in this
+    flag: int           # r4: -1 a member, 0 a base class
+    seq: int
+    size: int = 0       # an array: element size
+    count: int = 0      # an array: element count (0: one object)
 
 
 _BRANCH = re.compile(r"^b(eq|ne|lt|le|gt|ge)(-|\+)?$")
@@ -568,10 +624,11 @@ class _State:
     fresh: set = field(default_factory=set)     # registers written since the last call
     stack: dict = field(default_factory=dict)   # frame offset -> value (conversion scratch slots)
     when: dict = field(default_factory=dict)    # register -> write counter (which was written last)
+    cr1eq: str | None = None                    # crclr/crset cr1eq since the last call (a varargs call next)
 
     def copy(self) -> "_State":
         return _State(dict(self.regs), set(self.written), set(self.clobbered), set(self.stored), dict(self.cr),
-                      self.ctr, set(self.fresh), dict(self.stack), dict(self.when))
+                      self.ctr, set(self.fresh), dict(self.stack), dict(self.when), self.cr1eq)
 
 
 def _target(insn: Insn) -> int | None:
@@ -582,11 +639,14 @@ def _target(insn: Insn) -> int | None:
 
 class _Executor:
     def __init__(self, literal, this_is_object: bool, signature, vsignature=None, ctor_mode: bool = False,
-                 callers=None, params=None):
+                 callers=None, params=None, dtor_of=None):
         self.literal, self.this_is_object, self.signature = literal, this_is_object, signature
         self.callers = callers              # callee -> (GPR, FPR) arguments its call sites set up
         self.params = params                # (GPR, FPR) parameters this function is known to have
         self.ctor_mode = ctor_mode          # vtable stores and the base constructor call are markers
+        self.dtor_of = dtor_of              # destructor mode: is this auto-named callee a destructor?
+        self.news: dict = {}                # new-expressions: seq of the constructor's bl -> seq of operator new's
+        self.pending_new: dict = {}         # seq of operator new's bl -> (callee, cxx, size, placement args)
         self.vsignature = vsignature        # slot -> (GPR, FPR) for virtual calls on `this`
         self.out = Lifted([], {}, set())
         self.as_base: set[object] = set()
@@ -606,6 +666,8 @@ class _Executor:
         if reg not in st.regs:
             raise Unsupported(f"uses {reg} after a call clobbered it" if reg in st.clobbered else f"reads {reg} before writing it")
         value = st.regs[reg]
+        if isinstance(value, NewPending):
+            raise Unsupported("operator new's result used before its constructor runs")
         if isinstance(value, Phi):
             value = self.materialise(value)
             st.regs[reg] = value
@@ -816,6 +878,13 @@ class _Executor:
             raise Unsupported("arithmetic on a pointer (casts or pointer math)")
         return value
 
+    def is_code_address(self, value) -> bool:
+        """The address of a C++ function (a mangled name), or a parameter holding one."""
+        if isinstance(value, AddrOf) and isinstance(value.loc, GlobalObj):
+            fn = demangle(value.loc.sym) if "__" in value.loc.sym.lstrip("_") else None
+            return fn is not None
+        return isinstance(value, Param) and value.reg in self.out.own and "(*)" in self.out.own[value.reg].text
+
     def mark_unsigned(self, value) -> None:
         """An unsigned compare: word-sized values of unknown type are unsigned (or pointers)."""
         if isinstance(value, Load) and isinstance(value.loc, Field) and value.ctype == "int" and value not in self.as_base:
@@ -886,7 +955,7 @@ class _Executor:
             if isinstance(loc, Literal):
                 raise Unsupported("store into a literal")
             value = get(a[0])
-            if (self.ctor_mode and isinstance(value, AddrOf) and isinstance(value.loc, GlobalObj)
+            if ((self.ctor_mode or self.dtor_of) and isinstance(value, AddrOf) and isinstance(value.loc, GlobalObj)
                     and value.loc.sym.startswith("__vt__") and isinstance(loc, Field) and loc.base == Param("r3")):
                 out.global_objs.discard(value.loc.sym)
                 stmts.append(VtStore(value.loc.sym, loc.offset, seq))
@@ -959,6 +1028,9 @@ class _Executor:
             put(a[0], get(a[1]))
         elif op == "add" and (ix := self.index_ptr(get(a[1]), get(a[2])) or self.index_ptr(get(a[2]), get(a[1]))):
             put(a[0], ix)
+        elif op == "subf" and any(self.is_code_address(v) for v in (get(a[1]), get(a[2]))):
+            # a function's address compared through cntlzw(a - b): kept as pointers (see _simplify)
+            put(a[0], Op("-", (get(a[2]), get(a[1])), "ptrdiff"))
         elif op in _INT_OPS:
             x, y = self.as_value(get(a[1])), self.as_value(get(a[2]))
             put(a[0], Op(_INT_OPS[op], (y, x) if op == "subf" else (x, y), "int"))
@@ -1029,6 +1101,7 @@ class _Executor:
             st.cr["cr0"] = (_FUSED[tuple(a)], entry[1], entry[2])
         elif op in ("crclr", "crset") and tuple(a) == ("cr1eq",):
             self.vararg_at[seq + 1] = op        # the varargs call that follows
+            st.cr1eq = op                       # (a call through a pointer loads it after this)
         elif op == "bl":
             self.call(st, seq, a[0], stmts)
         elif op == "mtctr":
@@ -1091,9 +1164,17 @@ class _Executor:
         cxx = demangle(callee) if re.search(r"__(?:F|\d|Q\d|C)", callee) else None
         if cxx is None and re.search(r"__(?:F|\d|Q\d|C)", callee):
             raise Unsupported("calls a C++ function whose name it cannot demangle")
+        if seq in self.news.values():
+            return self.operator_new(st, seq, callee, cxx)
+        if seq in self.news:
+            return self.new_call(st, seq, callee, cxx, stmts)
+        if self.dtor_of and (call := self.dtor_call(st, seq, callee, cxx, stmts)):
+            return call
         if self.ctor_mode and self.get(st, "r3") == Param("r3") and not any(isinstance(x, VtStore) for x in stmts) \
                 and not out.calls and (cxx is None or cxx.special == "ctor"):
             return self.base_ctor_call(st, seq, callee, cxx, stmts)
+        if self.ctor_mode and (member := self.member_ctor(st, seq, callee, cxx, stmts)):
+            return member
         if cxx is not None:
             if seq in self.vararg_at:
                 raise Unsupported("a C++ varargs call")
@@ -1133,10 +1214,162 @@ class _Executor:
         for v in args:
             if isinstance(v, HaPart):
                 raise Unsupported("passes half an address")
+        self.prototype_args(callee, args)
         return self.finish_call(st, Call(callee, args, n_gpr, seq), stmts)
+
+    def prototype_args(self, callee: str, args) -> None:
+        """A C library function's pointer parameters type its arguments (char strings, buffers)."""
+        proto = PROTOTYPES.get(callee)
+        if proto is None:
+            return
+        for v, t in zip(args, proto[1]):
+            # (only what takes its type from the use: not a local's or a member's address)
+            free = isinstance(v, AddrOf) and isinstance(v.loc, (GlobalObj, GlobalVar)) or isinstance(v, CallResult) \
+                or isinstance(v, Param) and v.reg not in self.out.own or isinstance(v, Load)
+            if t.endswith("*") and t not in ("void*", "const void*") and free and v not in self.out.nodes \
+                    and v not in self.out.expected:
+                self.out.expected[v] = t
+                self.out.proto_expected.add(v)
 
     def set_before(self, seq: int, kind: str) -> int:
         return set_before(self.insns, seq, kind, self.targets)
+
+    def operator_new(self, st: _State, seq: int, callee: str, cxx) -> None:
+        """The first half of `new (placement) T(args)`: the size and placement arguments."""
+        if cxx is None or cxx.special != "operator new" or not cxx.params:
+            raise Unsupported(f"new-expression through {callee}")
+        size, gpr, fpr, placement = self.get(st, "r3"), 4, 1, []
+        if not isinstance(size, Const):
+            raise Unsupported("operator new of a computed size")
+        for t in cxx.params[1:]:
+            if t.reg == "none":
+                raise Unsupported("operator new with a class by value")
+            reg = f"f{fpr}" if t.reg == "fpr" else f"r{gpr}"
+            fpr, gpr = (fpr + 1, gpr) if t.reg == "fpr" else (fpr, gpr + 1)
+            v = self.get(st, reg)
+            if isinstance(v, Offset):
+                v = _resolve_offset(self.out, v, self.this_is_object)
+            if isinstance(v, HaPart):
+                raise Unsupported("passes half an address")
+            if t.text.endswith("*") and not isinstance(v, Const) and self.out.expected.setdefault(v, t.text) != t.text:
+                raise Unsupported("one value passed as two pointer types")
+            placement.append(v)
+        self.pending_new[seq] = (callee, cxx, size.value, tuple(placement))
+        for reg in _VOLATILE:
+            st.regs.pop(reg, None)
+            st.clobbered.add(reg)
+        self.put(st, "r3", NewPending(seq))
+        st.cr.clear()
+        st.fresh = {"r3"}
+        return None
+
+    def new_call(self, st: _State, seq: int, callee: str, cxx, stmts: list) -> Call:
+        """The constructor of a new-expression: `new (placement) T(args)` as one call."""
+        if not (isinstance(st.regs.get("r3"), NewPending) and st.regs["r3"].seq == self.news[seq]):
+            raise Unsupported("a new-expression whose constructor gets another object")
+        if cxx is None or cxx.special != "ctor":
+            raise Unsupported(f"new-expression with the constructor {callee}" if cxx is None or is_auto(callee)
+                              else f"new-expression calling {callee}")
+        if any(t.reg == "none" for t in cxx.params):
+            raise Unsupported("passes a class by value or varargs")
+        new_callee, new_cxx, size, placement = self.pending_new[self.news[seq]]
+        st.regs.pop("r3")
+        gpr, fpr, args = 4, 1, []
+        for t in cxx.params:
+            reg = f"f{fpr}" if t.reg == "fpr" else f"r{gpr}"
+            fpr, gpr = (fpr + 1, gpr) if t.reg == "fpr" else (fpr, gpr + 1)
+            if gpr > 11 or fpr > 9:
+                raise Unsupported("arguments on the stack")
+            args.append(self.get(st, reg))
+        args = [_resolve_offset(self.out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v)
+                if isinstance(v, IndexPtr) else v for v in args]
+        for v, t in zip(args, cxx.params):
+            if isinstance(v, HaPart):
+                raise Unsupported("passes half an address")
+            if isinstance(v, Const):
+                if t.text.endswith(("*", "&")) and v.value != 0:
+                    raise Unsupported("a constant passed as a pointer")
+                continue
+            if t.text.endswith(("*", "&")) and t.classes and t.text.rstrip("*& ").removeprefix("const ") == "::".join(t.classes[0]) \
+                    and t.text.count("*") + t.text.count("&") == 1:
+                self.bind(v, t.classes[0])
+            elif t.text.endswith(("*", "&")) and self.out.expected.setdefault(v, t.text) != t.text:
+                raise Unsupported("one value passed as two pointer types")
+        call = Call(callee, tuple(args) + placement, gpr - 3, seq, cxx=cxx,
+                    new=NewInfo(new_callee, new_cxx, size, cxx.quals))
+        call = self.finish_call(st, call, stmts)
+        self.bind(CallResult(call, False), cxx.quals)        # the new object: a T*
+        return call
+
+    def member_ctor(self, st: _State, seq: int, callee: str, cxx, stmts: list) -> MemberCtor | None:
+        """Constructor mode: a named constructor called on this+off (a member object), or
+        `__construct_array(this+off, ctor, dtor, size, n)`; None for anything else."""
+        this, obj = Param("r3"), st.regs.get("r3")
+        if not (isinstance(obj, Offset) and obj.base == this and obj.delta > 0):
+            return None
+        if callee == "__construct_array":
+            fn, dt, size, count = (st.regs.get(r) for r in ("r4", "r5", "r6", "r7"))
+            if not (isinstance(fn, AddrOf) and isinstance(fn.loc, GlobalObj) and isinstance(size, Const)
+                    and isinstance(count, Const) and size.value > 0 and count.value > 0
+                    and (dt == Const(0) or isinstance(dt, AddrOf) and isinstance(dt.loc, GlobalObj))):
+                return None
+            self.out.global_objs.discard(fn.loc.sym)
+            if isinstance(dt, AddrOf):
+                self.out.global_objs.discard(dt.loc.sym)
+            call = MemberCtor(fn.loc.sym, obj.delta, (), seq, demangle(fn.loc.sym), size.value, count.value,
+                              dt.loc.sym if isinstance(dt, AddrOf) else "")
+        else:
+            if cxx is None or cxx.special != "ctor" or any(t.reg == "none" for t in cxx.params):
+                return None
+            gpr, fpr, args = 4, 1, []
+            for t in cxx.params:
+                reg = f"f{fpr}" if t.reg == "fpr" else f"r{gpr}"
+                fpr, gpr = (fpr + 1, gpr) if t.reg == "fpr" else (fpr, gpr + 1)
+                if gpr > 11 or fpr > 9:
+                    return None
+                v = self.get(st, reg)
+                v = _resolve_offset(self.out, v, self.this_is_object) if isinstance(v, Offset) else v
+                if isinstance(v, (HaPart, IndexPtr)):
+                    return None
+                args.append(v)
+            call = MemberCtor(callee, obj.delta, tuple(args), seq, cxx)
+        stmts.append(call)
+        for reg in _VOLATILE:
+            st.regs.pop(reg, None)
+            st.clobbered.add(reg)
+        st.cr.clear()
+        st.stored.clear()
+        st.fresh = set()
+        return call
+
+    def dtor_call(self, st: _State, seq: int, callee: str, cxx, stmts: list) -> DtorCall | None:
+        """Destructor mode: the destructor of a member (r4 = -1) or base (r4 = 0) at this+off,
+        or `__destroy_arr(this+off, dtor, size, n)` for a member array; None for anything else."""
+        this, obj = Param("r3"), st.regs.get("r3")
+        off = 0 if obj == this else obj.delta if isinstance(obj, Offset) and obj.base == this else None
+        if off is None:
+            return None
+        if callee == "__destroy_arr":
+            fn, size, count = st.regs.get("r4"), st.regs.get("r5"), st.regs.get("r6")
+            if not (isinstance(fn, AddrOf) and isinstance(fn.loc, GlobalObj) and isinstance(size, Const)
+                    and isinstance(count, Const) and size.value > 0 and count.value > 0):
+                return None
+            self.out.global_objs.discard(fn.loc.sym)
+            call = DtorCall(fn.loc.sym, off, -1, seq, size.value, count.value)
+        else:
+            named = cxx is not None and cxx.special == "dtor" and not cxx.params
+            flag = st.regs.get("r4")
+            if not (named or cxx is None and self.dtor_of(callee)) or not (isinstance(flag, Const) and flag.value in (0, -1)):
+                return None
+            call = DtorCall(callee, off, flag.value, seq)
+        stmts.append(call)
+        for reg in _VOLATILE:
+            st.regs.pop(reg, None)
+            st.clobbered.add(reg)
+        st.cr.clear()
+        st.stored.clear()
+        st.fresh = set()
+        return call
 
     def vararg_call(self, st: _State, seq: int, callee: str, stmts: list) -> Call:
         """printf-like: the arguments are the registers written since the last call (the
@@ -1155,13 +1388,14 @@ class _Executor:
         args = tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v) if isinstance(v, IndexPtr) else v for v in args)
         if any(isinstance(v, HaPart) for v in args):
             raise Unsupported("passes half an address")
+        self.prototype_args(callee, args)
         return self.finish_call(st, Call(callee, args, n_gpr, seq, variadic=True), stmts)
 
     def cxx_call(self, st: _State, seq: int, callee: str, cxx, stmts: list) -> Call:
         """A call to a demangled C++ function: arguments in parameter order, each from the
         register its type uses; the receiver of a member call is bound to the class."""
         out = self.out
-        if cxx.special and cxx.special not in ("operator delete", "operator delete[]"):
+        if cxx.special and cxx.special not in ("operator delete", "operator delete[]") and cxx.special not in OPERATORS:
             raise Unsupported(f"calls a {cxx.special} (needs the class model)")
         if any(t.reg == "none" for t in cxx.params):
             raise Unsupported("passes a class by value or varargs")
@@ -1181,6 +1415,7 @@ class _Executor:
             raise Unsupported("passes half an address")
         if cxx.quals:
             self.bind(args[0], cxx.quals)
+            out.receivers.add(args[0])
         for v, t in zip(args[1:] if cxx.quals else args, cxx.params):
             if isinstance(v, Const):
                 if t.text.endswith(("*", "&")) and v.value != 0:
@@ -1234,6 +1469,9 @@ class _Executor:
         else:
             raise Unsupported("member call on a computed object")
         if out.bound.setdefault(key, quals) != quals:
+            if key == ("this",):                 # an override calling its base's version: the caller decides
+                out.this_classes.add(quals)
+                return
             raise Unsupported("one object used as two classes")
         embedded = isinstance(key, tuple) and key[:1] == ("embedded",)
         if embedded and out.bound.get(key[1]) == quals or \
@@ -1245,6 +1483,7 @@ class _Executor:
 
     def finish_call(self, st: _State, call: Call, stmts: list) -> Call:
         out = self.out
+        st.cr1eq = None
         out.calls.append(call)
         stmts.append(call)
         for reg in _VOLATILE:
@@ -1267,6 +1506,9 @@ class _Executor:
         out, fn = self.out, st.ctr
         vptr = fn.loc.base if isinstance(fn, Load) and isinstance(fn.loc, Field) else None
         if not (isinstance(vptr, Load) and isinstance(vptr.loc, Field)) or (fn.loc.offset - 8) % 4 or fn.loc.offset < 8:
+            if isinstance(fn, Load) and fn.ctype == "int" and (isinstance(fn.loc, GlobalVar) or isinstance(fn.loc, Field)
+                                                               and not isinstance(fn.loc.base, (Load, CallResult))):
+                return self.fnptr_call(st, seq, stmts, fn)
             raise Unsupported("indirect call that is not a virtual call")
         obj, voff, slot = vptr.loc.base, vptr.loc.offset, (fn.loc.offset - 8) // 4
         if self.get(st, "r3") != obj:
@@ -1304,6 +1546,32 @@ class _Executor:
         st.ctr = None
         return call
 
+    def fnptr_call(self, st: _State, seq: int, stmts: list, fn) -> Call:
+        """bctrl through a function pointer held by a global or a field: `fp(args)`. The
+        arguments are the registers this function set up for it (varargs: those written since
+        the last call)."""
+        out = self.out
+        variadic = st.cr1eq
+        if variadic:
+            n_gpr = max([n - 2 for n in range(3, 11) if f"r{n}" in st.fresh], default=1)
+            n_fpr = max([n for n in range(1, 9) if f"f{n}" in st.fresh], default=0) if variadic == "crset" else 0
+        else:
+            n_gpr, n_fpr = max(self.set_before(seq, "r") - 2, 0), self.set_before(seq, "f")
+        args = tuple(self.get(st, f"r{n}") for n in range(3, 3 + n_gpr)) + tuple(self.get(st, f"f{n}") for n in range(1, 1 + n_fpr))
+        args = tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v)
+                     if isinstance(v, IndexPtr) else v for v in args)
+        if any(isinstance(v, HaPart) for v in args):
+            raise Unsupported("passes half an address")
+        if not variadic and n_gpr == 0 and n_fpr == 0 and "r3" in st.regs and not isinstance(st.regs["r3"], CallResult):
+            out.review.append("a call through a function pointer: arguments passed through unchanged registers may be missing")
+        call = Call("@fnptr", args, n_gpr, seq, variadic=bool(variadic), fnptr=fn)
+        st.cr1eq = None
+        call = self.finish_call(st, call, stmts)
+        st.regs.pop("r12", None)
+        st.clobbered.add("r12")
+        st.ctr = None
+        return call
+
     def finish_vptrs(self) -> None:
         """A vtable pointer slot must not also be read as data."""
         for obj, voff in self.out.vptrs.items():
@@ -1338,7 +1606,7 @@ class _Executor:
 
 
 def lift(insns: list[Insn], literal, this_is_object: bool = False, signature=None, vsignature=None,
-         ctor_mode: bool = False, callers=None, params=None) -> Lifted:
+         ctor_mode: bool = False, callers=None, params=None, dtor_of=None, own=None) -> Lifted:
     """Symbolically execute a function ending in blr: straight-line code with calls, or small
     acyclic control flow (if / if-else / early returns) when the body branches.
 
@@ -1346,14 +1614,19 @@ def lift(insns: list[Insn], literal, this_is_object: bool = False, signature=Non
     or None when `sym` is a variable. `this_is_object`: r3 is `this` of a known class (the
     function sits in a vtable). `signature(sym)` gives a callee's (GPR, FPR) parameter counts,
     `callers(sym)` the most argument registers any call to it sets up; `params` the function's
-    own (GPR, FPR) parameter counts when known (its mangled name, or its callers).
+    own (GPR, FPR) parameter counts when known (its mangled name, or its callers); `own` its
+    demangled name: the parameters keep those types (class pointers and references bound).
     """
     frame_size, save_low = frame_layout(insns)
     insns = _conditional_returns(strip_frame(insns))
     if not insns or insns[-1].op not in ("blr", "b"):
         raise Unsupported("does not end in a return")
-    ex = _Executor(literal, this_is_object, signature, vsignature, ctor_mode, callers, params)
+    insns, news = _new_expressions(insns)
+    ex = _Executor(literal, this_is_object, signature, vsignature, ctor_mode, callers, params, dtor_of)
+    ex.news = news
     out = ex.out
+    if own is not None:
+        _own_params(ex, own, this_is_object)
     ex.scratch, ex.regions = stack_plan(insns, save_low) if frame_size else (set(), {})
     ex.insns, ex.targets = insns, {t for t in map(_target, insns) if t is not None}
     branches = [i for i in insns[:-1] if i.op in ("blr", "b") or _BRANCH.match(i.op) or i.op.startswith("bdnz")]
@@ -1374,6 +1647,56 @@ def lift(insns: list[Insn], literal, this_is_object: bool = False, signature=Non
 
 
 _COND_RETURN = re.compile(r"^b(eq|ne|lt|le|gt|ge)lr([+-]?)$")
+_NEW = re.compile(r"^__nw__(?:\w*)F")
+_NONVOLATILE = re.compile(r"^r(1[3-9]|2\d|3[01])$")
+
+
+def _own_params(ex: "_Executor", own, this_is_object: bool) -> None:
+    """The parameters' registers and types from the function's demangled name; a pointer or
+    reference to a class binds the parameter to it."""
+    if any(t.reg == "none" for t in own.params):
+        raise Unsupported("a parameter passed in memory (a class by value or varargs)")
+    gpr, fpr = (4 if own.quals and this_is_object else 3), 1
+    for t in own.params:
+        reg = f"f{fpr}" if t.reg == "fpr" else f"r{gpr}"
+        fpr, gpr = (fpr + 1, gpr) if t.reg == "fpr" else (fpr, gpr + 1)
+        if gpr > 11 or fpr > 9:
+            raise Unsupported("arguments on the stack")
+        ex.out.own[reg] = t
+        ex.out.own_order.append(reg)
+        if t.classes and t.text.rstrip("*& ").removeprefix("const ") == "::".join(t.classes[0]) \
+                and t.text.count("*") + t.text.count("&") == 1:
+            ex.bind(Param(reg), t.classes[0])
+
+
+def _new_expressions(insns: list[Insn]) -> tuple[list[Insn], dict]:
+    """`new (placement) T(args)`: `bl operator new; mr. rX, r3; beq L; <the constructor's
+    arguments>; bl T::T; mr rX, r3; L:` -> the same without the null check (straight-line for
+    the lifter), and {index of the constructor's bl: index of operator new's bl}."""
+    if not any(i.op == "bl" and _NEW.match(i.args[0]) for i in insns):
+        return insns, {}
+    targets = [t for t in map(_target, insns) if t is not None]
+    out, news, k = [], {}, 0
+    while k < len(insns):
+        x = insns[k]
+        nxt = insns[k + 1:k + 3]
+        if x.op == "bl" and _NEW.match(x.args[0]) and len(nxt) == 2 and nxt[0].op == "mr." and nxt[0].args[1] == "r3" \
+                and nxt[1].op == "beq":
+            res, j = nxt[0].args[0], k + 3
+            while j < len(insns) and insns[j].op != "bl" and not insns[j].op.startswith("b") \
+                    and insns[j].op not in ("mtctr", "bctrl") and _reads_writes(insns[j], None)[1] \
+                    and not any(w == "r3" or _NONVOLATILE.match(w) for w in _reads_writes(insns[j], None)[1]):
+                j += 1
+            ok = j + 2 < len(insns) and insns[j].op == "bl" and insns[j + 1].op == "mr" and insns[j + 1].args == (res, "r3") \
+                and _target(nxt[1]) == insns[j + 2].address and targets.count(insns[j + 2].address) == 1
+            if ok:
+                news[len(out) + (j - k) - 2] = len(out)
+                out += [x] + insns[k + 3:j + 2]
+                k = j + 2
+                continue
+        out.append(x)
+        k += 1
+    return out, news
 
 
 def _conditional_returns(insns: list[Insn]) -> list[Insn]:
@@ -1925,6 +2248,8 @@ def _simplify(e):
     """mwcc's branch-free comparison idioms back to comparisons."""
     if isinstance(e, Op) and e.op == ">>u" and e.args[1] == Const(5) and isinstance(e.args[0], Op) and e.args[0].op == "cntlzw":
         x = e.args[0].args[0]
+        if isinstance(x, Op) and x.op == "-" and x.ctype == "ptrdiff":
+            return Op("==", (x.args[1], x.args[0]), "int")
         if isinstance(x, Op) and x.op == "-" and isinstance(x.args[0], Const):
             return Op("==", (x.args[1], x.args[0]), "int")
         if isinstance(x, Op) and x.op == "^":
@@ -1944,11 +2269,16 @@ class Renderer:
         self.l, self.n = lifted, names
         self.ret_used = ret_used           # some rendered variant returns the value
         self.temps: dict[Load, str] = {}
+        self.extra_classes: list = []      # [(class, parent or None, member lines)]: render_tu's destructor model
+                                           # (the function's own class: only its parent counts)
+        for v in lifted.proto_expected:     # a prototype's pointer type yields to a struct the value turned out to be
+            if isinstance(v, AddrOf) and isinstance(v.loc, GlobalObj) and lifted.nodes.get(v.loc) or self.rep(v) in lifted.nodes:
+                lifted.expected.pop(v, None)
         self.unify_pointer_types()
         self.check_store_types()
 
     def check_store_types(self) -> None:
-        for st in self.l.stores:
+        for st in (self.l.stores + self.l.init_stores):
             if not isinstance(st.loc, Field) or isinstance(st.value, (Const, Literal)):
                 continue
             try:
@@ -1985,7 +2315,7 @@ class Renderer:
             t = pointer_type(var)
             if t and not isinstance(value, Const) and value not in self.l.expected and self.rep(value) not in self.l.nodes:
                 self.l.expected[value] = t
-        for st in self.l.stores:
+        for st in (self.l.stores + self.l.init_stores):
             if isinstance(st.loc, Field) and untyped(st.value):
                 try:
                     t = self.field_type(st.loc.base, st.loc.offset)
@@ -1995,7 +2325,8 @@ class Renderer:
                     self.l.expected[st.value] = t
 
     def roots_all(self) -> list:
-        roots = [st.value for st in self.l.stores] + [a for c in self.l.calls for a in c.args]
+        roots = [st.value for st in (self.l.stores + self.l.init_stores)] + [a for c in self.l.calls for a in c.args]
+        roots += list(self.l.init_args)
         roots += [st.cond for st in _flatten(self.l.tree) if isinstance(st, If)]
         for lp in (st for st in _flatten(self.l.tree) if isinstance(st, Loop)):
             roots += [lp.cond] + [v for _, v in lp.inits] + [v for _, v in lp.updates]
@@ -2128,6 +2459,8 @@ class Renderer:
             return f"{base.sym}.{self.field_name(loc.offset)}"
         if isinstance(base, Param) and self.n.member and base.reg == "r3":
             return self.field_name(loc.offset)
+        if self.is_ref(base) and not self.scalar_deref(base):
+            return f"{self.n.params[base.reg]}.{self.field_name(loc.offset)}"
         if self.scalar_deref(base):
             return f"*{self.expr(base, False)}"
         return f"{self.expr(base)}->{self.field_name(loc.offset)}"
@@ -2144,7 +2477,7 @@ class Renderer:
         if isinstance(e, Param):
             if self.n.member and e.reg == "r3":
                 return "this"
-            return self.n.params[e.reg]
+            return f"&{self.n.params[e.reg]}" if self.is_ref(e) else self.n.params[e.reg]
         if isinstance(e, Const):
             return _int_text(e.value)
         if isinstance(e, Literal):
@@ -2162,8 +2495,11 @@ class Renderer:
         if isinstance(e, AddrOf):
             if isinstance(e.loc, Field) and isinstance(e.loc.base, StackObj) and e.loc.offset == 0:
                 return f"&l{e.loc.base.offset:X}"          # the whole local
-            if isinstance(e.loc, GlobalObj) and self.array_global(e.loc.sym):
+            if isinstance(e.loc, GlobalObj) and self.array_global(e.loc.sym) or \
+                    isinstance(e.loc, GlobalVar) and self.small_array(e.loc.sym):
                 return e.loc.sym
+            if isinstance(e.loc, GlobalObj) and (found := self.code_symbol(e.loc.sym)):
+                return f"&{'::'.join(found[0].quals)}::{found[0].name}"
             return f"&{e.loc.sym}" if isinstance(e.loc, (GlobalObj, GlobalVar)) else f"&{self.lvalue(e.loc)}"
         if isinstance(e, Op):
             text = self._op(e)
@@ -2249,7 +2585,8 @@ class Renderer:
         if isinstance(e, Param):
             if self.n.member and e.reg == "r3":
                 return f"{self.n.this_type}*"
-            return self.param_type(e.reg)
+            t = self.param_type(e.reg)
+            return t[:-1].rstrip() + "*" if t.endswith("&") else t
         if isinstance(e, AddrOf) and isinstance(e.loc, Elem):
             t = self.elem_type(self.array_key(e.loc))
             if t in SIZES or e.loc.sub == 0:
@@ -2265,7 +2602,7 @@ class Renderer:
             if isinstance(loc, GlobalObj):
                 return f"{self.n.types[loc]}*"
             if isinstance(loc, GlobalVar):
-                return f"{self.l.small_globals[loc.sym]}*"
+                return f"{self.small_array(loc.sym) or self.l.small_globals[loc.sym]}*"
             ctype = self.l.nodes.get(self.rep(loc.base), {}).get(loc.offset)
             if ctype is None:
                 return f"{self.embedded_type(loc.base, loc.offset)}*"
@@ -2279,9 +2616,50 @@ class Renderer:
             return want[:-1].rstrip()
         return None
 
+    def code_symbol(self, sym: str):
+        """(demangled function, its pointer type) for a function whose address the body
+        compares with a parameter of a function pointer type (`id == GUI::ClassName`)."""
+        fn = demangle(sym) if "__" in sym.lstrip("_") else None
+        if fn is None or fn.special:
+            return None
+        target = AddrOf(GlobalObj(sym))
+        for root in self.roots_all():
+            for e in _walk(root):
+                if isinstance(e, Op) and e.op in ("==", "!=", "-") and target in e.args:
+                    other = e.args[1] if e.args[0] == target else e.args[0]
+                    if isinstance(other, Param) and other.reg in self.l.own and "(*)" in self.l.own[other.reg].text:
+                        return fn, self.l.own[other.reg].text
+        return None
+
+    def code_symbols(self) -> list:
+        """[(class, None, [static declaration])] for the functions code_symbol found."""
+        out = []
+        for sym in sorted(self.l.global_objs):
+            found = self.code_symbol(sym)
+            if found is None:
+                continue
+            fn, ptr = found
+            ret, params = ptr.split("(*)", 1)
+            if f"({', '.join(t.text for t in fn.params)})" != params.strip() or not fn.quals:
+                raise Unsupported(f"{sym} compared with a pointer of another type")
+            out.append(("::".join(fn.quals), None, [f"static {ret.strip()} {fn.name}{params.strip()};"]))
+        return out
+
+    def small_array(self, sym: str) -> str | None:
+        """A small (sda21) global only ever passed by address where a pointer is expected (a
+        short string): declared as an array of what that pointer points at."""
+        want = self.pointee(AddrOf(GlobalVar(sym)))
+        if want is None or self.l.small_globals.get(sym) != "int":
+            return None
+        if any(isinstance(x, Load) and x.loc == GlobalVar(sym) for r in self.roots_all() for x in _walk(r)) \
+                or any(st.loc == GlobalVar(sym) for st in (self.l.stores + self.l.init_stores)):
+            return None
+        return want
+
     def array_global(self, sym: str) -> str | None:
-        """A global whose address is passed as a scalar pointer is an array of that scalar."""
-        return self.pointee(AddrOf(GlobalObj(sym)))
+        """A global whose address is passed as a scalar pointer is an array of that scalar
+        (unless it is also used as a struct)."""
+        return None if self.l.nodes.get(GlobalObj(sym)) else self.pointee(AddrOf(GlobalObj(sym)))
 
     def embedded_type(self, base, offset: int) -> str:
         scalar = self.pointee(AddrOf(Field(base, offset))) or self.pointee(AddrOf(Field(self.rep(base), offset)))
@@ -2302,6 +2680,9 @@ class Renderer:
         """A field's type: a pointer to the object loaded from it, else a pointer stored into
         it, else what its accesses say."""
         base = self.rep(base)
+        fp = self.fnptr_type(Field(base, offset)) if any(c.fnptr is not None for c in self.l.calls) else None
+        if fp:
+            return fp
         child = next((b for b in self.l.nodes if isinstance(b, Load) and isinstance(b.loc, Field)
                       and self.rep(b.loc.base) == base and b.loc.offset == offset), None)
         if child is not None:
@@ -2314,14 +2695,20 @@ class Renderer:
         for e, want in self.l.expected.items():
             if isinstance(e, Load) and isinstance(e.loc, Field) and self.rep(e.loc.base) == base and e.loc.offset == offset:
                 return want
-        for st in self.l.stores:
+        for st in (self.l.stores + self.l.init_stores):
             if isinstance(st.loc, Field) and self.rep(st.loc.base) == base and st.loc.offset == offset \
                     and not isinstance(st.value, (Const, Literal)) and self.ctype_of(st.value).endswith("*"):
                 return self.ctype_of(st.value)
         return self.l.nodes[base][offset]
 
+    def is_ref(self, e) -> bool:
+        """A reference parameter (by its mangled name): an object, printed as `&name`."""
+        return isinstance(e, Param) and e.reg in self.l.own and self.l.own[e.reg].text.endswith("&")
+
     def param_type(self, reg: str) -> str:
         p = Param(reg)
+        if reg in self.l.own:
+            return self.l.own[reg].text
         if p in self.l.expected:
             return self.l.expected[p]
         vp = self.via_pointer_type(p)
@@ -2344,6 +2731,8 @@ class Renderer:
         for b in bases:
             if self.scalar_deref(b) or self.local_scalar(b) or isinstance(b, StackObj) and ("embedded", b, 0) in self.l.bound:
                 continue
+            if isinstance(b, GlobalObj) and not self.l.nodes.get(b) and (self.array_global(b.sym) or self.code_symbol(b.sym)):
+                continue                                 # (an array or a function: no struct)
             lines.append(f"struct {self.type_name(b)};")
         for b in bases:
             for off in sorted(self.l.embedded.get(b, ())) if b in self.l.nodes else ():
@@ -2362,18 +2751,21 @@ class Renderer:
     def classes(self) -> set:
         """Every qualified class the TU needs: bound objects, callee classes, parameter classes."""
         out = set(self.l.bound.values())
+        out |= {tuple(c.split("::")) for c, _, _ in self.code_symbols()}
         for c in self.l.calls:
             if c.cxx:
                 out.add(c.cxx.quals) if c.cxx.quals else None
                 for t in c.cxx.params:
                     out.update(t.classes)
+            if c.new is not None:
+                out.add(c.new.cxx.quals) if c.new.cxx.quals else None
         return {q for q in out if q}
 
     def methods(self) -> dict:
         """class -> declarations of the methods called on it."""
         rets: dict = {}                 # one function called twice, its result used once: not void
         for c in self.l.calls:
-            if not (c.cxx and c.cxx.quals):
+            if not (c.cxx and c.cxx.quals) or c.new is not None:
                 continue
             ret = "void"
             for fp in (False, True):
@@ -2398,7 +2790,15 @@ class Renderer:
         if this_q and this_members is not None:
             classes.add(this_q)
         derived = [tuple(c.split("::")) for c in (chain or [])[1:]]
-        if any(q in classes for q in derived):
+        # a derived class of the chain may only be named by the methods called on this
+        on_this = lambda c: c.args and isinstance(c.args[0], Param) and c.args[0].reg == "r3" and self.n.member
+        direct = {q for o, q in self.l.bound.items() if not (o == ("this",) or isinstance(o, Param) and o.reg == "r3")}
+        for c in self.l.calls:
+            if c.cxx:
+                direct |= {q for t in c.cxx.params for q in t.classes}
+                if c.cxx.quals and not on_this(c):
+                    direct.add(c.cxx.quals)
+        if any(q in direct for q in derived):
             raise Unsupported("a class of the inheritance chain is also used directly")
         classes |= set(derived)
         members: dict = {q: list(m) for q, m in self.methods().items()}
@@ -2407,11 +2807,29 @@ class Renderer:
                 continue
             if isinstance(obj, Param) and obj.reg == "r3" and self.n.member:
                 continue
+            if q == this_q and this_members is not None:        # (say `new C(*this)`): this's layout
+                if self.l.nodes.get(obj):
+                    raise Unsupported("fields of another object of the function's own class")
+                continue
             body = self.struct_body(obj, [], 0, own_type=False)
             members.setdefault(q, [])
             members[q] = [m.strip() for m in body] + members[q]
         if this_q and this_members is not None:
             members[this_q] = [m.strip() for m in this_members] + members.get(this_q, [])
+        parent_of = {}
+        new_classes, _ = self.new_classes()
+        forced = {tuple(name.split("::")) for name, _, _ in self.extra_classes}    # defined even when empty
+        for name, parent, lines in self.extra_classes + new_classes + self.code_symbols():
+            # (destructor/constructor models, new-expressions, compared function addresses)
+            q = tuple(name.split("::"))
+            if q == this_q:                                 # the function's own class: already has its members
+                members[q] = members.get(q, []) + [l for l in lines if l not in members.get(q, [])]
+            else:
+                classes.add(q)
+                members[q] = list(lines) + [m for m in members.get(q, []) if m not in lines]
+            if parent:
+                if parent_of.setdefault(q, parent) != parent:
+                    raise Unsupported(f"{name} derived from {parent_of[q]} and from {parent}")
         for q in members:
             members[q] = _fold_called_slots(members[q])
         # all paths, including enclosing ones
@@ -2433,15 +2851,34 @@ class Renderer:
                 raise Unsupported("classes nested three deep")
         embedded = {q for o, q in self.l.bound.items() if isinstance(o, tuple) and o[:1] == ("embedded",)}
         order = sorted(paths, key=lambda q: (q == this_q, q not in embedded, len(q), q))
+        for q, parent in parent_of.items():               # an operator new's class: T's (empty) base
+            if "::".join(q) in self.new_classes()[1] and any("(" not in m for m in members.get(tuple(parent.split("::")), [])
+                                                             if not m.startswith("virtual ~")):
+                raise Unsupported(f"new {'::'.join(q)}: operator new from {parent}, a class with data")
+        if parent_of:                                    # a base before the classes derived from it
+            placed: list = []
+            def place(q, depth=0):
+                parent = parent_of.get(q)
+                if parent and depth < 16 and tuple(parent.split("::")) in paths:
+                    place(tuple(parent.split("::")), depth + 1)
+                if q not in placed:
+                    placed.append(q)
+            for q in order:
+                place(q)
+            order = placed
         for q in order:
+            if q in derived:
+                continue                                 # (defined with the chain below)
             if q in embedded and q not in members:
                 members[q] = []
-            if members.get(q) is not None and (members[q] or q == this_q or q in embedded):
-                definitions.append(f"struct {'::'.join(q)} {{")
+            if members.get(q) is not None and (members[q] or q == this_q or q in embedded or q in forced):
+                parent = parent_of.get(q)
+                definitions.append(f"struct {'::'.join(q)}" + (f" : {parent}" if parent else "") + " {")
                 definitions += [f"    {m}" for m in members[q]]
                 definitions.append("};")
         for parent, q in zip(chain or [], derived):
-            body = list(own_decls or []) if q == derived[-1] else []
+            body = [m for m in members.get(q, []) if m not in (own_decls or [])]
+            body += list(own_decls or []) if q == derived[-1] else []
             definitions.append(f"struct {'::'.join(q)} : {parent} {{")
             definitions += [f"    {m}" for m in body]
             definitions.append("};")
@@ -2459,13 +2896,33 @@ class Renderer:
             out.append(f"virtual {ret} vf{slot}({', '.join(params)});")
         return out
 
-    def struct_body(self, base, extra_members: list[str], size: int = 0, own_type: bool = True) -> list[str]:
-        members, cur = [], 0
+    def struct_body(self, base, extra_members: list[str], size: int = 0, own_type: bool = True,
+                    start: int = 0, objects: dict | None = None, dtor_at: tuple | None = None) -> list[str]:
+        """`start`: where the members begin (after a base class); `objects`: offset -> (class,
+        count, element size) of member objects; `dtor_at`: (offset, declaration) of a
+        destructor that is the first virtual function (the vtable pointer's place)."""
+        members, cur = [], start
+        q = self.n.this_type if isinstance(base, Param) and base.reg == "r3" and self.n.member else self.bound_class(base)
+        size = max(size, self.new_classes()[1].get(q, 0))       # sizeof(T) of a new-expression
+        owner = next((c.new.cxx.quals for c in self.l.calls if c.new is not None and "::".join(c.new.cls) == q
+                      and c.new.cxx.quals and "::".join(c.new.cxx.quals) != q), None)
+        if owner in self.l.polymorphic:                          # (its base holds the vtable pointer)
+            cur = start = max(start, 4)
         entries = {off: self.field_type(base, off) for off in self.l.nodes.get(base, {})}
         for off in self.l.embedded.get(base, ()):
             entries.setdefault(off, self.embedded_type(base, off))
         if base in self.l.vptrs:
+            if dtor_at is not None:
+                raise Unsupported("virtual calls on this in a destructor that declares the first virtual")
             entries[self.l.vptrs[base]] = "@vptr"
+        for off, (cls, count, esize) in (objects or {}).items():
+            if off in entries and entries[off] != cls:
+                raise Unsupported(f"member object at +0x{off:X} also used as {entries[off]}")
+            entries[off] = "@object"
+        if dtor_at is not None:
+            if dtor_at[0] in entries:
+                raise Unsupported(f"the vtable pointer at +0x{dtor_at[0]:X} is also accessed as data")
+            entries[dtor_at[0]] = "@dtor"
         arrays = {k[1]: k for k in self.l.arrays if not k[2] and self.rep(k[0]) == self.rep(base)}
         for start in arrays:
             if start in entries:
@@ -2491,21 +2948,45 @@ class Renderer:
                 members += [f"    {d}" for d in self.virtual_decls(base)]
                 cur = off + 4
                 continue
-            width = 4 if ctype.endswith("*") else SIZES.get(ctype, 1)
+            if ctype in ("@object", "@dtor"):
+                if off < cur:
+                    raise Unsupported(f"overlapping fields at +0x{off:X}")
+                if off > cur:
+                    members.append(f"    char _pad{cur:X}[0x{off - cur:X}];")
+                if ctype == "@dtor":
+                    members.append(f"    {dtor_at[1]}")
+                    cur = off + 4
+                    continue
+                cls, count, esize = objects[off]
+                members.append(f"    {cls} {self.field_name(off)}" + (f"[{count}];" if count else ";"))
+                cur = off + esize * max(count, 1)
+                continue
+            width = 4 if ctype.endswith("*") or "(*)" in ctype else SIZES.get(ctype, 1)
             if off < cur:
                 raise Unsupported(f"overlapping fields at +0x{off:X}")
             if off % width:
                 raise Unsupported(f"misaligned {ctype} at +0x{off:X}")
             if off > cur:
                 members.append(f"    char _pad{cur:X}[0x{off - cur:X}];")
-            members.append(f"    {ctype} {self.field_name(off)};")
+            members.append(f"    {ctype.replace('(*)', f'(*{self.field_name(off)})')};" if "(*)" in ctype
+                           else f"    {ctype} {self.field_name(off)};")
             cur = off + width
         if size > cur:
             members.append(f"    char _pad{cur:X}[0x{size - cur:X}];")
+        elif size and size < cur and q in self.new_classes()[1]:
+            raise Unsupported(f"new {q}: its fields end past its size")
         return members + [f"    {m}" for m in extra_members]
 
     def signature(self) -> list[str]:
-        """Parameters in register order: GPRs (after `this`), then FPRs."""
+        """Parameters in register order: GPRs (after `this`), then FPRs; those of the mangled
+        name (in its order) when the function has one."""
+        if self.l.own_order:
+            first = 4 if self.n.member else 3
+            extra = [r for r in self._used_regs("r") + self._used_regs("f")
+                     if r not in self.l.own and not (r[0] == "r" and int(r[1:]) < first)]
+            if extra:
+                raise Unsupported(f"uses {extra[0]}, which its mangled parameters do not have")
+            return [_declare(self.param_type(r), self.n.params[r]) for r in self.l.own_order]
         used_r = [int(r[1:]) for r in self._used_regs("r")]
         used_f = [int(r[1:]) for r in self._used_regs("f")]
         first = 4 if self.n.member else 3
@@ -2520,7 +3001,7 @@ class Renderer:
 
     def _used_regs(self, kind: str) -> list[str]:
         used = set(self.l.int_params) | {b.reg for b in self.l.nodes if isinstance(b, Param)}
-        for st in self.l.stores:
+        for st in (self.l.stores + self.l.init_stores):
             for e in _walk(st.value):
                 if isinstance(e, Param):
                     used.add(e.reg)
@@ -2912,9 +3393,51 @@ class Renderer:
             lines.append(f"    return {self.expr(ret)};")
         return lines
 
+    def fnptr_type(self, loc) -> str | None:
+        """The function pointer type of a location called through: `ret (*)(params)`."""
+        key = location_key(Load(loc, "int", 0)) if isinstance(loc, (Field, GlobalVar)) else None
+        calls = [c for c in self.l.calls if c.fnptr is not None and location_key(c.fnptr) == key]
+        if not calls:
+            return None
+        used = {x for r in self.roots() for x in _walk(r) if isinstance(x, CallResult)}
+        ret, params = "void", None
+        for c in calls:
+            for fp in (False, True):
+                if CallResult(c, fp) in used:
+                    ret = self.ctype_of(CallResult(c, fp))
+            here = [self.arg_type(a, i < c.n_gpr) for i, a in enumerate(c.args)]
+            if c.variadic:
+                here = here[:1] + ["..."]
+            if params is not None and params != here:
+                raise Unsupported("one function pointer called with different argument kinds")
+            params = here
+        return f"{ret} (*)({', '.join(params)})"
+
+    def fits_prototype(self, callee: str, proto) -> bool:
+        """Every call's arguments convert to the C library prototype's parameters."""
+        for c in self.l.calls:
+            if c.callee != callee or c.cxx:
+                continue
+            for a, t in zip(c.args, proto[1]):
+                if t == "..." or isinstance(a, Const) or not t.endswith("*"):
+                    continue
+                try:
+                    have = self.ctype_of(a)
+                except (Unsupported, KeyError):
+                    return False
+                if have != t and t not in ("void*", "const void*") and not (t == "const char*" and have == "char*"):
+                    return False
+        return True
+
     def arg_type(self, e, gpr: bool) -> str:
         if e in self.l.expected:
             return self.l.expected[e]
+        if isinstance(e, Param) and e.reg in self.l.own:      # a parameter of the mangled name: its pointer type
+            t = self.l.own[e.reg].text
+            if t.endswith("&"):
+                return "void*"
+            if t.endswith("*"):
+                return t
         if gpr and isinstance(e, Load) and self.ctype_of(e).endswith("*"):
             return "void*"
         if not gpr:
@@ -2925,8 +3448,8 @@ class Renderer:
 
     def roots(self) -> list:
         """Every expression the body evaluates."""
-        roots = [st.value for st in self.l.stores] + [st.loc.base for st in self.l.stores if isinstance(st.loc, Field)]
-        roots += [a for c in self.l.calls for a in c.args]
+        roots = [st.value for st in (self.l.stores + self.l.init_stores)] + [st.loc.base for st in (self.l.stores + self.l.init_stores) if isinstance(st.loc, Field)]
+        roots += [a for c in self.l.calls for a in c.args] + list(self.l.init_args)
         roots += [st.cond for st in _flatten(self.l.tree) if isinstance(st, If)]
         for lp in (st for st in _flatten(self.l.tree) if isinstance(st, Loop)):
             roots += [lp.cond] + [v for _, v in lp.inits] + [v for _, v in lp.updates]
@@ -2939,6 +3462,8 @@ class Renderer:
         if not t.text.endswith(("*", "&")) and t.reg == "gpr" and self.ctype_of(e).endswith("*"):
             raise Unsupported(f"passes a pointer where {t.text} is expected")
         if t.text.endswith("&"):                      # a reference: pass the object itself
+            if self.is_ref(e):
+                return self.n.params[e.reg]
             if isinstance(e, AddrOf) and isinstance(e.loc, Field) and isinstance(e.loc.base, StackObj) and e.loc.offset == 0:
                 return f"l{e.loc.base.offset:X}"
             if isinstance(e, AddrOf):
@@ -2946,7 +3471,52 @@ class Renderer:
             return f"*{self.expr(e, False)}"
         return self.expr(e)
 
+    def init_list(self, model) -> str:
+        """` : Base(args), mX(value), mY(args)`: a constructor model's initializers."""
+        entries = []
+        c = model.base_call
+        if c is not None:
+            args = ", ".join(self.cxx_arg(a, t) for a, t in zip(c.args[1:], c.cxx.params)) if c.cxx is not None \
+                else ", ".join(self.expr(a) for a in c.args[1:])
+            if args:
+                entries.append(f"{model.base}({args})")
+        for off, x in model.inits:
+            if isinstance(x, MemberCtor):
+                args = ", ".join(self.cxx_arg(a, t) for a, t in zip(x.args, x.cxx.params))
+                if args:
+                    entries.append(f"{self.field_name(off)}({args})")
+            else:
+                entries.append(f"{self.field_name(off)}({self.expr(x.value)})")
+        return f" : {', '.join(entries)}" if entries else ""
+
+    def new_text(self, call: Call) -> str:
+        n = len(call.cxx.params)
+        args = ", ".join(self.cxx_arg(a, t) for a, t in zip(call.args[:n], call.cxx.params))
+        placement = ", ".join(self.cxx_arg(a, t) for a, t in zip(call.args[n:], call.new.cxx.params[1:]))
+        return f"new {f'({placement}) ' if placement else ''}{'::'.join(call.new.cls)}({args})"
+
+    def new_classes(self) -> tuple[list, dict]:
+        """For each new-expression: [(class, base, member lines)] (T with its constructor, the
+        class declaring operator new, T's base when it is another), {T: sizeof(T)}."""
+        extra, sizes = [], {}
+        for c in self.l.calls:
+            if c.new is None:
+                continue
+            t, owner = "::".join(c.new.cls), "::".join(c.new.cxx.quals)
+            if sizes.setdefault(t, c.new.size) != c.new.size:
+                raise Unsupported(f"new {t} of two sizes")
+            ctor = f"{c.new.cls[-1]}({', '.join(p.text for p in c.cxx.params)});"
+            params = ", ".join(p.text for p in c.new.cxx.params)
+            if owner:
+                # a polymorphic base (RTTI) has its vtable pointer: T's own bytes start after it
+                virtual = [f"virtual ~{c.new.cxx.quals[-1]}();"] if c.new.cxx.quals in self.l.polymorphic else []
+                extra.append((owner, None, virtual + [f"static void* operator new({params});"]))
+            extra.append((t, owner if owner and owner != t else None, [ctor]))
+        return extra, sizes
+
     def call_text(self, call: Call) -> str:
+        if call.new is not None:
+            return self.new_text(call)
         if call.cxx:
             fn = call.cxx
             args = call.args[1:] if fn.quals else call.args
@@ -2964,6 +3534,8 @@ class Renderer:
                     target = obj.loc.sym if isinstance(obj.loc, (GlobalObj, GlobalVar)) else self.lvalue(obj.loc)
                 return f"{target}.{fn.name}({text})"
             return f"{self.expr(obj, False)}->{fn.name}({text})"
+        if call.fnptr is not None:
+            return f"{self.expr(call.fnptr, False)}({', '.join(self.expr(a) for a in call.args)})"
         if not call.virtual:
             return f"{call.callee}({', '.join(self.expr(a) for a in call.args)})"
         obj, rest = call.args[0], call.args[1:]
@@ -2978,7 +3550,7 @@ class Renderer:
         used = {x for r in roots for x in _walk(r) if isinstance(x, CallResult)}
         sigs: dict = {}
         for c in self.l.calls:
-            if c.virtual != virtual or c.cxx:
+            if c.virtual != virtual or c.cxx or c.fnptr is not None:
                 continue
             if CallResult(c, False) in used and CallResult(c, True) in used:
                 raise Unsupported(f"{c.callee}: result used as both int and float")
@@ -2999,6 +3571,14 @@ class Renderer:
                 ret = old_ret if ret == "void" else ret
             sigs[key] = (ret, params)
         return sigs
+
+
+def _declare(ctype: str, name: str) -> str:
+    """`T name`, or `R (*name)(P)` for a pointer to a function."""
+    for form in ("(*)", "(&)"):
+        if form in ctype:
+            return ctype.replace(form, f"({form[1]}{name})", 1)
+    return f"{ctype} {name}"
 
 
 def _fold_called_slots(members: list[str]) -> list[str]:
@@ -3231,35 +3811,60 @@ def param_names(lifted: Lifted) -> dict[str, str]:
 
 def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen: list[Variant],
               global_sizes: dict[str, int], display: bool = False, standalone: bool = False,
-              chain: list[str] | None = None) -> tuple[str, list[str]]:
+              chain: list[str] | None = None, dtor=None, ctor_model=None, cxx_free: bool = False) -> tuple[str, list[str]]:
     """One compilable TU holding every variant as v0..vN (or, for display, the first variant
     under the function's own name; `standalone`: under its own name, with this's struct, for
     dk gen --write). `chain` = [this_type, ..., C]: the function is a member of C, a class
     derived from this_type (whose inherited methods it calls on this); this_type keeps the
-    fields. Returns (source, struct layout notes)."""
+    fields. `dtor` (classgen.DtorModel): the variants are the body of this_type's destructor,
+    written into its class model; `ctor_model` (classgen.CtorModel): the body of this_type's
+    constructor, its base and member initializers from the model. Returns (source, struct layout notes)."""
     prefix = re.sub(r"\W", "_", this_type)
     names = Names(member, this_type, fn_name, name_nodes(lifted, prefix), param_names(lifted), bool(chain))
     r = Renderer(lifted, names, any(v.ret_mode != "void" for v in chosen))
+    if dtor is not None or ctor_model is not None:
+        if chain or not member or any(v.ret_mode != "void" for v in chosen):
+            raise Unsupported("a constructor or destructor body that returns a value")
+        r.extra_classes = (dtor or ctor_model).classes
     this = Param("r3")
     out: list[str] = []
     notes: list[str] = []
     decls = r.struct_decls()
     if display and member:
         decls = [d for d in decls if d != f"struct {this_type};"]
+    if dtor is not None or ctor_model is not None:       # the class model declares these
+        decls = [d for d in decls if d not in {f"struct {c};" for c, _, _ in (dtor or ctor_model).classes}
+                 | {f"struct {this_type};"}]
     out += decls + r.elem_structs()
     sig = ", ".join(r.signature())
     fn_names = [fn_name] if display or standalone else [f"v{i}" for i in range(len(chosen))]
     value = return_value(lifted)
     ret_types = [("void" if v.ret_mode == "void" else "bool" if v.fold and v.ret_mode == "bool"
                   else r.ctype_of(value, v.ret_mode == "bool")) for v in chosen]
-    this_in_model = member and ("::" in this_type or tuple(this_type.split("::")) in r.classes())
+    this_in_model = member and ("::" in this_type or tuple(this_type.split("::")) in r.classes() or dtor is not None
+                                or ctor_model is not None)
     this_members = None
-    ctor = fn_name == "__ct" and member and (display or standalone)
+    ctor = fn_name == "__ct" and member and (display or standalone) or ctor_model is not None
     owner = chain[-1] if chain else this_type
     own_decls = [f"{owner.split('::')[-1]}({sig});" if ctor else f"{t} {n}({sig});" for t, n in zip(ret_types, fn_names)]
     if chain and not this_in_model:
         raise Unsupported("an inherited class that is not in the class model")
-    if this_in_model and not display:
+    if ctor_model is not None:
+        if display:
+            raise Unsupported("constructor drafts are written whole (standalone)")
+        short = this_type.split("::")[-1]
+        own_decls = [f"{short}({sig});"]
+        at = (ctor_model.dtor_at, f"virtual ~{short}();") if ctor_model.dtor_at is not None else None
+        this_members = r.struct_body(this, own_decls, start=ctor_model.start, objects=ctor_model.objects, dtor_at=at)
+    elif dtor is not None:
+        own_decls = [] if dtor.dtor_at is not None else [dtor.decl]
+        if sig:
+            raise Unsupported("a destructor body that reads arguments")
+        if display:
+            raise Unsupported("destructor drafts are written whole (standalone)")
+        this_members = r.struct_body(this, own_decls, start=dtor.start, objects=dtor.objects,
+                                     dtor_at=(dtor.dtor_at, dtor.decl) if dtor.dtor_at is not None else None)
+    elif this_in_model and not display:
         this_members = r.struct_body(this, [] if chain else own_decls)
     bound_objs = [o for o in lifted.bound if not isinstance(o, tuple) and not (isinstance(o, Param) and o.reg == "r3" and member)]
     if len({lifted.bound[o] for o in bound_objs}) != len(bound_objs) and any(lifted.nodes.get(o) for o in bound_objs):
@@ -3290,6 +3895,8 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
         if not isinstance(b, StackObj):
             notes.append(_layout_note(r, b))
     for sym in sorted(lifted.global_objs):
+        if r.code_symbol(sym):
+            continue                                    # (a function of the class model)
         if r.array_global(sym):
             if lifted.nodes.get(GlobalObj(sym)):
                 raise Unsupported(f"{sym} used both as a struct and as an array")
@@ -3297,16 +3904,34 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
         else:
             out.append(f"extern {r.type_name(GlobalObj(sym))} {sym};")
     for sym, ctype in sorted(lifted.small_globals.items()):
+        if r.small_array(sym):
+            size = global_sizes.get(sym, 0)
+            if not 0 < size <= 8:
+                raise Unsupported(f"{sym}: a small array of unknown size")
+            out.append(f"extern {r.small_array(sym)} {sym}[{size}];")
+            continue
+        fp = r.fnptr_type(GlobalVar(sym))
+        if fp:
+            out.append(f"extern {fp.replace('(*)', f'(*{sym})')};")
+            continue
         held = next((b for b in lifted.nodes if isinstance(b, Load) and b.loc == GlobalVar(sym)), None)
         out.append(f"extern {r.type_name(held) + '*' if held is not None else ctype} {sym};")
     for callee, (ret, params) in sorted(r.call_signatures().items()):
+        proto = PROTOTYPES.get(callee)
+        if proto is not None and (len(proto[1]) == len(params) or proto[1][-1] == "..." and params[-1:] == ["..."]) \
+                and r.fits_prototype(callee, proto):
+            ret, params = proto[0], list(proto[1])
         out.append(f'extern "C" {ret} {callee}({", ".join(params)});')
     for c in lifted.calls:
+        if c.new is not None and not c.new.cxx.quals:
+            decl = f"void* operator new({', '.join(t.text for t in c.new.cxx.params)});"
+            if decl not in out:
+                out.append(decl)
         if c.cxx and not c.cxx.quals and c.cxx.special in ("operator delete", "operator delete[]") and len(c.cxx.params) > 1:
             decl = f"void {c.cxx.special}({', '.join(t.text for t in c.cxx.params)});"
             if decl not in out:
                 out.append(decl)
-        if c.cxx and not c.cxx.quals and not c.cxx.special:
+        if c.cxx and not c.cxx.quals and (not c.cxx.special or c.cxx.special in OPERATORS):
             ret = "void"
             for fp in (False, True):
                 if CallResult(c, fp) in r._used_results():
@@ -3322,13 +3947,22 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
             out += [f"struct {this_type} {{"] + r.struct_body(this, decls) + ["};"]
     for v, t, n in zip(chosen, ret_types, fn_names):
         stores = [lifted.stores[i] for i in v.order]
-        head = f"{t} {chain[-1] if chain else this_type}::{n}({sig})" if member else f'extern "C" {t} {n}({sig})'
+        head = f"{t} {chain[-1] if chain else this_type}::{n}({sig})" if member else \
+            f"{t} {n}({sig})" if cxx_free else f'extern "C" {t} {n}({sig})'      # (cxx_free: a mangled free function)
         if ctor:                                        # C::C(...): CodeWarrior's constructors return this
             head = f"{owner}::{owner.split('::')[-1]}({sig})"
+            if ctor_model is not None:
+                head += r.init_list(ctor_model)
+        if dtor is not None:
+            head = f"{this_type}::~{this_type.split('::')[-1]}()"
         r.fold_bool, r.sink, r.nest = v.fold, v.sink, v.nest
         lines = r.body(stores, v.ret_mode, v.cache)
         if lifted.locals:
             lines = r.local_decls(v.locals_desc) + lines
+        if dtor is not None and lines and lines[-1].strip() == "return;":
+            lines = lines[:-1]
+        if dtor is not None and any(l.strip().startswith("return") for l in lines):
+            raise Unsupported("a destructor body that returns early")
         if ctor:                                        # (returning this is implicit; nothing else is)
             if lines and lines[-1].strip() == "return this;":
                 lines = lines[:-1]

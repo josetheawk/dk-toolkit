@@ -8,21 +8,13 @@ them) and checks the hash.
 from __future__ import annotations
 
 import argparse
-import subprocess
 
-from .command import BUILD_ERROR, OK, USAGE, Command, hint
+from .command import BUILD_ERROR, OK, Command, hint
 from .config import Config
 from .isolated import verify_overlay
 
 
 def run(cfg: Config, args: argparse.Namespace) -> int:
-    if args.rev != "HEAD":
-        resolved = subprocess.run(["git", "rev-parse", "--verify", args.rev], cwd=cfg.root, capture_output=True, text=True)
-        if resolved.returncode != 0:
-            print(f"error: unknown revision {args.rev}")
-            return USAGE
-        print("note: verify-head checks HEAD; to check another revision, check it out in a separate clone")
-        return USAGE
     ok, detail = verify_overlay(cfg, {}, timeout=args.timeout, keep=args.keep, name="verify-head")
     if not ok:
         print(f"FAILED: HEAD does not build and match on its own:\n{detail}")
@@ -33,7 +25,6 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _configure(p: argparse.ArgumentParser) -> None:
-    p.add_argument("rev", nargs="?", default="HEAD", help="only HEAD is supported")
     p.add_argument("--timeout", type=int, default=900, help="seconds per step (default 900)")
     p.add_argument("--keep", action="store_true", help="keep the worktree for inspection")
 

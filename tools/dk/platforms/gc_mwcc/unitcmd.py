@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 from pathlib import Path
 
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
 from ...core.progress import load_report
-from ...core.util import run_ninja
 from . import asmindex
 from .dol import Dol
 from .dtk_symbols import boundary_fix, build_errors, caused_by, read_symbols, read_units, set_symbol_size
@@ -110,6 +108,11 @@ def rebuild(cfg: Config, tx: Transaction) -> str | None:
         if proc.returncode == 124:
             return "linker hung with this split (killed after 60 s)"
         if proc.returncode == 0:
+            leaks = section_overruns(cfg)
+            if leaks:
+                # the hash matches, yet objdiff (report, check, save) rejects these target objects
+                return ("the build matches, but objdiff would reject a target object whose symbol runs past its "
+                        "section (fix that unit's range too: ./dk unit propose / unit set):\n  " + "\n  ".join(leaks[:8]))
             return None
         output = proc.stdout + proc.stderr
         fix = boundary_fix(output)
@@ -118,6 +121,32 @@ def rebuild(cfg: Config, tx: Transaction) -> str | None:
             return f"{caused_by(output)}\n" + build_errors(output)
         tx.write(symbols_path, resized)
     return "gave up after 20 symbol boundary fixes"
+
+
+def section_overruns(cfg: Config) -> list[str]:
+    """Symbols of the split target objects that run past the end of their section, which objdiff
+    refuses (`size out of section bounds`): typically a neighbour's gap_ padding label left
+    reaching over a boundary that moved."""
+    import json
+    path = cfg.root / "objdiff.json"
+    if not path.is_file():
+        return []
+    out = []
+    for u in json.loads(path.read_text()).get("units", []):
+        target = cfg.root / u.get("target_path", "")
+        if not u.get("target_path") or not target.is_file():
+            continue
+        try:
+            elf = Elf.parse(target.read_bytes())
+        except ValueError:
+            continue
+        for x in elf.symbols:
+            if x.name and x.size and 0 < x.shndx < len(elf.sections):
+                sec = elf.sections[x.shndx]
+                if sec.type != 8 and x.value + x.size > sec.size:      # objdiff tolerates it in .bss
+                    out.append(f"{u['name']}: {x.name} ends at {sec.name}+0x{x.value + x.size:X}, past its "
+                               f"0x{sec.size:X} bytes")
+    return out
 
 
 def run_add(cfg: Config, args: argparse.Namespace) -> int:

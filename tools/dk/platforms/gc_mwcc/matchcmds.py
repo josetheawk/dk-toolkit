@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import subprocess
 from pathlib import Path
 
 from . import freshness as fresh
 from ...core.build import failed_outputs
 from ...core.command import BUILD_ERROR, MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from ...core.util import run_ninja
 from .linkproof import function_proof
 from .matching import (MatchError, UnitScore, compile_command, load_objdiff_units, render, resolve_unit,
                        retarget, run_compile, score)
@@ -149,6 +147,7 @@ def near_rows(units: list[dict], scores: dict, limit: int = 3) -> list[str]:
         items += [f"{sec} {pct:.2f}% (dk diff --literals {sec})" for sec, pct in sorted(s.data.items()) if pct < 100.0]
         if s.layout_problems:
             items.append(f"layout: {s.layout_problems[0]}" + (f" (+{len(s.layout_problems) - 1} more)" if len(s.layout_problems) > 1 else ""))
+        items += [f"link: {n}" for n in s.link_notes[:3]] + ([f"link: … {len(s.link_notes) - 3} more"] if len(s.link_notes) > 3 else [])
         rows.append((len(open_fns), sum(f.size for f in open_fns), len(items), u["name"], items))
     out = [f"near link ({len(rows)} WIP unit(s) at most {limit} function(s) from exact):"]
     for n, size, _, name, items in sorted(rows):

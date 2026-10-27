@@ -2,7 +2,9 @@
 
 Two kinds of rules, both from dk.toml [quality]:
   forbidden  any hit fails (accept/save refuse a unit with one; CI fails the repo)
-  debt       counted, never fails; placeholder density that refinement passes pay down
+  debt       counted, never fails; placeholder density that refinement passes pay down.
+             A debt rule with `duplicates = true` counts only repeats: a match whose text
+             already matched earlier in the same file (a declaration pasted twice).
 Vendored reference code (dk.toml `exclude`) is not judged.
 """
 
@@ -25,6 +27,7 @@ class Rule:
     name: str
     pattern: re.Pattern
     why: str
+    duplicates: bool = False
 
 
 @dataclass
@@ -35,7 +38,7 @@ class FileReport:
 
 
 def _rules(raw: list[dict]) -> list[Rule]:
-    return [Rule(r["name"], re.compile(r["pattern"], re.M), r.get("why", "")) for r in raw]
+    return [Rule(r["name"], re.compile(r["pattern"], re.M), r.get("why", ""), bool(r.get("duplicates"))) for r in raw]
 
 
 def settings(cfg: Config) -> tuple[list[Path], list[Path], list[Rule], list[Rule]]:
@@ -66,11 +69,21 @@ def scan(cfg: Config, files: list[Path]) -> list[FileReport]:
             for m in rule.pattern.finditer(text):
                 r.forbidden.append((text.count("\n", 0, m.start()) + 1, rule.name))
         for rule in debt:
-            n = len(rule.pattern.findall(text))
+            n = repeats(rule.pattern, text) if rule.duplicates else len(rule.pattern.findall(text))
             if n:
                 r.debt[rule.name] = n
         reports.append(r)
     return reports
+
+
+def repeats(pattern: re.Pattern, text: str) -> int:
+    """Matches of `pattern` whose text (trailing blanks aside) already matched earlier in `text`."""
+    seen, n = set(), 0
+    for m in pattern.finditer(text):
+        key = m.group(0).rstrip()
+        n += key in seen
+        seen.add(key)
+    return n
 
 
 def forbidden_hits(cfg: Config, files: list[Path]) -> list[str]:
@@ -83,7 +96,7 @@ def render(cfg: Config, reports: list[FileReport]) -> str:
     totals = {n: sum(r.debt.get(n, 0) for r in reports) for n in names}
     out = [f"{GENERATED_MARK} quality; do not edit -->", "# Source quality", "",
            f"{len(reports)} judged files. Forbidden hits: {sum(len(r.forbidden) for r in reports)} (must stay 0).", "",
-           "Debt (placeholders a refinement pass replaces with real names/types):", ""]
+           "Debt (placeholders and leftovers that refinement passes pay down):", ""]
     out += [f"- `{d.name}`: {totals[d.name]} — {d.why}" for d in debt]
     out += ["", "| File | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
     for r in sorted(reports, key=lambda r: (-sum(r.debt.values()), r.path)):

@@ -35,7 +35,7 @@
 - **Reject weak evidence:** a one-function chain with no relocations (empty varargs stubs, `blr` helpers) matches unrelated code. Found as a false "dsp_debug.c" inside game code.
 - **dtk's auto-label sizes are guesses.** A real split boundary often lands inside one (`Split … ends within symbol 'lbl_…'`). Trim the auto label to the boundary and re-split. Never trim a named symbol, because that indicates a real layout difference.
 - **End a data split at its last object's end when that end is word-aligned, otherwise at the next symbol.** dtk fills the bytes after a split's last object with a `gap_` symbol that reaches the next symbol, and objdiff rejects one that leaves its section (`gap_… size out of section bounds`). Zero padding left after an aligned end becomes a harmless auto split.
-- **A unit whose only code is a static initializer is dropped whole by the linker** (text and `.ctors` entry): nothing outside references its object, so `.ctors` loses an entry and every later section shifts. A lone `__sinit` after a TU without one of its own is that TU's tail. Keep a genuinely standalone one with `#pragma force_active on` after the includes.
+- **A unit whose only code is a static initializer is dropped whole by the linker** (text and `.ctors` entry): nothing outside references its object. Detect: code and data exact, but the link has `.ctors` one entry short and every later section shifted. A lone `__sinit` after a TU without one of its own is that TU's tail: merge the two (`dk unit propose` prints the steps). Keep a genuinely standalone one (say, a TU holding only a header static) with `#pragma force_active on` after the includes.
 - mwcc include flags: `-I<dir>` must be attached, while `-i <dir>` and `-ir <dir>` (recursive) take a separate argument. SDK sources include sibling private headers (`__os.h`), so they need `-ir src`.
 - **Renaming functions to their real names wakes up dtk's signatures,** which then add known data symbols. Those can overlap labels dtk invented earlier, and the split fails with `Symbol X overlaps with symbol lbl_…`. Apply: drop the stale `lbl_` and re-split (`dk analyze lib --apply` does this automatically).
 
@@ -61,6 +61,27 @@
   - Repeat until stable, because chosen objects make their referents the unit's.
   - Verified on 349 linked units: 757 of 821 data ranges reproduced, against 619 with locality alone.
 
+## Emission order
+
+- **A unit's functions, and the strings and literals they introduce, come out in definition order.** Why: a unit whose functions all match still fails layout and literal offsets when the source has them in another order. Apply: sort the source by target address before chasing literal offsets (`./dk reorder <unit>` compiles before and after and keeps nothing that scores lower). A static table keeps its strings' place only if it moves with the function after it.
+- **MWCC 1.3 to 2.7 holds back an `extern "C"` function that assigns a struct, or that needs an inline function's out-of-line copy, like a weak copy.** It comes out at the end of the next top-level declaration with C++ linkage (ahead of its own copies), most recently held first, and at the end of the unit when no such declaration follows. A following `extern "C"` function does not release it. Only in C++ mode: C files, C++ linkage, copy-initialisation (`S s = *p;`) and GC 1.0, 1.2.5 and 3.0 are unaffected. Why: verified in toys (a C++ function, a static or `struct Fwd;` after it releases it), in two units where such functions sat at the end, and in one where it came out after the next `extern "C"` function until a static table stood between them. Detect: the main `.text` ends in functions whose source lines run backwards, or one function sits after its successor. Apply: define them in reverse target order, or put the C++ declaration the target implies right after the function.
+- **An inline function's out-of-line (weak) copy comes out where it is first needed, not where it is defined.**
+  - The compiler queues each copy that a function needs: a call it does not inline, a virtual call, or a call in a branch that an inlined helper folds away. Code under `if (0)` queues nothing. A copy queues once per unit.
+  - The queue is emitted at the end of the next top-level declaration that has C++ linkage, most recently queued first. After a C++ function, that is right after the function itself. After an `extern "C"` function, the copies wait for the next C++ declaration of any kind: a function, variable, typedef, struct, enum or static. An `extern "C"` declaration or a `#pragma` does not count.
+  - Inline virtuals that only a vtable needs come at the end of the unit, after the last function. The classes come in reverse order of their key functions' definitions, and each class's virtuals in declaration order: the order the class itself declares them, so a derived class that declares its overrides out of slot order (`vf0, vf1, vf4, vf2…`) emits them that way while its slots still follow the base.
+  - Why: verified in toys and in linked units. Of 933 weak copies there, 832 follow a C++ function, 67 follow `__sinit`, and the 34 that follow an `extern "C"` function either end the unit, follow a C++ declaration, or belong to a function emitted last. In a unit where a copy landed one function late, `struct Fwd;` after the `extern "C"` function moved it into the target's place.
+  - Apply: to place a copy, reference it from the function the target puts it after; when that function is `extern "C"`, follow it with any C++ declaration.
+  - Detect from a normal build: `-sym on` moves copies defined in headers into sections of their own.
+- **Vtables and their RTTI (class names, base lists) come at the end of the unit's data, in reverse order of first need.**
+  - A class's own vtable is needed where its key function is defined. The key function is the first non-inline virtual the class *declares*.
+  - A weak vtable (a class without a key function) is needed where a function first stores it, through an inlined constructor or destructor.
+  - So whether the destructor or another virtual is declared first decides whether the class's RTTI and vtable come before or after the weak copies of its bases' and members' vtables.
+  - The class-name strings are created with the RTTI. An inline function compiled later that returns the same name reuses that string (`-str reuse`).
+  - Why: verified in toys. In one unit, `.data` went from 37% to exact by declaring an overridden virtual before the destructor.
+  - Apply: match the target's data order by choosing which virtual each class declares first.
+
+## C++ object model
+
 - **CodeWarrior class layout:** the vtable pointer sits where the first virtual function is declared (offset 0 when virtuals come first, after the preceding data otherwise); slot N is at vtable + 8 + 4N (`{rtti, 0, fn…}`). With a second base, its vtable (RTTI, offset, then its slots) is embedded right after the primary base's slots, and the virtuals the derived class adds come after that embedded part, so their slot numbers skip it. A virtual call is `lwz r12, voff(obj); lwz r12, 8+4N(r12); mtctr r12; bctrl`.
 - **CodeWarrior virtual destructor shape:** `mr. this; beq`, vtable store(s), base destructor (`li r4, 0; bl __dt__B`, or inlined: another vtable store and another null check), `extsh. flags; ble`, then `operator delete`. A class-specific `operator delete` appears as `__dl__<Class>FPv`. RTTI base lists hold every ancestor, root first, and point at per-unit RTTI copies.
 - **CodeWarrior mangling for calls:** `name__F<params>`, `name__<len><Class>[C]F<params>`, `Q<n>` for nested names. Return types aren't mangled, so a declaration may choose one freely.
@@ -76,6 +97,9 @@
   - Compile with `-sym on` to get DWARF that names every variable's register; the code stays byte-identical. Compare that per variable with the target. `dk regs <unit> <fn>` does this.
   - Move the declarations into the target's order. Split `T x = e;` into `T x;` plus `x = e;` where needed. `dk regs --try` compiles those variants.
   - When a local ranks wrongly although its declaration order is right, change how its value is made: a `?:` initializer versus if/else assignments, or a value fed straight into an operation versus first passed on as an argument.
+- **An inline function's parameters are temporaries, in volatile registers too.** A pointer that a caller keeps in a named local for repeated element access (`a = p + j; o[0] = a[0] + t * (b[0] - a[0]); …`) ranks below the CSE'd offset temporary. Passed as a parameter of a small `static inline` helper, it ranks above that temporary. Why: that turned three volatile-register near misses exact, and the helper's parameter order mattered in one of them. Apply: where the target gives the offset a later register than the pointers, move the repeated block into an inline helper that takes the pointers, and try its parameter orders.
+- **Between plain operands, source order sets a commutative instruction's operand order. Compound operands the compiler orders itself.** `a*b + c` and `c + a*b` compile alike, but `x + y` and `y + x` do not (x, y variables or loads). Naming the compound part in a local makes it plain again (`int t = i * w; r = t + y;`), so the source order then decides. Why: verified in toys, and it turned two volatile-register near misses exact. Apply: `dk regs --try` maps the differing instructions to source lines (DWARF `.line`) and on those lines swaps plain operands and names compound ones, in both orders.
+- **A loop index that is a signed counter converted to unsigned is strength-reduced to an offset, not a pointer.** `a[(unsigned int)i]`, or an accessor with an `unsigned int` index parameter called with an `int` counter, gives `addi r0, rOff, K; lwzx rD, rBase, r0` with rOff stepped by the element size. A plain `a[i]`, or an unsigned counter, gives `lwz rD, K(rPtr)` with the pointer stepped. The conversion also changes callee-saved ranks: the counter and the offset temporary rank differently than the counter and a pointer do. Why: verified in toys and on 7 real functions. Apply: `dk regs` reports which form each side uses, and `--try` compiles the cast and counter-type variants.
 
 ## Hand-written assembly
 
@@ -84,10 +108,11 @@
 
 ## Compilers
 
+- **Judge a compiler with whole units, not single trivial functions.** Why: simple code compiles identically on GC 1.3 through 2.7, so it can't discriminate. Apply: run `./dk compiler-search` on units with loops, floats, switches and inlining, and treat a version as pinned only when it's the sole exact match.
+- **Find `-fp_contract` from the binary, not by trial.** Count fused multiply-add instructions (`fmadds`, `fmsubs`, `fnmadds`, `fnmsubs`) per unit. If game code uses separate `fmuls` + `fadds` everywhere and FMAs only appear in a few library units, game code was built with `-fp_contract off`.
 - **`-char signed` with GC 1.3:** a char compare emitting `cmplwi` where the target has `extsb.` means the unit was built with `-char signed`. Set it per unit (`./dk unit flags`).
 - **GC 1.3 vs 1.3.2 in a realigned frame:** `psq_st fN, …, 1, qr7` is GC 1.3; GC 1.3.2 emits `0, qr0`. GC 1.3 also auto-inlines less, so treat the compiler as per unit.
 - **An asm function with interior global labels can hang `mwldeppc`** when its unit is linked on its own. Declare the unit linked instead of linking it in isolation.
-
 - The template's compilers bundle has GC 1.0 through 3.0a5.2, Wii versions, and ProDG 3.5–3.9.3. `build/compilers/info.txt` maps each label to its mwcc build number.
 - `mw_comment_version` in `config.yml`: 8 = GC 1.0+, 10 = GC 1.3.2+, 11 = GC 2.7+, 14 = GC 3.0a3+.
 - SDK libraries were prebuilt by Nintendo with an older compiler than most games used, so expect per-library compiler versions.

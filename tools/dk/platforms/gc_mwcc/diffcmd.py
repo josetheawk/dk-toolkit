@@ -113,7 +113,8 @@ def literal_rows(target, base, section: str) -> list[str]:
     for off, size, name in t:
         theirs = data(tsec, off, size)
         mine = ours.get(off)
-        same = mine is not None and data(bsec, off, mine[0]) == theirs
+        # the same bytes over the target object's range (dtk's label may span several of ours)
+        same = mine is not None and data(bsec, off, size) == theirs
         right = f"{mine[1]} {_value(data(bsec, off, mine[0]))} ({bu.get(off, '-')})" if mine else "-"
         rows.append(f"  {'  ' if same else '!='} +0x{off:<4X} {name} {_value(theirs)} ({tu.get(off, '-')})  |  {right}")
     return rows
