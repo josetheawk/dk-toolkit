@@ -12,13 +12,14 @@ from ...core.build import failed_outputs
 from ...core.command import BUILD_ERROR, MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
 from ...core.util import run_ninja
+from .linkproof import function_proof
 from .matching import (MatchError, UnitScore, compile_command, load_objdiff_units, render, resolve_unit,
                        retarget, run_compile, score)
 
 
 def run_check(cfg: Config, args: argparse.Namespace) -> int:
     if args.all:
-        return run_check_all(cfg)
+        return run_check_all(cfg, args.near)
     if not args.target:
         print("error: give a unit or function, or --all")
         return USAGE
@@ -27,16 +28,25 @@ def run_check(cfg: Config, args: argparse.Namespace) -> int:
     except MatchError as e:
         print(f"error: {e}")
         return USAGE
-    proc = fresh.build(cfg, [unit["base_path"]])
-    if proc.returncode != 0:
-        print("BUILD ERROR:")
-        print("\n".join(line for line in proc.stdout.splitlines() if "Usage Warning" not in line)[-3000:])
-        return BUILD_ERROR
-    try:
-        s = score(cfg, unit["name"], cfg.root / unit["target_path"], cfg.root / unit["base_path"])
-    except MatchError as e:
-        print(f"error: {e}")
-        return USAGE
+    proof = None
+    if args.private:
+        s = _private_score(cfg, unit, args.function)
+        if isinstance(s, int):
+            return s
+        s, proof = s
+    else:
+        proc = fresh.build(cfg, [unit["base_path"]])
+        if proc.returncode != 0:
+            print("BUILD ERROR:")
+            print("\n".join(line for line in proc.stdout.splitlines() if "Usage Warning" not in line)[-3000:])
+            return BUILD_ERROR
+        try:
+            s = score(cfg, unit["name"], cfg.root / unit["target_path"], cfg.root / unit["base_path"])
+        except MatchError as e:
+            print(f"error: {e}")
+            return USAGE
+        if args.function:
+            proof = function_proof(cfg, unit, cfg.root / unit["base_path"], args.function)
 
     for line in render(s):
         print(line)
@@ -46,12 +56,49 @@ def run_check(cfg: Config, args: argparse.Namespace) -> int:
             print(f"error: {args.function} not in {unit['name']}")
             return USAGE
         ok = f.percent == 100.0
+        if proof is not None:
+            # the hand link: our function relocated to its final addresses vs the original's bytes
+            print(f"link proof: {proof.detail}")
+            if proof.judged and not proof.ok and ok:
+                print("note: objdiff calls it equal, but linked it would differ: fix that before accepting")
+            ok = ok and (proof.ok or not proof.judged)
         print("MATCH" if ok else f"MISMATCH ({f.percent:.2f}%)")
         return OK if ok else MISMATCH
     print("MATCH" if s.exact else f"MISMATCH (code {s.code_percent:.2f}%)")
     if s.exact:
         hint(f"accept {args.target}")
     return OK if s.exact else MISMATCH
+
+
+def _private_score(cfg: Config, unit: dict, function: str | None = None):
+    """Compile the unit into a private directory and score it there: no project lock and no
+    shared build outputs, so iterating on a unit never waits for other agents (accept and save
+    still prove the real build). Returns (score, link proof of `function` or None)."""
+    import os
+    import shutil
+    work = cfg.root / "build" / "dk" / "try" / str(os.getpid())
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        try:
+            command = compile_command(cfg, unit["base_path"], locked=False)
+        except MatchError as e:
+            print(f"error: {e}")
+            return USAGE
+        ok, out = run_compile(cfg, retarget(command, work))
+        objs = list(work.glob("*.o"))
+        if not ok or not objs:
+            print("BUILD ERROR:")
+            print(out[-3000:])
+            return BUILD_ERROR
+        try:
+            s = score(cfg, unit["name"], cfg.root / unit["target_path"], objs[0])
+            return s, (function_proof(cfg, unit, objs[0], function) if function else None)
+        except MatchError as e:
+            print(f"error: {e}")
+            return USAGE
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def check_all_rows(units: list[dict], scores: dict[str, UnitScore | None]) -> tuple[list[str], int]:
@@ -66,7 +113,7 @@ def check_all_rows(units: list[dict], scores: dict[str, UnitScore | None]) -> tu
         if s is None:
             return f"  {tag:<7} {'BUILD ERROR':>21}  {u['name']}"
         n_exact = sum(f.percent == 100.0 for f in s.functions)
-        data = "ok" if all(v == 100.0 for v in s.data.values()) else "DIFF"
+        data = "ok" if all(v == 100.0 for v in s.data.values()) and not s.data_problems else "DIFF"
         layout = "ok" if not s.layout_problems else "DIFF"
         return f"  {tag:<7} {n_exact:>4}/{len(s.functions):<4} {s.code_percent:7.2f}%  data {data:<4} layout {layout:<4} {u['name']}"
 
@@ -86,7 +133,31 @@ def check_all_rows(units: list[dict], scores: dict[str, UnitScore | None]) -> tu
     return lines, BUILD_ERROR if broken else (MISMATCH if failed else OK)
 
 
-def run_check_all(cfg: Config) -> int:
+def near_rows(units: list[dict], scores: dict, limit: int = 3) -> list[str]:
+    """WIP units at most `limit` functions from exact, cheapest first, each blocking item with
+    its reason: what a closer would fix to link the unit."""
+    rows = []
+    for u in units:
+        s = scores.get(u["name"])
+        if s is None or u["metadata"].get("complete") or s.exact:
+            continue
+        open_fns = [f for f in s.functions if f.percent < 100.0]
+        if len(open_fns) > limit:
+            continue
+        items = [f"{f.name} {f.percent:.2f}%: {f.note or 'code differs (dk diff --function)'}" for f in open_fns]
+        items += [f"vtable {p}" for p in s.data_problems[:3]]
+        items += [f"{sec} {pct:.2f}% (dk diff --literals {sec})" for sec, pct in sorted(s.data.items()) if pct < 100.0]
+        if s.layout_problems:
+            items.append(f"layout: {s.layout_problems[0]}" + (f" (+{len(s.layout_problems) - 1} more)" if len(s.layout_problems) > 1 else ""))
+        rows.append((len(open_fns), sum(f.size for f in open_fns), len(items), u["name"], items))
+    out = [f"near link ({len(rows)} WIP unit(s) at most {limit} function(s) from exact):"]
+    for n, size, _, name, items in sorted(rows):
+        out.append(f"  {name}: {n} function(s) open, 0x{size:X} bytes")
+        out += [f"      {item}" for item in items]
+    return out
+
+
+def run_check_all(cfg: Config, near: bool = False) -> int:
     try:
         units = [u for u in load_objdiff_units(cfg) if u.get("base_path")]
     except MatchError as e:
@@ -106,6 +177,8 @@ def run_check_all(cfg: Config) -> int:
             scores[u["name"]] = None
     lines, code = check_all_rows(units, scores)
     print("\n".join(lines))
+    if near:
+        print("\n".join(near_rows(units, scores)))
     print("MATCH (every linked unit exact)" if code == OK else "REGRESSION: a linked unit is not exact (fix before any commit)")
     return code
 
@@ -159,9 +232,13 @@ def run_search(cfg: Config, args: argparse.Namespace) -> int:
 
 def _configure_check(p: argparse.ArgumentParser) -> None:
     p.add_argument("target", nargs="?", help="unit (source path or name) or a function symbol inside a declared unit")
-    p.add_argument("--function", help="judge only this function (exit 0 if it is exact)")
+    p.add_argument("--function", help="judge only this function: exact, and hand-linked byte-identical to the original")
+    p.add_argument("--private", action="store_true",
+                   help="compile into a private directory, without the project lock (fast iteration; accept proves the real build)")
     p.add_argument("--all", action="store_true",
                    help="re-score every source unit; exit 1 if a linked unit is no longer exact, list WIP by code %%")
+    p.add_argument("--near", action="store_true",
+                   help="with --all: list WIP units at most 3 functions from exact, with what blocks each item")
 
 
 def _configure_search(p: argparse.ArgumentParser) -> None:

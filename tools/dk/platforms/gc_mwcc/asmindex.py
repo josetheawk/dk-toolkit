@@ -16,9 +16,10 @@ from ...core.config import Config
 
 _START = re.compile(r'^\.(?P<kind>fn|obj) "?(?P<name>[^,\s"]+)"?')     # dtk quotes names with @ etc.
 _END = re.compile(r'^\.end(?:fn|obj) "?(?P<name>[^\s"]+)"?')
-_CODE_REF = re.compile(r"\b(?P<sym>[A-Za-z_.$@?][\w.$@?<>,:*&-]*)@(?:ha|h|l|sda21|sda2)\b")
-_CALL = re.compile(r"\bbl?\s+(?P<sym>[A-Za-z_$@?][\w.$@?<>,:*&-]*)")   # bl calls and b tail calls (not .L labels)
-_DATA_WORD = re.compile(r"^\s*\.4byte (?P<sym>[A-Za-z_.$@?][\w.$@?<>,:*&-]*)")
+# dtk quotes names it cannot write bare ("@73"@ha, bl "f<1>", .4byte "@etb_8000"): accept both forms
+_CODE_REF = re.compile(r'(?:"(?P<q>[^"]+)"|\b(?P<sym>[A-Za-z_.$@?][\w.$@?<>,:*&-]*))@(?:ha|h|l|sda21|sda2)\b')
+_CALL = re.compile(r'\bbl?\s+(?:"(?P<q>[^"]+)"|(?P<sym>[A-Za-z_$@?][\w.$@?<>,:*&-]*))')   # bl calls and b tail calls (not .L labels)
+_DATA_WORD = re.compile(r'^\s*\.4byte (?:"(?P<q>[^"]+)"|(?P<sym>[A-Za-z_.$@?][\w.$@?<>,:*&-]*))')
 
 
 @dataclass
@@ -67,10 +68,10 @@ def index(files: list[Path]) -> dict[str, AsmEntry]:
                 kind, name = current
                 body = "\n".join(lines)
                 if kind == "fn":
-                    refs = [x["sym"] for x in _CODE_REF.finditer(body)]
-                    calls = [x["sym"] for x in _CALL.finditer(body)]
+                    refs = [x["q"] or x["sym"] for x in _CODE_REF.finditer(body)]
+                    calls = [x["q"] or x["sym"] for x in _CALL.finditer(body)]
                 else:
-                    refs = [x["sym"] for l in lines if (x := _DATA_WORD.match(l))]
+                    refs = [x["q"] or x["sym"] for l in lines if (x := _DATA_WORD.match(l))]
                     calls = []
                 entries[name] = AsmEntry(name, kind, path, body, _unique(refs), _unique(calls))
                 current = None

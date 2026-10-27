@@ -148,6 +148,17 @@ class IncludersTest(unittest.TestCase):
             })
             self.assertEqual(includers(cfg, "include/game/a/Old.h"), ["src/game/x.cpp"])
 
+    def test_rm_refuses_a_declared_units_source(self):
+        import argparse
+        from tools.dk.core import rmcmd
+        units = '[[lib]]\nname = "game"\nobjects = [\n    { path = "game/x.cpp", status = "NonMatching" },\n]\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_project(Path(tmp), files={"src/game/x.cpp": "int x;\n", "config/units.toml": units})
+            cfg.platform_options["units"] = "config/units.toml"
+            args = argparse.Namespace(paths=["src/game/x.cpp"], reason=None, trailer=[])
+            self.assertEqual(rmcmd.run(cfg, args), 1)
+            self.assertTrue((Path(tmp) / "src/game/x.cpp").is_file())     # refused before deleting
+
 
 class ToolkitSyncTest(unittest.TestCase):
     def test_export_copies_owned_paths_only(self):

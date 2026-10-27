@@ -42,9 +42,11 @@ def parse(text: str) -> dict[str, int]:
 
 
 def committed(cfg: Config) -> dict[str, int]:
-    """The floor as committed at HEAD (the shared working copy may be ahead or behind)."""
-    proc = subprocess.run(["git", "show", f"HEAD:{cfg.rel(path(cfg))}"], cwd=cfg.root, capture_output=True, text=True)
-    return parse(proc.stdout) if proc.returncode == 0 else {k: 0 for k in KEYS}
+    """The floor as committed at the verified (pinned) HEAD; the shared working copy may be
+    ahead or behind. A newer floor lands with a newer HEAD, and then the commit is retried."""
+    from . import isolated
+    data = isolated.show(cfg, cfg.rel(path(cfg)))
+    return parse(data.decode()) if data is not None else {k: 0 for k in KEYS}
 
 
 def gate(cfg: Config, measures: dict) -> tuple[list[str], str]:

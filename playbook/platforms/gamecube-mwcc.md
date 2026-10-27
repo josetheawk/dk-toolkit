@@ -34,7 +34,8 @@
 - **Names flow along the call graph from exact matches.** A byte-identical function's `bl foo` and its `lis/addi` or SDA21 data references land on the real `foo` in the DOL. So every named relocation target of a matched function names a DOL address. Keep only names that are consistent both ways. Why: objdiff scores `bl fn_801D1DD8` vs `bl __CARDGetControlBlock` as a mismatch, so identical code shows up as 99.x% until the callees are named. Apply: `dk analyze lib --apply` does it, and re-running a port afterwards turns those near misses exact.
 - **Reject weak evidence:** a one-function chain with no relocations (empty varargs stubs, `blr` helpers) matches unrelated code. Found as a false "dsp_debug.c" inside game code.
 - **dtk's auto-label sizes are guesses.** A real split boundary often lands inside one (`Split … ends within symbol 'lbl_…'`). Trim the auto label to the boundary and re-split. Never trim a named symbol, because that indicates a real layout difference.
-- **Data split ends include the inter-TU padding.** Extend to the next symbol if it's close, otherwise word-align, or dtk rejects the leftover auto split as misaligned.
+- **End a data split at its last object's end when that end is word-aligned, otherwise at the next symbol.** dtk fills the bytes after a split's last object with a `gap_` symbol that reaches the next symbol, and objdiff rejects one that leaves its section (`gap_… size out of section bounds`). Zero padding left after an aligned end becomes a harmless auto split.
+- **A unit whose only code is a static initializer is dropped whole by the linker** (text and `.ctors` entry): nothing outside references its object, so `.ctors` loses an entry and every later section shifts. A lone `__sinit` after a TU without one of its own is that TU's tail. Keep a genuinely standalone one with `#pragma force_active on` after the includes.
 - mwcc include flags: `-I<dir>` must be attached, while `-i <dir>` and `-ir <dir>` (recursive) take a separate argument. SDK sources include sibling private headers (`__os.h`), so they need `-ir src`.
 - **Renaming functions to their real names wakes up dtk's signatures,** which then add known data symbols. Those can overlap labels dtk invented earlier, and the split fails with `Symbol X overlaps with symbol lbl_…`. Apply: drop the stale `lbl_` and re-split (`dk analyze lib --apply` does this automatically).
 
@@ -52,11 +53,29 @@
 - **The linker dead-strips data objects, not just functions.** Literals and statics used only by stripped functions, and globals nothing uses, vanish from the middle of `.sdata2`/`.bss`, and the rest pack together at their alignment. A byte diff can't line that up. Detect: code exact, data DIFF, and a dead-stripped function list. Apply: score by removing those objects, re-packing the kept ones in order, and comparing; the accept-time hash stays the final proof.
 - **wibo puts itself in its own process group.** Killing a hung build means killing ninja's whole session, not just its group, or hung `mwldeppc` processes keep spinning for hours.
 - **dtk never deletes asm for splits that no longer exist.** Tools that read `build/<ID>/asm` must only use files for units listed in `build/<ID>/config.json`, otherwise stale copies shadow current ones.
-- **Proposing a unit's data from its code** (`./dk unit propose`): an object is local when all its referrers are the unit's functions or other local objects. Walk vtable → RTTI → name string / base list, and extend over contiguous weak objects (inline base vtables) the unit also references. Alternate the two until stable, because weak objects make their RTTI copies local.
+- **Proposing a unit's data from its code** (`./dk unit propose`): an object is the unit's when only the unit (or its own data) references it, when it is a vtable with a slot pointing at a unit function (an inlined constructor elsewhere may reference it too), or when the unit's static initializer constructs it (`.bss`). Then:
+  - Keep each range between the declared neighbours in link order (an overlap breaks the split, a crossing makes a link-order cycle).
+  - Split at runs of three or more objects that only other units reach; one or two are globals the unit defines for others.
+  - Extend forward over what the unit uses (weak vtables, their RTTI copies) and over unreferenced objects: strings and `.bss` reached at an offset from a referenced base. The next unit's first object is its base, so it is referenced.
+  - Leave a leading weak copy that an earlier unit also reaches to that unit, because the link keeps the first copy.
+  - Repeat until stable, because chosen objects make their referents the unit's.
+  - Verified on 349 linked units: 757 of 821 data ranges reproduced, against 619 with locality alone.
 
-- **CodeWarrior class layout:** the vtable pointer sits where the first virtual function is declared (offset 0 when virtuals come first, after the preceding data otherwise); slot N is at vtable + 8 + 4N (`{rtti, 0, fn…}`). A virtual call is `lwz r12, voff(obj); lwz r12, 8+4N(r12); mtctr r12; bctrl`.
+- **CodeWarrior class layout:** the vtable pointer sits where the first virtual function is declared (offset 0 when virtuals come first, after the preceding data otherwise); slot N is at vtable + 8 + 4N (`{rtti, 0, fn…}`). With a second base, its vtable (RTTI, offset, then its slots) is embedded right after the primary base's slots, and the virtuals the derived class adds come after that embedded part, so their slot numbers skip it. A virtual call is `lwz r12, voff(obj); lwz r12, 8+4N(r12); mtctr r12; bctrl`.
 - **CodeWarrior virtual destructor shape:** `mr. this; beq`, vtable store(s), base destructor (`li r4, 0; bl __dt__B`, or inlined: another vtable store and another null check), `extsh. flags; ble`, then `operator delete`. A class-specific `operator delete` appears as `__dl__<Class>FPv`. RTTI base lists hold every ancestor, root first, and point at per-unit RTTI copies.
 - **CodeWarrior mangling for calls:** `name__F<params>`, `name__<len><Class>[C]F<params>`, `Q<n>` for nested names. Return types aren't mangled, so a declaration may choose one freely.
+
+## Register allocation (callee-saved r14-r31, f14-f31)
+
+- **The callee-saved number of a value is set by its rank, and declaration order sets a named local's rank.** Values get registers one at a time in rank order. Each takes the lowest-numbered register already handed out that no overlapping value holds, and only otherwise a new one (r31 first, then down). Rank, highest first:
+  1. Compiler temporaries, newest first: a call result held while the rest of an expression is evaluated, an inline function's locals and result, CSE values, loop-invariant addresses and strength-reduced loop pointers.
+  2. Named locals, in declaration order. Where the first definition or first use sits does not matter, and nested-block locals count where they are declared.
+  3. Parameters, last one first.
+
+  A local or parameter that merges with a temporary takes the temporary's rank. That happens when its value feeds an operation (arithmetic, a compare, a store) straight from the call or expression that made it, or when a loop pointer is strength-reduced from it. A local that is only passed on as an argument or returned keeps its declaration rank. Use count, loop depth and `register` have no effect, and GC 1.3 through 2.7 behave alike. Why: the rule predicted every register in 360 generated test functions, where first-use order, live-range length and "highest free register" did not. Apply:
+  - Compile with `-sym on` to get DWARF that names every variable's register; the code stays byte-identical. Compare that per variable with the target. `dk regs <unit> <fn>` does this.
+  - Move the declarations into the target's order. Split `T x = e;` into `T x;` plus `x = e;` where needed. `dk regs --try` compiles those variants.
+  - When a local ranks wrongly although its declaration order is right, change how its value is made: a `?:` initializer versus if/else assignments, or a value fed straight into an operation versus first passed on as an argument.
 
 ## Hand-written assembly
 

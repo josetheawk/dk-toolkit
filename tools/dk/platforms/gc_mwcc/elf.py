@@ -96,6 +96,21 @@ class Elf:
     def section(self, name: str) -> ElfSection | None:
         return next((s for s in self.sections if s.name == name), None)
 
+    def force_active(self) -> set[str]:
+        """Names of the symbols mwcc flagged force-active (`#pragma force_active on`, or
+        `__declspec(force_export)`): the linker never dead-strips them. mwcc keeps per-symbol
+        flags in its `.comment` section: a 0x2C-byte "CodeWarrior" header, then 8 bytes per
+        symbol-table entry (alignment, visibility flags, active flags); active bit 0x08."""
+        com = self.section(".comment")
+        if com is None or not com.data.startswith(b"CodeWarrior") or len(com.data) < 0x2C:
+            return set()
+        out = set()
+        for i, sym in enumerate(self.symbols):
+            at = 0x2C + 8 * i + 5
+            if at < len(com.data) and com.data[at] & 0x08 and sym.name:
+                out.add(sym.name)
+        return out
+
     def functions(self) -> dict[str, Function]:
         result = {}
         for sym in self.symbols:

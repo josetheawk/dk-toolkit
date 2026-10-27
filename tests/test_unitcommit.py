@@ -57,6 +57,14 @@ class ComposeTest(unittest.TestCase):
         self.assertNotIn("Cfunc__1CFv", out)
 
 
+class ThunkRenameTest(unittest.TestCase):
+    def test_a_renamed_thunk_travels_with_its_function_name(self):
+        head = "@164@8@vf14__Q22AI12CopBaseProtoFP11Unk800F11CCPCc = .text:0x800C0000; // type:function size:0x8\n"
+        work = "@164@8@vf14__Q22AI12CopBaseProtoFP8PProfilePCc = .text:0x800C0000; // type:function size:0x8\n"
+        out = compose_symbols(head, work, [(".text", 0x800F0000, 0x800F1000)], {"vf14__Q22AI12CopBaseProtoFP8PProfilePCc"})
+        self.assertIn("FP8PProfilePCc", out)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -79,3 +87,27 @@ class MergeTest(unittest.TestCase):
                       '    { path = "game/b.cpp", status = "NonMatching" },\n]\n')
         units_work = '[[lib]]\nname = "game"\nobjects = [\n    { path = "game/a.cpp", status = "Matching" },\n]\n'
         self.assertNotIn("game/b.cpp", compose_units(units_head, units_work, "game/a.cpp", ("game/b.cpp",)))
+
+
+class HeaderChurnTest(unittest.TestCase):
+    """Another agent's half-done edit to a shared header rides along in a unit's commit; leave
+    out the edits the unit does not need, keep the ones its source needs."""
+
+    def test_leaves_out_unneeded_edits_and_keeps_needed_ones(self):
+        from tools.dk.platforms.gc_mwcc.unitcommit import choose_headers
+        a, b = "include/a.h", "include/b.h"
+
+        def unit_needs_a(kept):            # a.h adds a member the unit uses; b.h is another agent's edit
+            if a not in kept:
+                return None                # does not compile without a.h's edit
+            return (5, 0) if b in kept else (8, 1)
+        self.assertEqual(choose_headers([a, b], unit_needs_a), {a})
+
+        def needs_none(kept):
+            return (8, 1) if b not in kept else (3, 0)
+        self.assertEqual(choose_headers([a, b], needs_none), set())
+        self.assertEqual(choose_headers([], needs_none), set())
+
+        def needs_both(kept):
+            return (9, 1) if kept == {a, b} else None
+        self.assertEqual(choose_headers([a, b], needs_both), {a, b})

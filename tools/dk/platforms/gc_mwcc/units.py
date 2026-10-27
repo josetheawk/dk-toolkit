@@ -223,3 +223,14 @@ def remove_object(units: UnitsFile, path: str) -> bool:
                     units.libs.remove(lib)
                 return True
     return False
+
+
+def declared_sources(cfg, read) -> set[str]:
+    """Repo paths of the sources the units file declares, in the content `read(rel)` returns
+    (bytes, or None when the file is absent): HEAD's or the working tree's."""
+    import tomllib
+    data = read(cfg.platform_options["units"])
+    if data is None:
+        return set()
+    src = cfg.platform_options.get("src", "src")
+    return {f"{src}/{o['path']}" for lib in tomllib.loads(data.decode()).get("lib", []) for o in lib.get("objects", [])}

@@ -59,6 +59,20 @@ def project_lock(root: Path):
             _lock_file = None
 
 
+@contextlib.contextmanager
+def released():
+    """Give up this process's project lock for a while (a clean-worktree build touches nothing
+    shared), then take it back. A no-op when the lock is not held."""
+    held = _lock_depth > 0 and _lock_file is not None
+    if held:
+        fcntl.flock(_lock_file, fcntl.LOCK_UN)
+    try:
+        yield
+    finally:
+        if held:
+            fcntl.flock(_lock_file, fcntl.LOCK_EX)
+
+
 NINJA_TIMEOUT = 180  # seconds; a full re-split + link takes ~2 s, so this is a hang
 
 

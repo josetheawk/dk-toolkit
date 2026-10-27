@@ -17,8 +17,7 @@ from .dol import Dol
 from .dtk_symbols import boundary_fix, build_errors, caused_by, read_symbols, read_units, set_symbol_size
 from .elf import Elf
 from .matching import MatchError, resolve_unit
-from .dol import Dol
-from .propose import adjust_tu_bounds, ctor_slots, propose, self_contained
+from .propose import DATA_SECTIONS, adjust_tu_bounds, ctor_slots, lone_initializer, propose, range_end, self_contained
 from .units import (add_object, add_split_unit, read_units_file, remove_object, remove_split_unit, set_flags,
                     render_units_file, replace_split_unit)
 
@@ -107,7 +106,7 @@ def rebuild(cfg: Config, tx: Transaction) -> str | None:
     # A normal re-split + link takes ~2 s; 60 s means the linker hung on this split.
     symbols_path = cfg.root / cfg.platform_options["symbols"]
     for _ in range(20):
-        proc = fresh.build(cfg, timeout=60)
+        proc = fresh.build(cfg, fresh.hash_target(cfg), timeout=60)
         if proc.returncode == 124:
             return "linker hung with this split (killed after 60 s)"
         if proc.returncode == 0:
@@ -133,9 +132,10 @@ def run_add(cfg: Config, args: argparse.Namespace) -> int:
     options = {"mw_version": args.mw_version, "cflags": args.cflags}
     error = declare(cfg, tx, args.path, splits, args.lib, args.status, settings, options)
     if error:
+        print(f"REJECTED: {error}")
         tx.rollback()
-        fresh.build(cfg)
-        print(f"REJECTED: {error}\n(files restored)")
+        fresh.build(cfg, fresh.hash_target(cfg))     # relink only: unlinked sources stay out of it
+        print("(files restored)")
         return MISMATCH
     print(f"added {args.path} ({len(splits)} split(s)); re-split build still matches")
     hint("ctx <function>", f"check {args.path}")
@@ -144,9 +144,10 @@ def run_add(cfg: Config, args: argparse.Namespace) -> int:
 
 def _finish(cfg: Config, tx: Transaction, error: str | None, done: str) -> int:
     if error:
+        print(f"REJECTED: {error}")
         tx.rollback()
-        fresh.build(cfg)
-        print(f"REJECTED: {error}\n(files restored)")
+        fresh.build(cfg, fresh.hash_target(cfg))     # relink only: unlinked sources stay out of it
+        print("(files restored)")
         return MISMATCH
     print(done)
     return OK
@@ -217,15 +218,23 @@ def run_fit(cfg: Config, args: argparse.Namespace) -> int:
     if split_unit is None:
         print("error: unit not found in splits.txt")
         return USAGE
+    symbols = read_symbols(cfg.root / cfg.platform_options["symbols"])
     new, changes = [], []
     for sec, start, end in split_unit.splits:
         section = base.section(sec)
         size = (section.size + 3) & ~3 if section else 0
         if sec != ".text" and section and 0 < size < end - start:
             tail = b"" if sec.startswith((".bss", ".sbss")) else dol.read(start + size, end - start - size)
-            if not tail.strip(b"\0"):
-                changes.append(f"{sec} 0x{end:08X} -> 0x{start + size:08X}")
-                end = start + size
+            # dtk fills from the last object's end to the next symbol with a gap_ symbol: never
+            # end a range between an unaligned object end and the next symbol
+            cut = start + size
+            last = max((min(x.address + x.size, cut) for x in symbols
+                        if x.section == sec and start <= x.address < cut and x.type != "label"), default=cut)
+            following = min((x.address for x in symbols if x.section == sec and x.address >= cut), default=end)
+            cut = max(cut, range_end(last, min(following, end), [], sec))
+            if not tail.strip(b"\0") and cut < end:
+                changes.append(f"{sec} 0x{end:08X} -> 0x{cut:08X}")
+                end = cut
         new.append((sec, start, end))
     if not changes:
         print("nothing to trim (data ranges already match the compiled sizes, or the tail is not padding)")
@@ -295,6 +304,15 @@ def run_propose(cfg: Config, args: argparse.Namespace) -> int:
                       f"(thunks/factories after its __sinit): {', '.join(moved_out)}")
             if moved_in:
                 print(f"note: {len(moved_in)} function(s) after this unit belong to it: {', '.join(moved_in)}")
+        if not args.raw and lone_initializer(fns, previous, entries):
+            print(f"note: {', '.join(s.name for s in fns)} is only a static initializer: a unit of just that is "
+                  f"dropped by the linker (accept fails, .ctors shifts). It is the tail of the TU before it "
+                  f"(0x{previous[0].address:08X}-), which has no initializer: propose the two as one unit")
+            merged = previous + fns
+            owners = [u for u in read_units(paths(cfg)[0])
+                      if any(sec == ".text" and a <= s.address < z for sec, a, z in u.splits for s in (merged[0], fns[0]))]
+            args.merge = owners
+            fns = merged
         start, end = fns[0].address, fns[-1].address + fns[-1].size
     else:
         try:
@@ -303,7 +321,11 @@ def run_propose(cfg: Config, args: argparse.Namespace) -> int:
             print("error: give START END as hex addresses, or a function name")
             return USAGE
         entries = asmindex.index(asmindex.current_asm_files(cfg))
-    p = propose(symbols, entries, start, end, ctor_slots(Dol.parse(cfg.original.read_bytes()), symbols))
+    dol = Dol.parse(cfg.original.read_bytes())
+    splits_path, _, _ = paths(cfg)
+    # declared neighbours bound every data range (no overlap, same link order); a unit whose
+    # .text is this range is ignored, so re-proposing a declared unit shows what would change
+    p = propose(symbols, entries, start, end, ctor_slots(dol, symbols), units=read_units(splits_path), read=dol.read)
     print(f"text 0x{start:08X}-0x{end:08X}: {len(p.functions)} function(s)")
     for sec, (lo, hi) in sorted(p.sections.items(), key=lambda kv: kv[1]):
         names = ", ".join(p.members[sec][:8]) or "(static-initializer slot)"
@@ -312,7 +334,41 @@ def run_propose(cfg: Config, args: argparse.Namespace) -> int:
         print(f"extern data ({len(p.extern_data)}): {', '.join(p.extern_data[:12])}")
     if p.extern_calls:
         print(f"extern calls ({len(p.extern_calls)}): {', '.join(p.extern_calls[:12])}")
+    for note in p.notes:
+        print(f"note: {note}")
     splits = " ".join(f"{sec}:0x{lo:08X}-0x{hi:08X}" for sec, lo, hi in p.splits())
+    merge = getattr(args, "merge", [])
+    first = next((u for u in merge if any(sec == ".text" and a == start for sec, a, _ in u.splits)), None)
+    if first:     # the initializer joins a declared unit: widen it, retire the initializer's own unit
+        others = [u for u in merge if u is not first]
+        print(f"\n./dk unit set {first.name} {splits}")
+        for u in others:
+            print(f"./dk unit remove {u.name}")
+        if others:
+            print(f"# move the header static from src/{others[0].name} into src/{first.name}, then:")
+        print(f"./dk save {first.name} --note \"absorbed its static initializer\"")
+        for u in others:     # only once HEAD no longer declares it (rm refuses before)
+            print(f"./dk rm src/{u.name} --reason \"merged into {first.name}\"")
+        return OK
+    current = next((u for u in read_units(splits_path) if (".text", start, end) in u.splits), None)
+    if current:   # already declared: show what would change, as one unit set
+        have = {sec: (a, z) for sec, a, z in current.splits}
+        want = dict(p.sections) | {".text": (start, end)}
+        changes = [f"  {sec:<8} {'-' if sec not in have else f'0x{have[sec][0]:08X}-0x{have[sec][1]:08X}'} -> "
+                   f"0x{want[sec][0]:08X}-0x{want[sec][1]:08X}" for sec in want if have.get(sec) != want[sec]]
+        kept = [sec for sec in have if sec not in want]
+        if not changes:
+            print(f"\n{current.name} already has these ranges")
+            return OK
+        print(f"\n{current.name} is declared; proposed changes:")
+        print("\n".join(changes))
+        for sec in kept:
+            print(f"  {sec:<8} kept as declared (the proposal has no range there)")
+            want[sec] = have[sec]
+        order = lambda sec: (sec != ".text", DATA_SECTIONS.index(sec) if sec in DATA_SECTIONS else 99)
+        print(f"\n./dk unit set {current.name} " + " ".join(f"{sec}:0x{a:08X}-0x{z:08X}" for sec, (a, z) in
+                                                         sorted(want.items(), key=lambda kv: order(kv[0]))))
+        return OK
     print(f"\n./dk unit add {args.path or '<src path>'} --lib {args.lib} --cflags {args.cflags} "
           f"--mw-version {args.mw_version} --category {args.category} {splits}")
     return OK

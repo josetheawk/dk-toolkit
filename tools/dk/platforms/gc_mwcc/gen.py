@@ -165,6 +165,7 @@ class Call:
     seq: int
     virtual: bool = False
     cxx: object = None    # demangle.Function for a C++ callee (args follow its parameter order)
+    variadic: bool = False    # crclr/crset cr1eq before it: a varargs call (printf-like)
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,8 @@ class Lifted:
     bound: dict = field(default_factory=dict)                         # object -> qualified class (tuple)
     expected: dict = field(default_factory=dict)                      # expression -> type a C++ callee wants
     notes: list = field(default_factory=list)                         # caveats printed with the draft
+    review: list = field(default_factory=list)                        # source-level guesses: a comment in the body
+    caller_evidence: bool = False                                     # a call is longer for other callers' setup
     base_call: object = None                                          # constructor mode: the base constructor call
     locals: dict = field(default_factory=dict)                        # frame offset -> size of each local used
     arrays: dict = field(default_factory=dict)                        # (base, start, via_pointer) -> {"size", "fields"}
@@ -428,6 +431,23 @@ def _reads_writes(insn: Insn, signature) -> tuple[list[str], list[str]]:
     return regs(a[1:]), regs(a[:1])
 
 
+def set_before(insns: list[Insn], seq: int, kind: str, targets: set) -> int:
+    """The highest argument register (r3-r10 / f1-f8) written on the straight path into the
+    call at `seq` and not read before it: a value nothing else uses is an argument (the
+    callee's own asm can hide it by passing it on untouched). `targets`: branch targets."""
+    lo, hi = (3, 10) if kind == "r" else (1, 8)
+    read, top = set(), 0
+    for insn in reversed(insns[:seq]):
+        if insn.op in ("bl", "bctrl", "blr", "b"):
+            break
+        reads, writes = _reads_writes(insn, None)
+        top = max([top] + [int(w[1:]) for w in writes if w[0] == kind and w not in read and lo <= int(w[1:]) <= hi])
+        read.update(reads)
+        if insn.address in targets:                 # another path joins here
+            break
+    return top
+
+
 def infer_signature(insns: list[Insn], signature=None) -> tuple[int, int]:
     """(GPR, FPR) parameter counts: the highest argument register read before it is written,
     scanning up to the first call (whose own parameters count as reads)."""
@@ -561,8 +581,11 @@ def _target(insn: Insn) -> int | None:
 
 
 class _Executor:
-    def __init__(self, literal, this_is_object: bool, signature, vsignature=None, ctor_mode: bool = False):
+    def __init__(self, literal, this_is_object: bool, signature, vsignature=None, ctor_mode: bool = False,
+                 callers=None, params=None):
         self.literal, self.this_is_object, self.signature = literal, this_is_object, signature
+        self.callers = callers              # callee -> (GPR, FPR) arguments its call sites set up
+        self.params = params                # (GPR, FPR) parameters this function is known to have
         self.ctor_mode = ctor_mode          # vtable stores and the base constructor call are markers
         self.vsignature = vsignature        # slot -> (GPR, FPR) for virtual calls on `this`
         self.out = Lifted([], {}, set())
@@ -573,6 +596,9 @@ class _Executor:
         self.ifs: dict = {}                 # seq -> If (for materialising merged values)
         self.materialised: dict = {}        # Phi -> VarRef
         self.regions: dict = {}             # local variables: frame offset -> size
+        self.vararg_at: dict = {}           # seq of a call -> crclr | crset (cr1eq: FPR arguments or not)
+        self.insns: list = []               # the body (for set_before)
+        self.targets: set = set()           # addresses branches jump to
 
     # helpers -----------------------------------------------------------------------------
 
@@ -1001,6 +1027,8 @@ class _Executor:
             if tuple(a) not in _FUSED or entry is None or entry[0] != "float":
                 raise Unsupported(f"instruction cror {', '.join(a)}")
             st.cr["cr0"] = (_FUSED[tuple(a)], entry[1], entry[2])
+        elif op in ("crclr", "crset") and tuple(a) == ("cr1eq",):
+            self.vararg_at[seq + 1] = op        # the varargs call that follows
         elif op == "bl":
             self.call(st, seq, a[0], stmts)
         elif op == "mtctr":
@@ -1067,11 +1095,38 @@ class _Executor:
                 and not out.calls and (cxx is None or cxx.special == "ctor"):
             return self.base_ctor_call(st, seq, callee, cxx, stmts)
         if cxx is not None:
+            if seq in self.vararg_at:
+                raise Unsupported("a C++ varargs call")
             return self.cxx_call(st, seq, callee, cxx, stmts)
+        if seq in self.vararg_at:
+            return self.vararg_call(st, seq, callee, stmts)
         sig = self.signature(callee) if self.signature else None
         if sig is None:
             raise Unsupported(f"call to {callee}: signature unknown")
-        n_gpr, n_fpr = sig
+        own = sig
+        seen = (self.callers(callee) if self.callers else None) or (0, 0)
+        # other callers' evidence only reaches registers that hold a value here: set by this
+        # function, or a parameter it is known to have, passed on untouched
+        def held(r: str) -> bool:
+            v = st.regs.get(r)
+            if isinstance(v, Param) and v.reg == r:
+                n = int(r[1:]) - 2 if r[0] == "r" else int(r[1:])
+                return bool(self.params) and n <= self.params[0 if r[0] == "r" else 1]
+            return v is not None
+        live = lambda regs: next((k for k, r in enumerate(regs) if not held(r)), len(regs))
+        seen = (min(seen[0], live([f"r{n}" for n in range(3, 11)])), min(seen[1], live([f"f{n}" for n in range(1, 9)])))
+        here = (max(own[0], self.set_before(seq, "r") - 2), max(own[1], self.set_before(seq, "f")))
+        n_gpr, n_fpr = max(here[0], seen[0]), max(here[1], seen[1])
+        out.caller_evidence |= (n_gpr, n_fpr) != here
+        for n in range(3 + n_gpr, 11):          # (the callee's own asm passes it on untouched)
+            v = st.regs.get(f"r{n}")
+            if f"r{n}" in st.fresh and isinstance(v, AddrOf) and isinstance(v.loc, Field) and isinstance(v.loc.base, StackObj):
+                n_gpr = n - 2                   # a local's address put in an argument register is an argument
+        if (n_gpr, n_fpr) != tuple(own):
+            note = (f"{callee} takes {n_gpr} int and {n_fpr} float arguments here: registers its callers set up, "
+                    f"though its own code reads {own[0]} and {own[1]}; check its declaration")
+            if note not in out.review:
+                out.review.append(note)
         args = tuple(self.get(st, f"r{n}") for n in range(3, 3 + n_gpr)) + tuple(self.get(st, f"f{n}") for n in range(1, 1 + n_fpr))
         # &member passed to a call: an embedded object (same evidence rule as for returns)
         args = tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v) if isinstance(v, IndexPtr) else v for v in args)
@@ -1079,6 +1134,28 @@ class _Executor:
             if isinstance(v, HaPart):
                 raise Unsupported("passes half an address")
         return self.finish_call(st, Call(callee, args, n_gpr, seq), stmts)
+
+    def set_before(self, seq: int, kind: str) -> int:
+        return set_before(self.insns, seq, kind, self.targets)
+
+    def vararg_call(self, st: _State, seq: int, callee: str, stmts: list) -> Call:
+        """printf-like: the arguments are the registers written since the last call (the
+        callee's own asm only shows it saving all of them). Declared `f(T, ...)`: whatever
+        follows the first argument passes through `...` the same way."""
+        out = self.out
+        n_gpr = max([n - 2 for n in range(3, 11) if f"r{n}" in st.fresh], default=1)
+        n_fpr = max([n for n in range(1, 9) if f"f{n}" in st.fresh], default=0) if self.vararg_at[seq] == "crset" else 0
+        if self.vararg_at[seq] == "crset" and not n_fpr:
+            raise Unsupported("varargs call with FPR arguments the lifter did not see")
+        if not out.calls:
+            out.review.append(f"{callee}: varargs passed through unchanged registers may be missing")
+        if n_fpr:
+            out.review.append(f"{callee}: float arguments are placed after the others (their position is a guess)")
+        args = tuple(self.get(st, f"r{n}") for n in range(3, 3 + n_gpr)) + tuple(self.get(st, f"f{n}") for n in range(1, 1 + n_fpr))
+        args = tuple(_resolve_offset(out, v, self.this_is_object) if isinstance(v, Offset) else self.elem_address(v) if isinstance(v, IndexPtr) else v for v in args)
+        if any(isinstance(v, HaPart) for v in args):
+            raise Unsupported("passes half an address")
+        return self.finish_call(st, Call(callee, args, n_gpr, seq, variadic=True), stmts)
 
     def cxx_call(self, st: _State, seq: int, callee: str, cxx, stmts: list) -> Call:
         """A call to a demangled C++ function: arguments in parameter order, each from the
@@ -1205,7 +1282,7 @@ class _Executor:
         sig = self.vsignature(slot) if self.vsignature and obj == Param("r3") and self.this_is_object else None
         if sig is None:
             # unknown slot: an argument passed through an untouched register is invisible
-            out.notes.append(f"vf{slot}'s parameters are unknown: arguments passed through unchanged registers may be missing")
+            out.review.append(f"vf{slot}'s parameters are unknown: arguments passed through unchanged registers may be missing")
             fresh_r = [n for n in range(4, 11) if f"r{n}" in st.fresh]
             fresh_f = [n for n in range(1, 9) if f"f{n}" in st.fresh]
             sig = (max(fresh_r, default=3) - 2, max(fresh_f, default=0))
@@ -1244,6 +1321,8 @@ class _Executor:
             # the integer reading if the body already used this base that way, else &element
             st.regs["r3"] = self.as_value(ix) if ix.base in self.raw_bases else self.elem_address(ix)
         r3, f1 = st.regs.get("r3"), st.regs.get("f1")
+        if isinstance(r3, Phi) and Param("r3") in _leaves(r3) and isinstance(f1, Phi) and Param("f1") not in _leaves(f1):
+            return f1, True, False          # some path leaves r3 untouched: every path sets f1
         if isinstance(r3, CallResult) and isinstance(f1, CallResult) and r3.call == f1.call:
             return r3, False, True          # ends with a call: returning its result compiles the same
         if "f1" in st.written and not isinstance(f1, CallResult) and \
@@ -1259,21 +1338,24 @@ class _Executor:
 
 
 def lift(insns: list[Insn], literal, this_is_object: bool = False, signature=None, vsignature=None,
-         ctor_mode: bool = False) -> Lifted:
+         ctor_mode: bool = False, callers=None, params=None) -> Lifted:
     """Symbolically execute a function ending in blr: straight-line code with calls, or small
     acyclic control flow (if / if-else / early returns) when the body branches.
 
     `literal(sym, size)` returns the bytes of a compiler literal (a constant in .sdata2/.rodata)
     or None when `sym` is a variable. `this_is_object`: r3 is `this` of a known class (the
-    function sits in a vtable). `signature(sym)` gives a callee's (GPR, FPR) parameter counts.
+    function sits in a vtable). `signature(sym)` gives a callee's (GPR, FPR) parameter counts,
+    `callers(sym)` the most argument registers any call to it sets up; `params` the function's
+    own (GPR, FPR) parameter counts when known (its mangled name, or its callers).
     """
     frame_size, save_low = frame_layout(insns)
-    insns = strip_frame(insns)
+    insns = _conditional_returns(strip_frame(insns))
     if not insns or insns[-1].op not in ("blr", "b"):
         raise Unsupported("does not end in a return")
-    ex = _Executor(literal, this_is_object, signature, vsignature, ctor_mode)
+    ex = _Executor(literal, this_is_object, signature, vsignature, ctor_mode, callers, params)
     out = ex.out
     ex.scratch, ex.regions = stack_plan(insns, save_low) if frame_size else (set(), {})
+    ex.insns, ex.targets = insns, {t for t in map(_target, insns) if t is not None}
     branches = [i for i in insns[:-1] if i.op in ("blr", "b") or _BRANCH.match(i.op) or i.op.startswith("bdnz")]
     if not branches and insns[-1].op == "blr":
         st = _State({f"r{n}": Param(f"r{n}") for n in range(3, 11)} | {f"f{n}": Param(f"f{n}") for n in range(1, 9)},
@@ -1289,6 +1371,20 @@ def lift(insns: list[Insn], literal, this_is_object: bool = False, signature=Non
     _lift_cfg(ex, insns)
     ex.finish_vptrs()
     return _finish_params(out, ex.as_base, this_is_object)
+
+
+_COND_RETURN = re.compile(r"^b(eq|ne|lt|le|gt|ge)lr([+-]?)$")
+
+
+def _conditional_returns(insns: list[Insn]) -> list[Insn]:
+    """`beqlr` (a leaf's `if (c) return;`) as a branch to a return after the body: the lifter
+    then sees an early return. Only for lifting; the original is what drafts are compared with."""
+    if not any(_COND_RETURN.match(i.op) for i in insns):
+        return insns
+    ret = insns[-1].address + 4
+    out = [Insn(i.address, i.word, f"b{m[1]}{m[2]}", i.args + (f".L_{ret:08X}",)) if (m := _COND_RETURN.match(i.op)) else i
+           for i in insns]
+    return out + [Insn(ret, 0x4E800020, "blr", ())]
 
 
 def _lift_cfg(ex: _Executor, insns: list[Insn]) -> None:
@@ -1733,18 +1829,7 @@ def _canonicalize(out: Lifted) -> None:
         if k not in rep:
             rep[k] = b
             continue
-        r = rep[k]
-        for off, ctype in out.nodes.pop(b).items():
-            old = out.nodes[r].get(off)
-            if old and old != ctype and {old, ctype} not in ({"short", "unsigned short"}, {"int", "unsigned int"}):
-                raise Unsupported(f"field +0x{off:X} accessed as {old} and {ctype}")
-            out.nodes[r][off] = ctype if not old or ctype.startswith("unsigned") else old
-        out.embedded.setdefault(r, set()).update(out.embedded.pop(b, set()))
-        if b in out.vptrs:
-            v = out.vptrs.pop(b)
-            if out.vptrs.setdefault(r, v) != v:
-                raise Unsupported("two vtable pointers")
-        out.alias[b] = r
+        _merge_node(out, b, rep[k])         # (its class too, when a member call bound it)
     out.alias.update({("key", k): r for k, r in rep.items() if isinstance(r, Load)})
     for b in list(out.embedded):
         if not out.embedded[b]:
@@ -1833,6 +1918,7 @@ class Names:
     function: str
     types: dict[object, str] = field(default_factory=dict)
     params: dict[str, str] = field(default_factory=dict)
+    inherited: bool = False         # the function's class derives from this_type (render_tu's chain)
 
 
 def _simplify(e):
@@ -2285,7 +2371,7 @@ class Renderer:
 
     def methods(self) -> dict:
         """class -> declarations of the methods called on it."""
-        out: dict = {}
+        rets: dict = {}                 # one function called twice, its result used once: not void
         for c in self.l.calls:
             if not (c.cxx and c.cxx.quals):
                 continue
@@ -2293,22 +2379,28 @@ class Renderer:
             for fp in (False, True):
                 if CallResult(c, fp) in self._used_results():
                     ret = self.ctype_of(CallResult(c, fp))
-            decl = f"{ret} {c.cxx.name}({', '.join(t.text for t in c.cxx.params)}){' const' if c.cxx.const else ''};"
-            out.setdefault(c.cxx.quals, [])
-            if decl not in out[c.cxx.quals]:
-                out[c.cxx.quals].append(decl)
-        return out
+            rest = f"{c.cxx.name}({', '.join(t.text for t in c.cxx.params)}){' const' if c.cxx.const else ''};"
+            known = rets.setdefault(c.cxx.quals, {})
+            if known.get(rest, "void") == "void":
+                known[rest] = ret
+        return {q: [f"{ret} {rest}" for rest, ret in known.items()] for q, known in rets.items()}
 
     def _used_results(self) -> set:
         return {x for r in self.roots() for x in _walk(r) if isinstance(x, CallResult)}
 
-    def class_model(self, this_members: list[str] | None) -> tuple[list[str], list[str]]:
+    def class_model(self, this_members: list[str] | None, chain: list[str] | None = None,
+                    own_decls: list[str] | None = None) -> tuple[list[str], list[str]]:
         """(skeletons, definitions): nested forward declarations for every class first, then
-        each class with members defined out of line (fields, virtuals, called methods)."""
+        each class with members defined out of line (fields, virtuals, called methods), then
+        the `chain` of derived classes down to the function's own (see render_tu)."""
         classes = self.classes()
         this_q = tuple(self.n.this_type.split("::")) if self.n.member else None
         if this_q and this_members is not None:
             classes.add(this_q)
+        derived = [tuple(c.split("::")) for c in (chain or [])[1:]]
+        if any(q in classes for q in derived):
+            raise Unsupported("a class of the inheritance chain is also used directly")
+        classes |= set(derived)
         members: dict = {q: list(m) for q, m in self.methods().items()}
         for obj, q in self.l.bound.items():
             if isinstance(obj, tuple):
@@ -2320,6 +2412,8 @@ class Renderer:
             members[q] = [m.strip() for m in body] + members[q]
         if this_q and this_members is not None:
             members[this_q] = [m.strip() for m in this_members] + members.get(this_q, [])
+        for q in members:
+            members[q] = _fold_called_slots(members[q])
         # all paths, including enclosing ones
         paths = set()
         for q in classes:
@@ -2346,6 +2440,11 @@ class Renderer:
                 definitions.append(f"struct {'::'.join(q)} {{")
                 definitions += [f"    {m}" for m in members[q]]
                 definitions.append("};")
+        for parent, q in zip(chain or [], derived):
+            body = list(own_decls or []) if q == derived[-1] else []
+            definitions.append(f"struct {'::'.join(q)} : {parent} {{")
+            definitions += [f"    {m}" for m in body]
+            definitions.append("};")
         return skeletons, definitions
 
     def virtual_decls(self, base) -> list[str]:
@@ -2566,6 +2665,8 @@ class Renderer:
                 folded = folded[:-1] + [If(cond, [Return(Const(1), folded[-1].seq)], [], folded[-1].seq),
                                         Return(Const(0), folded[-1].seq)]
             tree = folded
+        if getattr(self, "sink", False):
+            tree = _sink(tree)
         flat = list(_flatten(tree))
         void = ret_mode == "void"
 
@@ -2643,6 +2744,13 @@ class Renderer:
                         k += 2
                         continue
                     i = position[id(st)]
+                    nested = self.nested(st, [x for s2 in flat[i + 1:] for root in exprs(s2) for x in _walk(root)],
+                                         [x for root in exprs(nxt) for x in _walk(root)] if nxt is not None
+                                         and not isinstance(nxt, Loop) else [])
+                    if nested is not None and not hoist_before.get(id(nxt)):
+                        self.temps[nested] = declare(text)
+                        k += 1
+                        continue
                     for fp in (False, True):
                         cr = CallResult(st, fp)
                         if used_later(cr, i):
@@ -2655,6 +2763,10 @@ class Renderer:
                         lines.append(f"{pad}{text};")
                 elif isinstance(st, If):
                     then, other, cond = st.then, st.other, _simplify(st.cond)
+                    tail = top and k == len(block) - 1      # its arms end the function
+                    if void and tail:                       # (where a void return is implicit)
+                        drop = lambda arm: arm[:-1] if arm and isinstance(arm[-1], Return) else arm
+                        then, other = drop(then), drop(other)
                     if not then and not other and not st.decls:
                         k += 1                  # the branch only selects a value (a ternary)
                         continue
@@ -2665,12 +2777,12 @@ class Renderer:
                     checked(cond)
                     lines.append(f"{pad}if ({self.expr(cond)}) {{")
                     scopes.append(set())
-                    emit(then, depth + 1, False)
+                    emit(then, depth + 1, tail)
                     scopes.pop()
                     if other:
                         lines.append(f"{pad}}} else {{")
                         scopes.append(set())
-                        emit(other, depth + 1, False)
+                        emit(other, depth + 1, tail)
                         scopes.pop()
                     lines.append(f"{pad}}}")
                 elif isinstance(st, Assign):
@@ -2709,6 +2821,20 @@ class Renderer:
 
         emit(tree, 1, True)
         return lines
+
+    def nested(self, call: Call, later: list, next_: list):
+        """With the nest variant: the CallResult of `call` if it is used exactly once in what
+        follows, and that use is in the next statement (so `f(g())` reads the same)."""
+        if not getattr(self, "nest", False):
+            return None
+        for fp in (False, True):
+            cr = CallResult(call, fp)
+            n = sum(x == cr for x in later)
+            if n and (n != 1 or cr not in next_):
+                return None
+            if n:
+                return cr
+        return None
 
     def body_flat(self, order: list[Store], ret_mode: str) -> list[str]:
         """Statements in order (stores in `order`, calls where they happen), then the return.
@@ -2764,9 +2890,13 @@ class Renderer:
                 continue
             text = self.call_text(item)
             last = i == len(stmts) - 1
+            nested = self.nested(item, [x for _, k, it in uses[i + 1:] for root in exprs(k, it) for x in _walk(root)],
+                                 [x for _, k, it in uses[i + 1:i + 2] for root in exprs(k, it) for x in _walk(root)])
             if last and isinstance(ret, CallResult) and ret.call == item:
                 lines.append(f"    return {text};")
                 merged = True
+            elif nested is not None and not hoist_at.get(i + 1):
+                self.temps[nested] = text
             elif used_after(item, i):
                 for fp in (False, True):
                     cr = CallResult(item, fp)
@@ -2825,7 +2955,8 @@ class Renderer:
                 return f"{fn.name}({text})"
             obj = call.args[0]
             if isinstance(obj, Param) and obj.reg == "r3" and self.n.member:
-                return f"{fn.name}({text})"
+                # an inherited method: qualified, as an override calls its base's version
+                return f"{'::'.join(fn.quals)}::{fn.name}({text})" if self.n.inherited else f"{fn.name}({text})"
             if isinstance(obj, AddrOf):
                 if isinstance(obj.loc, Field) and isinstance(obj.loc.base, StackObj) and obj.loc.offset == 0:
                     target = f"l{obj.loc.base.offset:X}"
@@ -2856,6 +2987,8 @@ class Renderer:
                 if CallResult(c, fp) in used:
                     ret = self.ctype_of(CallResult(c, fp))
             params = [self.arg_type(a, i < c.n_gpr) for i, a in enumerate(c.args)]
+            if c.variadic:
+                params = params[:1] + ["..."]
             key = c.callee
             if c.virtual:
                 params, key = params[1:], (self.rep(c.args[0]), int(c.callee[2:]))
@@ -2868,6 +3001,20 @@ class Renderer:
         return sigs
 
 
+def _fold_called_slots(members: list[str]) -> list[str]:
+    """A virtual slot vfN that is also called by name (a qualified base call, `B::vfN()`) is
+    one declaration: the virtual one, with the called function's signature."""
+    out = list(members)
+    for m in members:
+        named = re.fullmatch(r"(?!virtual )(.+) (vf\d+)\((.*)\)( const)?;", m)
+        slot = next((i for i, v in enumerate(out) if re.fullmatch(rf"virtual .+ {named[2]}\(.*\)( const)?;", v)), None) \
+            if named else None
+        if slot is not None:
+            out[slot] = f"virtual {m}"
+            out.remove(m)
+    return out
+
+
 def _negate(cond):
     if isinstance(cond, Op) and cond.op == "!":
         return cond.args[0]
@@ -2878,6 +3025,32 @@ def _negate(cond):
     if isinstance(cond, Op) and cond.op in _NEGATE:
         return Op(_NEGATE[cond.op], cond.args, cond.ctype)
     return Op("!", (cond,), "int")
+
+
+def _leaves(v) -> list:
+    """The values a (nested) Phi can take."""
+    return _leaves(v.then) + _leaves(v.other) if isinstance(v, Phi) else [v]
+
+
+def _nests(lifted) -> bool:
+    """Does some call's result feed another call or a store (a candidate for f(g()))?"""
+    values = [a for c in lifted.calls for a in c.args] + [st.value for st in lifted.stores]
+    return any(isinstance(x, CallResult) for v in values for x in _walk(v))
+
+
+def _sink(block: list) -> list:
+    """[..., If(c, A, B), Return(Phi(c, x, y))] -> [..., If(c, A + [return x]), B..., return y]
+    (recursively): the value the arms merge is returned in each arm. The same list when
+    nothing sinks."""
+    if len(block) < 2 or not isinstance(block[-1], Return) or not isinstance(block[-2], If):
+        return block
+    ret, node = block[-1], block[-2]
+    v = ret.value
+    if not isinstance(v, Phi) or v.site != node.seq or node.decls:
+        return block
+    then = _sink(node.then + [Return(v.then, ret.seq)])
+    other = _sink(node.other + [Return(v.other, ret.seq)])
+    return block[:-2] + [If(node.cond, then, [], node.seq)] + other
 
 
 def _walk(e):
@@ -2910,6 +3083,21 @@ def _flatten(tree: list):
             yield from _flatten(st.body)
 
 
+def tight_locals(lifted: Lifted) -> dict:
+    """Each struct local sized to its highest accessed field (instead of running up to the next
+    local or the register save area): the frame then shows whether the struct was smaller."""
+    out = dict(lifted.locals)
+    for off in lifted.locals:
+        b = StackObj(off)
+        fields = lifted.nodes.get(b, {})
+        if not fields or lifted.embedded.get(b) or ("embedded", b, 0) in lifted.bound \
+                or any(k[0] == b for k in lifted.arrays):
+            continue
+        end = max(o + (4 if t.endswith("*") else SIZES.get(t, 4)) for o, t in fields.items())
+        out[off] = min(out[off], end)
+    return out
+
+
 def has_flow(lifted) -> bool:
     return any(isinstance(st, (If, Return, Loop)) for st in lifted.tree)
 
@@ -2930,6 +3118,8 @@ class Variant:
     cache: bool = False         # values read once but used by several statements go in locals
     locals_desc: bool = False   # declare stack locals from the highest offset down
     fold: str = ""              # "expr": return a && b;  "if": if (a && b) return 1; return 0;
+    sink: bool = False          # a value merged after an if is returned in each arm instead
+    nest: bool = False          # a call result used once, by the next statement, is written there: f(g())
 
 
 def variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
@@ -2949,6 +3139,11 @@ def _variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
                for v in values if v is not None):
             modes.insert(modes.index("return"), "bool")
         out = [Variant((), m) for m in modes] + [Variant((), m, True) for m in modes]
+        if _sink(lifted.tree) is not lifted.tree:      # if (c) { return f(); } return 0;
+            out += [Variant((), m, c, sink=True) for c in (False, True) for m in modes if m != "void"]
+        if _nests(lifted):
+            out += [Variant((), m, nest=True) for m in modes] + \
+                   [Variant((), m, sink=True, nest=True) for m in modes if m != "void" and any(v.sink for v in out)]
         def bool_tree(v) -> bool:
             if isinstance(v, Phi):
                 return bool_tree(v.then) and bool_tree(v.other)
@@ -2983,6 +3178,8 @@ def _variants(lifted: Lifted, limit: int = 32) -> list[Variant]:
         orders += [p for p in itertools.permutations(base) if p != base]
     out = [Variant(o, m) for o in orders for m in modes]
     out[len(modes):len(modes)] = [Variant(base, m, True) for m in modes]       # right after the plain base order
+    if _nests(lifted):
+        out[2 * len(modes):2 * len(modes)] = [Variant(base, m, nest=True) for m in modes]
     return out[:limit]
 
 
@@ -3033,11 +3230,15 @@ def param_names(lifted: Lifted) -> dict[str, str]:
 
 
 def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen: list[Variant],
-              global_sizes: dict[str, int], display: bool = False) -> tuple[str, list[str]]:
+              global_sizes: dict[str, int], display: bool = False, standalone: bool = False,
+              chain: list[str] | None = None) -> tuple[str, list[str]]:
     """One compilable TU holding every variant as v0..vN (or, for display, the first variant
-    under the function's own name). Returns (source, struct layout notes)."""
+    under the function's own name; `standalone`: under its own name, with this's struct, for
+    dk gen --write). `chain` = [this_type, ..., C]: the function is a member of C, a class
+    derived from this_type (whose inherited methods it calls on this); this_type keeps the
+    fields. Returns (source, struct layout notes)."""
     prefix = re.sub(r"\W", "_", this_type)
-    names = Names(member, this_type, fn_name, name_nodes(lifted, prefix), param_names(lifted))
+    names = Names(member, this_type, fn_name, name_nodes(lifted, prefix), param_names(lifted), bool(chain))
     r = Renderer(lifted, names, any(v.ret_mode != "void" for v in chosen))
     this = Param("r3")
     out: list[str] = []
@@ -3047,19 +3248,27 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
         decls = [d for d in decls if d != f"struct {this_type};"]
     out += decls + r.elem_structs()
     sig = ", ".join(r.signature())
-    fn_names = [fn_name] if display else [f"v{i}" for i in range(len(chosen))]
+    fn_names = [fn_name] if display or standalone else [f"v{i}" for i in range(len(chosen))]
     value = return_value(lifted)
     ret_types = [("void" if v.ret_mode == "void" else "bool" if v.fold and v.ret_mode == "bool"
                   else r.ctype_of(value, v.ret_mode == "bool")) for v in chosen]
     this_in_model = member and ("::" in this_type or tuple(this_type.split("::")) in r.classes())
     this_members = None
+    ctor = fn_name == "__ct" and member and (display or standalone)
+    owner = chain[-1] if chain else this_type
+    own_decls = [f"{owner.split('::')[-1]}({sig});" if ctor else f"{t} {n}({sig});" for t, n in zip(ret_types, fn_names)]
+    if chain and not this_in_model:
+        raise Unsupported("an inherited class that is not in the class model")
     if this_in_model and not display:
-        this_members = r.struct_body(this, [f"{t} {n}({sig});" for t, n in zip(ret_types, fn_names)])
+        this_members = r.struct_body(this, [] if chain else own_decls)
     bound_objs = [o for o in lifted.bound if not isinstance(o, tuple) and not (isinstance(o, Param) and o.reg == "r3" and member)]
     if len({lifted.bound[o] for o in bound_objs}) != len(bound_objs) and any(lifted.nodes.get(o) for o in bound_objs):
         raise Unsupported("two objects of one class with fields")
-    skeletons, definitions = r.class_model(this_members)
+    skeletons, definitions = r.class_model(this_members, chain, own_decls)
     out += skeletons + definitions
+    if chain:
+        notes.append(f"class chain (RTTI, root last): {' : '.join(reversed(chain))}; fields are listed on "
+                     f"{chain[0]} (they may belong to any class of the chain)")
     for b in sorted(lifted.nodes, key=lambda b: r.type_name(b)):
         if r.scalar_deref(b) or (member and b == this) or r.bound_class(b) or r.local_scalar(b):
             continue
@@ -3109,15 +3318,24 @@ def render_tu(lifted: Lifted, member: bool, this_type: str, fn_name: str, chosen
         if display:
             notes.insert(0, _layout_note(r, this, this_type))
         elif not this_in_model:
-            decls = [f"{t} {n}({sig});" for t, n in zip(ret_types, fn_names)]
+            decls = own_decls
             out += [f"struct {this_type} {{"] + r.struct_body(this, decls) + ["};"]
     for v, t, n in zip(chosen, ret_types, fn_names):
         stores = [lifted.stores[i] for i in v.order]
-        head = f"{t} {this_type}::{n}({sig})" if member else f'extern "C" {t} {n}({sig})'
-        r.fold_bool = v.fold
+        head = f"{t} {chain[-1] if chain else this_type}::{n}({sig})" if member else f'extern "C" {t} {n}({sig})'
+        if ctor:                                        # C::C(...): CodeWarrior's constructors return this
+            head = f"{owner}::{owner.split('::')[-1]}({sig})"
+        r.fold_bool, r.sink, r.nest = v.fold, v.sink, v.nest
         lines = r.body(stores, v.ret_mode, v.cache)
         if lifted.locals:
             lines = r.local_decls(v.locals_desc) + lines
+        if ctor:                                        # (returning this is implicit; nothing else is)
+            if lines and lines[-1].strip() == "return this;":
+                lines = lines[:-1]
+            if any(l.strip().startswith("return") for l in lines):
+                raise Unsupported("a constructor whose draft returns something other than this")
+        if display or standalone:                       # (inside the body: it stays with the code when merged)
+            lines = [f"    // REVIEW: {n}" for n in lifted.review] + lines
         out += [head + " {"] + lines + ["}"] if lines else [head + " {}"]
     return "\n".join(out) + "\n", [n for n in notes if n]
 

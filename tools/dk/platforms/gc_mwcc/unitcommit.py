@@ -14,11 +14,10 @@ progress floor) must build and match from a clean checkout before it is committe
 from __future__ import annotations
 
 import re
-import subprocess
 import tomllib
 from collections import defaultdict
 
-from ...core import floor
+from ...core import floor, isolated
 from ...core.config import Config
 from ...core.isolated import commit_overlay, verify_overlay
 from . import dtkconfig
@@ -30,9 +29,14 @@ _SYMBOL = re.compile(r"^(?P<name>\S+) = (?P<section>[^:\s]+):0x(?P<addr>[0-9A-Fa
 _SIZE = re.compile(r"size:0x([0-9A-Fa-f]+)")
 
 
+_base: dict[str, str] = {}      # shared files already composed by an earlier unit of the same commit
+
+
 def _head(cfg: Config, rel: str) -> str:
-    proc = subprocess.run(["git", "show", f"HEAD:{rel}"], cwd=cfg.root, capture_output=True, text=True)
-    return proc.stdout if proc.returncode == 0 else ""
+    if rel in _base:
+        return _base[rel]
+    data = isolated.show(cfg, rel)
+    return data.decode() if data is not None else ""
 
 
 # --- units.toml ------------------------------------------------------------------------------
@@ -168,7 +172,7 @@ def compose_symbols(head_text: str, work_text: str, ranges: list[tuple[str, int,
         for line in head.get(key, []) + work.get(key, []):
             m = _SYMBOL.match(line.strip())
             size = int(s[1], 16) if (s := _SIZE.search(line)) else 0
-            if m["name"] in words:
+            if m["name"] in words or any(part in words for part in m["name"].split("@") if part):
                 return True
             for sec, lo, hi in ranges:
                 if sec == section and addr < hi and addr + max(size, 1) > lo:
@@ -184,6 +188,137 @@ def compose_symbols(head_text: str, work_text: str, ranges: list[tuple[str, int,
 # --- the commit ------------------------------------------------------------------------------
 
 def commit_unit(cfg: Config, unit: dict, message: str) -> tuple[bool, str]:
+    return commit_units(cfg, [unit], message)
+
+
+def commit_units(cfg: Config, units: list[dict], message: str) -> tuple[bool, str]:
+    """Commit HEAD plus the deltas of `units` as one verified commit (a unit split in several,
+    or units that need each other)."""
+    for attempt in range(isolated.UNLOCKED_TRIES + 1):   # recompose on a HEAD that moved meanwhile
+        isolated.pin_head(cfg, attempt)
+        ok, detail = _commit_units_once(cfg, units, message)
+        if detail != isolated.MOVED:
+            return ok, detail
+    return ok, detail
+
+
+def _commit_units_once(cfg: Config, units: list[dict], message: str) -> tuple[bool, str]:
+    overlay: dict = {}
+    files: list[str] = []
+    _base.clear()
+    try:
+        for unit in units:
+            part, own = unit_overlay(cfg, unit)
+            for rel, data in part.items():
+                if rel not in own and data is not None:      # composed shared file: the next unit builds on it
+                    _base[rel] = data.decode()
+            overlay.update(part)
+            files += own
+    finally:
+        _base.clear()
+    sources = {u["metadata"]["source_path"] for u in units}
+    measures: dict = {}
+    ok, detail = verify_overlay(cfg, overlay, measures=measures)
+    if ok:
+        done, result = commit_with_floor(cfg, dict(overlay), measures, message)
+        if done or not result.startswith("below the progress floor"):
+            return done, result
+        failure = result
+    dirty = dirty_headers(cfg, overlay, files, sources)
+    if not ok:
+        why = (f"it includes header(s) with uncommitted edits: {', '.join(dirty)}; if they are another agent's, "
+               "retry after that agent commits them" if dirty else "it probably depends on another uncommitted change")
+        failure = f"this unit's delta does not build on top of HEAD by itself ({why}):\n" + detail
+    # Another agent's half-done edit to a shared header often rides along. Leave out the edits the
+    # units do not need (their sources still compile and score as well with HEAD's copy).
+    keep = choose_headers(dirty, lambda kept: private_scores(cfg, units, [h for h in dirty if h not in kept]))
+    left = [h for h in dirty if h not in keep]
+    if not left:
+        return False, failure
+    retry = dict(overlay)
+    for rel in left:
+        retry[rel] = isolated.show(cfg, rel)
+    note = f"left {', '.join(left)} at HEAD: another agent's in-progress edit"
+    measures = {}
+    ok, detail = verify_overlay(cfg, retry, measures=measures)
+    if not ok:
+        return False, f"{failure}\n(also tried with {', '.join(left)} at HEAD; that does not build either)"
+    done, result = commit_with_floor(cfg, retry, measures, message.rstrip("\n") + f"\n\n{note[0].upper()}{note[1:]}.\n")
+    return done, f"{result}; {note}" if done else result
+
+
+def dirty_headers(cfg: Config, overlay: dict, files: list[str], sources: set[str]) -> list[str]:
+    """Headers in the overlay whose working copy differs from HEAD's (a header new in this
+    commit is the unit's own and is never left out)."""
+    out = []
+    for rel in files:
+        if rel in sources or not rel.endswith((".h", ".hpp", ".inc")) or overlay.get(rel) is None:
+            continue
+        head = isolated.show(cfg, rel)
+        if head is not None and head != overlay[rel]:
+            out.append(rel)
+    return out
+
+
+def choose_headers(dirty: list[str], evaluate) -> set[str]:
+    """The dirty headers whose working edits the units need. `evaluate(kept)` scores the units
+    with only `kept` at their working version (a comparable tuple, or None if they do not
+    compile). An edit is left out when the units score at least as well without it: all at once
+    first, then one at a time."""
+    if not dirty:
+        return set()
+    full = evaluate(set(dirty))
+    bare = evaluate(set())
+    if bare is not None and (full is None or bare >= full):
+        return set()
+    keep = set(dirty)
+    for rel in dirty:
+        trial = evaluate(keep - {rel})
+        if trial is not None and (full is None or trial >= full):
+            keep.discard(rel)
+    return keep
+
+
+def private_scores(cfg: Config, units: list[dict], at_head: list[str]):
+    """(exact functions, exact units) of the units compiled privately with the headers in
+    `at_head` replaced by HEAD's copies, or None if one does not compile."""
+    import os
+    import shutil
+    from .matching import MatchError, compile_command, retarget, run_compile, score
+    work = cfg.root / "build" / "dk" / "headers" / str(os.getpid())
+    shutil.rmtree(work, ignore_errors=True)
+    shadow = work / "include"
+    try:
+        for rel in at_head:
+            if not rel.startswith("include/"):
+                return None                       # only include/ headers can be shadowed
+            dest = shadow / rel.removeprefix("include/")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(isolated.show(cfg, rel) or b"")
+        exact_functions = exact_units = 0
+        for i, unit in enumerate(units):
+            out = work / f"out{i}"
+            out.mkdir(parents=True, exist_ok=True)
+            try:
+                args = retarget(compile_command(cfg, unit["base_path"], locked=False), out)
+            except MatchError:
+                return None
+            first = next((k for k, a in enumerate(args) if a == "-i"), len(args))
+            args[first:first] = ["-i", str(shadow)]        # searched before the working include/
+            ok, _ = run_compile(cfg, args)
+            objs = list(out.glob("*.o"))
+            if not ok or not objs:
+                return None
+            s = score(cfg, unit["name"], cfg.root / unit["target_path"], objs[0])
+            exact_functions += sum(f.percent == 100.0 for f in s.functions)
+            exact_units += s.exact
+        return exact_functions, exact_units
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def unit_overlay(cfg: Config, unit: dict) -> tuple[dict, list[str]]:
+    """(HEAD + this unit's delta as an overlay, the unit's own files in it)."""
     opts = cfg.platform_options
     source = unit["metadata"]["source_path"]
     rel_unit = source.removeprefix(opts.get("src", "src") + "/")
@@ -219,12 +354,7 @@ def commit_unit(cfg: Config, unit: dict, message: str) -> tuple[bool, str]:
         overlay[dtk_rel] = composed.encode()
     overlay[opts["symbols"]] = compose_symbols(_head(cfg, opts["symbols"]), (cfg.root / opts["symbols"]).read_text(),
                                                ranges, words).encode()
-    measures: dict = {}
-    ok, detail = verify_overlay(cfg, overlay, measures=measures)
-    if not ok:
-        return False, ("this unit's delta does not build on top of HEAD by itself (it probably depends on "
-                       "another uncommitted change; retry after that lands):\n" + detail)
-    return commit_with_floor(cfg, overlay, measures, message)
+    return overlay, files
 
 
 def commit_with_floor(cfg: Config, overlay: dict, measures: dict, message: str) -> tuple[bool, str]:

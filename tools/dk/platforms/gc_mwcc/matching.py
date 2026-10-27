@@ -30,6 +30,7 @@ class FunctionScore:
     name: str
     size: int
     percent: float
+    note: str = ""          # why a function that differs only in relocations is not equivalent
 
 
 @dataclass
@@ -40,6 +41,7 @@ class UnitScore:
     layout_problems: list[str] = field(default_factory=list)
     stripped: list[str] = field(default_factory=list)    # in source, absent from target (linker drops them)
     weak_copies: list[str] = field(default_factory=list)  # data the original link discarded (weak copies, stripped-only)
+    data_problems: list[str] = field(default_factory=list)  # vtable slots pointing at other functions
 
     @property
     def code_percent(self) -> float:
@@ -50,7 +52,7 @@ class UnitScore:
     def exact(self) -> bool:
         return (all(f.percent == 100.0 for f in self.functions)
                 and all(p == 100.0 for p in self.data.values())
-                and not self.layout_problems)
+                and not self.data_problems and not self.layout_problems)
 
 
 def load_objdiff_units(cfg: Config) -> list[dict]:
@@ -82,9 +84,11 @@ def resolve_unit(cfg: Config, query: str) -> dict:
     raise MatchError(f"{query} at 0x{sym.address:08X} is not inside any declared unit (./dk unit add)")
 
 
-def compile_command(cfg: Config, base_path: str) -> str:
-    """The project's own compile command for an object, without the dependency post-step."""
-    proc = run_ninja(cfg.root, ["-t", "commands", base_path])
+def compile_command(cfg: Config, base_path: str, locked: bool = True) -> str:
+    """The project's own compile command for an object, without the dependency post-step.
+    `ninja -t commands` only reads build.ninja; locked=False skips the project lock."""
+    proc = run_ninja(cfg.root, ["-t", "commands", base_path]) if locked else \
+        subprocess.run(["ninja", "-t", "commands", base_path], cwd=cfg.root, capture_output=True, text=True)
     if proc.returncode != 0 or not proc.stdout.strip():
         raise MatchError(f"no build command for {base_path}: {proc.stderr.strip()}")
     return proc.stdout.strip().splitlines()[-1].split(" && ", 1)[0]
@@ -167,10 +171,26 @@ def _weak_extras(target: Path, base: Path) -> tuple[dict[str, list[tuple[int, in
             target_name = symbol_at(r.target_section, r.target_value + r.addend) if r.target_section else None
             referrers.setdefault(target_name or r.symbol, set()).add(holder)
     objects = {s.name for s in sized if s.type != 2 and s.name not in want}
+    section_of = {s.name: elf.sections[s.shndx].name for s in sized}
+    # A C++ __sinit that reaches a section through its section symbol ("...bss.0"+N,
+    # "...data.0"+N) walks its global-object/destructor-chain records, or the literals of its
+    # initializers, by register arithmetic: those objects have no relocation of their own, yet
+    # the link keeps them.
+    sinit_secs = set()
+    for sec in elf.sections:
+        for r in elf.relocations(sec.index):
+            holder = symbol_at(sec.name, r.offset) or ""
+            if holder.startswith("__sinit") and r.symbol.startswith("...") and r.target_section:
+                sinit_secs.add(r.target_section)
+    # Objects flagged force-active (`#pragma force_active on`) are never dead-stripped, even when
+    # nothing references them or only discarded weak copies do; weak copies still lose to the
+    # first definition, so the flag only protects the unit's own (non-weak) objects.
+    forced = {s.name for s in sized if s.bind != STB_WEAK and s.name in elf.force_active()}
+    objects -= forced
     zero_fillable = _discarded(objects, referrers, extras)
     stripped = {s.name for s in sized if s.type == 2 and s.name not in want}
     # The target lacks these and nothing in the unit uses them: the link found no user at all.
-    unused = {n for n in objects if not referrers.get(n)}
+    unused = {n for n in objects if not referrers.get(n) and section_of.get(n) not in sinit_secs}
     extras = _discarded(objects, referrers, zero_fillable | stripped | unused)
 
     out: dict[str, list[tuple[int, int, str]]] = {}
@@ -178,6 +198,41 @@ def _weak_extras(target: Path, base: Path) -> tuple[dict[str, list[tuple[int, in
         if s.name in extras and s.type != 2:
             out.setdefault(elf.sections[s.shndx].name, []).append((s.value, s.value + s.size, s.name))
     return out, zero_fillable
+
+
+def _kept_beside_zero_filled(base: Path, weak: dict[str, list[tuple[int, int, str]]],
+                             zero_fillable: set[str]) -> set[str]:
+    """Objects of `zero_fillable` that the link keeps after all: a local object in a section
+    where weak copies are zero-filled in place keeps its slot, its bytes and its relocations,
+    and so does everything it points at, transitively (a base-class list next to a zero-filled
+    weak vtable keeps the base's RTTI record and class name in .sdata alive)."""
+    elf = Elf.parse(base.read_bytes())
+    sized = [s for s in elf.symbols if 0 < s.shndx < len(elf.sections) and s.size and s.name]
+    by_section: dict[str, list[tuple[int, int, str]]] = {}
+    for s in sized:
+        by_section.setdefault(elf.sections[s.shndx].name, []).append((s.value, s.value + s.size, s.name))
+
+    def symbol_at(section: str, offset: int) -> str | None:
+        return next((n for lo, hi, n in by_section.get(section, []) if lo <= offset < hi), None)
+
+    points_at: dict[str, set[str]] = {}
+    for sec in elf.sections:
+        for r in elf.relocations(sec.index) or []:
+            holder = symbol_at(sec.name, r.offset)
+            to = symbol_at(r.target_section, r.target_value + r.addend) if r.target_section else r.symbol
+            if holder and to:
+                points_at.setdefault(holder, set()).add(to)
+    weak_names = {s.name for s in sized if s.bind == STB_WEAK}
+    section_of = {s.name: elf.sections[s.shndx].name for s in sized}
+    zero_filled_secs = {sec for sec, ranges in weak.items() if any(n in weak_names for _, _, n in ranges)}
+    kept = {n for n in zero_fillable if n not in weak_names and section_of.get(n) in zero_filled_secs}
+    todo = list(kept)
+    while todo:
+        for to in points_at.get(todo.pop(), set()):
+            if to in zero_fillable and to not in weak_names and to not in kept:
+                kept.add(to)
+                todo.append(to)
+    return kept
 
 
 def _discarded(objects: set[str], referrers: dict[str, set[str]], seeds: set[str]) -> set[str]:
@@ -408,6 +463,154 @@ def _only_weak_extras(left: dict, right: dict, ranges: list[tuple[int, int, str]
     return True
 
 
+_AUTO_NAME = re.compile(r"^(?:fn|lbl)_[0-9A-F]{8}$")
+
+
+def _slots(elf: Elf, sym) -> dict[int, tuple[str, int]]:
+    """Offset in the object -> (function or object it points at, addend), section-relative
+    relocations resolved to the symbol defined there."""
+    defined = {(elf.sections[x.shndx].name, x.value): x.name for x in elf.symbols
+               if 0 < x.shndx < len(elf.sections) and x.name and x.type in (1, 2)}
+    out = {}
+    for r in elf.relocations(sym.shndx):
+        if sym.value <= r.offset < sym.value + sym.size:
+            name, addend = r.symbol, r.addend
+            if r.target_section and name == r.target_section:
+                name = defined.get((r.target_section, r.target_value + r.addend), name)
+                addend = 0 if name != r.target_section else addend
+            out[r.offset - sym.value] = (name, addend)
+    return out
+
+
+def vtable_problems(target: Elf, base: Elf) -> list[str]:
+    """Slots of the vtables both objects define that point at different functions.
+
+    objdiff compares a vtable's bytes, which are zero where relocations go, so an override
+    declared in the wrong slot scores 100% and only the link catches it. Names are compared:
+    the target's come from symbols.txt, ours from the compiler. A slot is not judged while the
+    target still has a placeholder (fn_ADDR) there that ours cannot be checked against: one of
+    the unit's own functions not renamed yet, or an unnamed function elsewhere."""
+    def kinds(elf):
+        return {x.name: (x.type, x.bind) for x in elf.symbols if 0 < x.shndx < len(elf.sections) and x.name}
+    t_kind, b_kind = kinds(target), kinds(base)
+    data = lambda n, k: k.get(n, (0, 0))[0] == 1 or n.startswith(("__RTTI__", "lbl_")) or re.fullmatch(r"@\d+", n)
+    vtables = lambda elf: {x.name: x for x in elf.symbols if x.type == 1 and 0 < x.shndx < len(elf.sections)
+                           and x.name.startswith("__vt__")}
+    tv, bv = vtables(target), vtables(base)
+    problems = []
+    for name in sorted(set(tv) & set(bv)):
+        ts, bs = _slots(target, tv[name]), _slots(base, bv[name])
+        size = min(tv[name].size, bv[name].size)      # dtk's symbol may run on over a weak copy after it
+        for off in sorted(o for o in set(ts) | set(bs) if o < size):
+            t, b = ts.get(off), bs.get(off)
+            if t == b:
+                continue
+            if t and data(t[0], t_kind) or b and data(b[0], b_kind):
+                continue                       # RTTI and other data pointers: judged with the data
+            if t and b and _AUTO_NAME.match(t[0]):
+                ours_override = b_kind.get(b[0]) == (2, 1)          # a global function this unit defines
+                if t[0] in t_kind or not ours_override:
+                    continue                   # unrenamed own function, or an unnamed one elsewhere
+            problems.append(f"{name}+0x{off:X}: target {t[0] if t else 'null'}, ours {b[0] if b else 'null'}")
+    return problems
+
+
+# bits each relocation type writes, from the relocation's offset
+_RELOC_MASK = {1: b"\xff\xff\xff\xff", 4: b"\xff\xff", 5: b"\xff\xff", 6: b"\xff\xff",
+               10: b"\x03\xff\xff\xfc", 109: b"\x00\x1f\xff\xff"}
+
+
+def _masked(code: bytes, relocs) -> bytes | None:
+    out = bytearray(code)
+    for r in relocs:
+        mask = _RELOC_MASK.get(r.type)
+        if mask is None:
+            return None
+        for i, m in enumerate(mask):
+            if r.offset + i < len(out):
+                out[r.offset + i] &= ~m & 0xFF
+    return bytes(out)
+
+
+def relocation_difference(target: Elf, base: Elf, tf, bf, name_at=None) -> str | None:
+    """None when two functions are the same once linked: equal code outside the relocated
+    fields, and every relocation resolves to the same thing, either the same symbol or the same
+    offset of the same section of this unit (our `.data.0+0xA0` or `@123` literal against dtk's
+    `lbl_...`), with the same bytes there. Otherwise the first relocation that differs, or ""
+    when the code itself differs. `name_at(address)`: symbols.txt's name there, to explain a
+    call through a stale C name."""
+    if len(tf.code) != len(bf.code):
+        return ""
+    tr, br = {r.offset: r for r in tf.relocs}, {r.offset: r for r in bf.relocs}
+    mt, mb = _masked(tf.code, tf.relocs), _masked(bf.code, bf.relocs)
+    if set(tr) != set(br) or mt is None or mb is None or mt != mb:
+        return ""
+    for off, r in sorted(tr.items()):
+        q = br[off]
+        if r.type != q.type:
+            return ""
+        if r.symbol == q.symbol and r.addend == q.addend:
+            continue
+        theirs, ours = r.target_value + r.addend, q.target_value + q.addend
+        label = f"+0x{off:X}: target {r.symbol}{r.addend:+#x}, ours {q.symbol}{q.addend:+#x}"
+        if r.target_section and q.target_section and r.target_section != q.target_section:
+            return (f"{label}: the target has it in {r.target_section}, ours in {q.target_section} "
+                    f"(a const literal where the original has a non-const static, or the reverse)")
+        stale = _AUTO_NAME.match(q.symbol) and q.symbol.startswith("fn_") and (
+            r.symbol.startswith(q.symbol + "__") or name_at is not None and name_at(int(q.symbol[3:], 16)) == r.symbol)
+        if stale:
+            return (f"{label}: ours still uses the C name {q.symbol}, which symbols.txt now names {r.symbol}: "
+                    f"declare it as that member (its class's header) and call it as one")
+        if not r.target_section and q.target_section and q.target_section != ".text":
+            return (f"{label}: {r.symbol} lies outside this unit's split, so the unit's data range misses it "
+                    f"(./dk unit propose shows the range; widen it with ./dk unit set)")
+        if not r.target_section and q.target_section == ".text":
+            return f"{label}: the original calls another unit's {r.symbol}, ours a function of this unit"
+        if not r.target_section or r.target_section != q.target_section:
+            return f"{label} (a different symbol)"
+        if theirs != ours:
+            return (f"{label}: the target has it at {r.target_section}+0x{theirs:X}, ours at +0x{ours:X} "
+                    f"(define the unit's literals/strings in the target's order)")
+        if r.target_section == ".text":
+            continue                                   # the same code address
+        ts, bs = target.section(r.target_section), base.section(q.target_section)
+        if ts is None or bs is None:
+            return f"{label} (section missing)"
+        if ts.type == 8:
+            continue                                   # .bss: the same offset is the same object
+        owner = [x for x in target.symbols if 0 < x.shndx < len(target.sections) and x.shndx == ts.index
+                 and x.size and x.value <= theirs < x.value + x.size and x.type in (1, 2)]
+        stop = min((x.value + x.size for x in owner), default=theirs + 4)
+        # dtk's label may run on over neighbouring data; the compiler's object has its true size
+        mine = [x for x in base.symbols if 0 < x.shndx < len(base.sections) and x.shndx == bs.index
+                and x.size and x.value <= ours < x.value + x.size and x.type in (1, 2) and x.name != q.target_section]
+        if mine:
+            stop = min(stop, theirs + min(x.value + x.size for x in mine) - ours)
+        if ts.data[theirs:stop] != bs.data[ours:ours + stop - theirs]:
+            return f"{label} (different bytes at {r.target_section}+0x{theirs:X})"
+        # the object's own pointers (a jump table's case labels, a table of strings) must land
+        # on the same offsets too: their bytes are zero in both objects
+        inner = lambda elf, sec, lo, hi: {x.offset - lo: (x.target_section, x.target_value + x.addend)
+                                          if x.target_section else (x.symbol, x.addend)
+                                          for x in elf.relocations(sec.index) if lo <= x.offset < hi}
+        if inner(target, ts, theirs, stop) != inner(base, bs, ours, ours + stop - theirs):
+            return f"{label} (its pointers differ at {r.target_section}+0x{theirs:X})"
+    return None
+
+
+_NAMES: dict = {}
+
+
+def _names_by_address(cfg: Config) -> dict[int, str]:
+    """symbols.txt address -> name, cached per file version (read only to explain a near miss)."""
+    path = cfg.root / cfg.platform_options["symbols"]
+    key = (path, path.stat().st_mtime_ns)
+    if key not in _NAMES:
+        _NAMES.clear()
+        _NAMES[key] = {s.address: s.name for s in read_symbols(path) if s.type == "function"}
+    return _NAMES[key]
+
+
 def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
     objdiff = cfg.root / "build" / "tools" / "objdiff-cli"
     # data_value: a relocation only matches if the data it points at matches too (catches a wrong
@@ -425,6 +628,19 @@ def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
             result.functions.append(FunctionScore(sym["name"], int(sym.get("size", 0)), float(sym.get("match_percent", 0.0))))
     weak, zero_fillable = _weak_extras(target, base)
     target_elf, base_elf = Elf.parse(target.read_bytes()), Elf.parse(base.read_bytes())
+    # dtk labels the zero padding between functions aligned by -func_align as gap_ functions;
+    # a compiled object has no symbol there, so they are padding, not missing functions
+    padding = {n for n, f in target_elf.functions().items() if n.startswith("gap_") and not f.code.strip(b"\0")}
+    result.functions = [f for f in result.functions if f.name not in padding]
+    target_fns, base_fns = target_elf.functions(), base_elf.functions()
+    name_at = lambda address: _names_by_address(cfg).get(address)
+    for f in result.functions:
+        if f.percent < 100.0 and f.name in target_fns and f.name in base_fns:
+            why = relocation_difference(target_elf, base_elf, target_fns[f.name], base_fns[f.name], name_at)
+            if why is None:
+                f.percent = 100.0          # the same addresses and bytes, under other names
+            elif why:
+                f.note = why
     right_sections = {sec["name"]: sec for sec in right.get("sections", [])}
     for sec in left.get("sections", []):
         if sec.get("kind") in ("SECTION_DATA", "SECTION_BSS"):
@@ -442,11 +658,17 @@ def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
             if pct < 100.0 and _relocated_section_matches(target_elf, base_elf, sec["name"],
                                                           {k: {n for _, _, n in v} for k, v in weak.items()}):
                 pct = 100.0
+            if pct < 100.0 and ranges:
+                kept = _kept_beside_zero_filled(base, weak, zero_fillable)
+                if kept and _relocated_section_matches(target_elf, base_elf, sec["name"],
+                                                       {k: {n for _, _, n in v} - kept for k, v in weak.items()}):
+                    pct = 100.0
+                    result.weak_copies += [name for _, _, name in ranges if name not in kept]
             result.data[sec["name"]] = pct
 
     # Layout after dead-stripping: functions the target lacks are dropped by the linker when
     # unreferenced (the hash check at accept proves it), so compare packed offsets instead.
-    want = _function_offsets(target)
+    want = {n: v for n, v in _function_offsets(target).items() if n not in padding}
     have = _function_offsets(base)
     stripped = sorted(set(have) - set(want))
     shift: dict[str, int] = {}
@@ -460,6 +682,7 @@ def score(cfg: Config, unit_name: str, target: Path, base: Path) -> UnitScore:
         elif got[0] != sec or shift[name] != off:
             result.layout_problems.append(f"{name}: at {got[0]}+0x{shift[name]:X} (after stripping), target {sec}+0x{off:X}")
     result.stripped = stripped
+    result.data_problems = vtable_problems(target_elf, base_elf)
     result.layout_problems += _nobits_layout_problems(
         target_elf, base_elf, {sec: {name for _, _, name in ranges} for sec, ranges in weak.items()})
     return result
@@ -469,12 +692,17 @@ def render(s: UnitScore) -> list[str]:
     lines = [f"unit {s.unit}"]
     for f in s.functions:
         lines.append(f"  {f.percent:7.2f}%  {f.name:<50} 0x{f.size:X}")
+        if f.note:
+            lines.append(f"            only a relocation differs: {f.note}")
     if s.data:
         lines.append("  data: " + "  ".join(f"{k} {v:.2f}%" for k, v in sorted(s.data.items())))
     if s.stripped:
         lines.append(f"  dead-stripped (in source, not in target): {', '.join(s.stripped)}")
     if s.weak_copies:
         lines.append(f"  data the original link discarded (weak copies, used only by stripped code; ignored): {', '.join(sorted(set(s.weak_copies)))}")
+    if s.data_problems:
+        lines.append("  vtables: MISMATCH (a slot points at another function: an override in the wrong slot?)")
+        lines += [f"    {p}" for p in s.data_problems]
     lines.append("  layout: " + ("OK" if not s.layout_problems else "MISMATCH"))
     lines += [f"    {p}" for p in s.layout_problems]
     return lines
@@ -496,15 +724,40 @@ def unit_commit_paths(cfg: Config, unit: dict) -> list[str]:
             continue
         if rel.parts and rel.parts[0] not in ("build", "orig"):
             paths.append(str(rel))
+    paths += quoted_includes(cfg, cfg.root / unit["metadata"]["source_path"])
     opts = cfg.platform_options
     paths += [opts["units"], opts["splits"], opts["symbols"], cfg.rel(floor.path(cfg))]
     return sorted(set(paths))
 
 
+_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.M)
+
+
+def quoted_includes(cfg: Config, source: Path) -> list[str]:
+    """Repo headers reached through #include "..." from `source`, recursively. Ninja's recorded
+    deps lag behind a header added since the unit's last full build; this does not."""
+    seen: set[Path] = set()
+    todo = [source]
+    while todo:
+        f = todo.pop()
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for name in _INCLUDE.findall(text):
+            for base in (f.parent, cfg.root / "include"):
+                h = (base / name).resolve()
+                if h.is_file() and h not in seen and h.is_relative_to(cfg.root):
+                    seen.add(h)
+                    todo.append(h)
+                    break
+    return [str(h.relative_to(cfg.root)) for h in seen]
+
+
 def commit_gate(cfg: Config, unit: dict) -> list[str]:
-    """Reasons a unit's commit must be refused: forbidden patterns in its own files, or progress
-    below the floor. Empty list = allowed."""
+    """Reasons a unit's commit must be refused: forbidden patterns in its own files. Empty list =
+    allowed. The progress floor is judged on the clean tree in unitcommit, never here: the shared
+    tree's report is stale (hash builds skip it) and holds other agents' work."""
     files = [cfg.root / p for p in unit_commit_paths(cfg, unit) if p.endswith((".c", ".cpp", ".cp", ".h", ".hpp", ".inc"))]
     problems = [f"forbidden: {h}" for h in quality.forbidden_hits(cfg, quality.judged_files(cfg, files))]
-    problems += [f"below progress floor: {m}" for m in floor.check(cfg)]
     return problems

@@ -9,10 +9,11 @@ from __future__ import annotations
 import argparse
 import re
 
+from .. import platforms
 from .command import MISMATCH, OK, USAGE, Command, hint
 from .config import Config
 from .gitops import tracked
-from .isolated import commit_overlay, verify_overlay
+from .isolated import commit_overlay, show, verify_overlay
 from .util import run_ninja
 
 SOURCE_SUFFIXES = (".c", ".cpp", ".cp", ".h", ".hpp", ".inc")
@@ -42,6 +43,19 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         if users:
             print(f"REJECTED: {rel} is still included by: {', '.join(users)}")
             return MISMATCH
+    declared = getattr(platforms.load(cfg.platform), "declared_sources", None)
+    if declared:
+        # A unit's source removed while HEAD (or the tree) still declares the unit leaves HEAD
+        # naming a missing file (the hash proof builds only linked code, so it does not notice).
+        def tree(rel: str) -> bytes | None:
+            path = cfg.root / rel
+            return path.read_bytes() if path.is_file() else None
+        for where, read in (("HEAD", lambda r: show(cfg, r)), ("the working tree", tree)):
+            still = sorted(set(rels) & declared(cfg, read))
+            if still:
+                print(f"REJECTED: {where} still declares a unit built from {', '.join(still)}: remove that unit "
+                      f"(./dk unit remove) and commit it (the save of the unit that absorbed it) first, then rm")
+                return MISMATCH
     saved = {rel: (cfg.root / rel).read_bytes() for rel in rels if (cfg.root / rel).is_file()}
     for rel in saved:
         (cfg.root / rel).unlink()

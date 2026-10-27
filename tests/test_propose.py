@@ -55,6 +55,112 @@ class ProposeTest(unittest.TestCase):
         p = propose(symbols, entries, 0x1000, 0x1020, {0x1010: 0x6008, 0x1020: 0x600C})
         self.assertEqual(p.sections[".ctors"], (0x6008, 0x600C))     # f2's unnamed .ctors slot
 
+    def test_declared_neighbours_bound_every_range(self):
+        from tools.dk.platforms.gc_mwcc.dtk_symbols import Unit
+        symbols = [
+            sym("a", ".text", 0x0F00, 0x10, "function"),        # declared unit before us
+            sym("f", ".text", 0x1000, 0x10, "function"),        # us
+            sym("b", ".text", 0x1020, 0x10, "function"),        # declared unit after us
+            sym("d0", ".data", 0x2000, 0x10),
+            sym("d1", ".data", 0x2010, 0x10),                   # inside the next unit's range
+            sym("d2", ".data", 0x2030, 0x8),                    # a stray beyond it
+            sym("z0", ".bss", 0x4FF0, 0x8),                     # before the previous unit's .bss
+            sym("z1", ".bss", 0x5008, 0x8),
+        ]
+        entries = {"f": entry("f", "fn", refs=["d0", "d1", "d2", "z0", "z1"]), "a": entry("a", "fn"),
+                   "b": entry("b", "fn")} | {n: entry(n, "obj") for n in ("d0", "d1", "d2", "z0", "z1")}
+        units = [Unit("A.cpp", [(".text", 0x0F00, 0x0F10), (".bss", 0x5000, 0x5008)]),
+                 Unit("B.cpp", [(".text", 0x1020, 0x1030), (".data", 0x2010, 0x2030)]),
+                 Unit("us.cpp", [(".text", 0x1000, 0x1010), (".data", 0x1F00, 0x3000)])]   # ignored: it is us
+        p = propose(symbols, entries, 0x1000, 0x1010, units=units)
+        self.assertEqual(p.sections[".data"], (0x2000, 0x2010))      # clipped at the next unit
+        self.assertEqual(p.sections[".bss"], (0x5008, 0x5010))       # never before a unit that precedes us
+        self.assertEqual(p.extern_data, ["d1", "d2", "z0"])
+        self.assertTrue(any("d1" in n for n in p.notes))
+
+    def test_own_vtable_rtti_and_strings_even_when_another_unit_uses_the_vtable(self):
+        symbols = [
+            sym("f", ".text", 0x1000, 0x10, "function"),        # a virtual of our class
+            sym("ctor", ".text", 0x1010, 0x10, "function"),     # another unit's inlined ctor
+            sym("str", ".data", 0x2000, 0x8),                   # our function's string
+            sym("name", ".data", 0x2008, 0x8),                  # class name string
+            sym("bases", ".data", 0x2010, 0x8),
+            sym("vt", ".data", 0x2018, 0x10),
+            sym("next", ".data", 0x2028, 0x8),                  # the next unit's
+            sym("rtti", ".sdata", 0x3000, 0x8),
+        ]
+        entries = {"f": entry("f", "fn", refs=["str"]), "ctor": entry("ctor", "fn", refs=["vt", "next"]),
+                   "vt": entry("vt", "obj", refs=["rtti", "f"]), "rtti": entry("rtti", "obj", refs=["name", "bases"]),
+                   "str": entry("str", "obj"), "name": entry("name", "obj"), "bases": entry("bases", "obj"),
+                   "next": entry("next", "obj")}
+        p = propose(symbols, entries, 0x1000, 0x1010)
+        self.assertEqual(p.sections[".data"], (0x2000, 0x2028))
+        self.assertEqual(p.sections[".sdata"], (0x3000, 0x3008))
+
+    def test_range_end_padding(self):
+        symbols = [sym("f", ".text", 0x1000, 0x10, "function"), sym("g", ".text", 0x1010, 0x10, "function"),
+                   sym("s", ".data", 0x2000, 0x13),             # unaligned end (a string)
+                   sym("n", ".data", 0x2018, 0x8),
+                   sym("w", ".sdata", 0x3000, 0x8),             # aligned end
+                   sym("m", ".sdata", 0x3010, 0x8)]
+        entries = {"f": entry("f", "fn", refs=["s", "w"]), "g": entry("g", "fn", refs=["n", "m"]),
+                   "s": entry("s", "obj"), "n": entry("n", "obj"), "w": entry("w", "obj"), "m": entry("m", "obj")}
+        p = propose(symbols, entries, 0x1000, 0x1010, read=lambda a, n: bytes(n))
+        self.assertEqual(p.sections[".data"], (0x2000, 0x2018))      # a gap_ after 0x2013 must stay inside
+        self.assertEqual(p.sections[".sdata"], (0x3000, 0x3008))     # the padding stays a hole
+
+    def test_odd_start_takes_the_word(self):
+        symbols = [sym("e", ".text", 0x0F00, 0x10, "function"), sym("f", ".text", 0x1000, 0x10, "function"),
+                   sym("shared", ".sbss", 0x4000, 0x1), sym("mine", ".sbss", 0x4001, 0x1)]
+        entries = {"e": entry("e", "fn", refs=["shared"]), "f": entry("f", "fn", refs=["shared", "mine"]),
+                   "shared": entry("shared", "obj"), "mine": entry("mine", "obj")}
+        p = propose(symbols, entries, 0x1000, 0x1010)
+        self.assertEqual(p.sections[".sbss"], (0x4000, 0x4004))
+
+    def test_bss_an_initializer_reaches_at_an_offset_and_strays(self):
+        symbols = [sym("__sinit_x_cpp", ".text", 0x1000, 0x10, "function"),
+                   sym("g", ".text", 0x1010, 0x10, "function"),
+                   sym("base", ".bss", 0x5000, 0x8),            # constructed here, used by others too
+                   sym("o1", ".bss", 0x5008, 0x8),              # reached at base+8: no reference
+                   sym("own", ".bss", 0x5010, 0x8),
+                   sym("x1", ".bss", 0x5018, 0x4), sym("x2", ".bss", 0x501C, 0x4), sym("x3", ".bss", 0x5020, 0x4),
+                   sym("far", ".bss", 0x5024, 0x4)]             # after three of another unit's objects
+        entries = {"__sinit_x_cpp": entry("__sinit_x_cpp", "fn", refs=["base", "own", "far"]),
+                   "g": entry("g", "fn", refs=["base", "x1", "x2", "x3"])} | \
+                  {n: entry(n, "obj") for n in ("base", "o1", "own", "x1", "x2", "x3", "far")}
+        p = propose(symbols, entries, 0x1000, 0x1010)
+        self.assertEqual(p.sections[".bss"], (0x5000, 0x5018))
+        self.assertIn("far", p.extern_data)
+
+    def test_leading_weak_copy_an_earlier_unit_reaches_is_its(self):
+        symbols = [sym("e", ".text", 0x0F00, 0x10, "function"),     # earlier unit
+                   sym("f", ".text", 0x1000, 0x10, "function"),
+                   sym("vt_e", ".data", 0x1F00, 0x8),
+                   sym("vt", ".data", 0x2000, 0x8),
+                   sym("rtti_base", ".sdata", 0x3000, 0x8),          # weak copy, kept in the earlier unit
+                   sym("rtti", ".sdata", 0x3008, 0x8)]
+        entries = {"e": entry("e", "fn"), "f": entry("f", "fn"),
+                   "vt_e": entry("vt_e", "obj", refs=["e", "rtti_base"]),
+                   "vt": entry("vt", "obj", refs=["rtti", "f", "rtti_base"]),
+                   "rtti": entry("rtti", "obj"), "rtti_base": entry("rtti_base", "obj")}
+        p = propose(symbols, entries, 0x1000, 0x1010)
+        self.assertEqual(p.sections[".sdata"], (0x3008, 0x3010))
+
+
+class AsmIndexTest(unittest.TestCase):
+    def test_quoted_names(self):
+        import tempfile
+        from tools.dk.platforms.gc_mwcc.asmindex import index
+        text = (".fn f, global\n/* 0 */\tlis r3, \"@73\"@ha\n/* 4 */\taddi r3, r3, \"@73\"@l\n"
+                "/* 8 */\tbl \"g<1>__Fv\"\n.endfn f\n.obj \"@73\", local\n\t.4byte \"@etb_80000000\"\n.endobj \"@73\"\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "a.s"
+            path.write_text(text)
+            entries = index([path])
+        self.assertEqual(entries["f"].refs, ["@73"])
+        self.assertEqual(entries["f"].calls, ["g<1>__Fv"])
+        self.assertEqual(entries["@73"].refs, ["@etb_80000000"])
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -106,3 +212,16 @@ class TuBoundsTest(unittest.TestCase):
         entries = {n: AsmEntry(n, "fn", P("auto_03_x.s"), "", [], ["a"] if n == "z" else []) for n in "abz"}
         fns, out, inn = adjust_tu_bounds([f("a", 0), f("b", 0x10)], [], [f("z", 0x20)], entries)
         self.assertEqual((out, inn), ([], []))               # next unit has no __sinit first: nothing moves
+
+
+class LoneInitializerTest(unittest.TestCase):
+    def test_lone_initializer_joins_the_tu_before(self):
+        from pathlib import Path as P
+        from tools.dk.platforms.gc_mwcc.propose import lone_initializer
+        f = lambda n, a: Symbol(n, ".text", a, {"type": "function", "size": "10"})
+        e = lambda n, file: AsmEntry(n, "fn", P(file + ".s"), "", [], [])
+        entries = {"a": e("a", "game/unk/A"), "__sinit_x_cpp": e("__sinit_x_cpp", "game/unk/X"),
+                   "__sinit_a_cpp": e("__sinit_a_cpp", "auto_fn_a"), "b": e("b", "game/unk/B")}
+        self.assertTrue(lone_initializer([f("__sinit_x_cpp", 0x10)], [f("a", 0)], entries))
+        self.assertFalse(lone_initializer([f("__sinit_x_cpp", 0x10)], [f("a", 0), f("__sinit_a_cpp", 8)], entries))
+        self.assertFalse(lone_initializer([f("b", 0x10)], [f("a", 0)], entries))

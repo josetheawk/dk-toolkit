@@ -452,5 +452,113 @@ class ForceActiveTest(unittest.TestCase):
         self.assertEqual(dtkconfig.force_active_names(composed), ["mine", "other_unit_old"])
 
 
+class SharedTreeWaitTest(unittest.TestCase):
+    def test_only_other_units_compile_failures_count(self):
+        from tools.dk.platforms.gc_mwcc.freshness import others_broken
+        out = ("FAILED: [code=2] build/GH2E69/src/game/fe/SingleChallengeScreen.o\n"
+               "FAILED: build/GH2E69/src/game/fe/Mine.o\nFAILED: build/GH2E69/main.elf\n")
+        self.assertEqual(others_broken(out, {"build/GH2E69/src/game/fe/Mine.o"}),
+                         {"build/GH2E69/src/game/fe/SingleChallengeScreen.o"})
+        self.assertEqual(others_broken("FAILED: build/GH2E69/main.elf\n", set()), set())    # a link error is ours
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class VtableSlotTest(unittest.TestCase):
+    """An override declared in the wrong slot leaves the vtable's bytes equal (relocations are
+    zero bytes) but points two slots at other functions: check must say so."""
+
+    def fake(self, slots, defined, size=0x14):
+        from tools.dk.platforms.gc_mwcc.elf import ElfSection, ElfSymbol, Reloc
+
+        class Fake:
+            sections = (ElfSection(0, "", 0, 0, 0, 0, 0, b""), ElfSection(1, ".text", 1, 0, 0, 0, 0, b""),
+                        ElfSection(2, ".data", 1, 0, size, 0, 0, bytes(size)))
+            symbols = tuple([ElfSymbol("__vt__3Foo", 0, size, 1, 1, 2)] +
+                            [ElfSymbol(n, i * 4, 4, 2, 1, 1) for i, n in enumerate(defined)] +
+                            [ElfSymbol(n, 0, 0, 0, 1, 0) for _, n in slots if n not in defined])
+
+            def relocations(self, index):
+                return [Reloc(off, 1, n, 0) for off, n in slots] if index == 2 else []
+        return Fake()
+
+    def test_wrong_slot_and_tolerated_placeholders(self):
+        from tools.dk.platforms.gc_mwcc.matching import vtable_problems
+        target = self.fake([(0, "__RTTI__3Foo"), (8, "vf2__3FooFv"), (0xC, "vf3__3BarFv"), (0x10, "fn_80001000")],
+                           ["vf2__3FooFv"])
+        ours = self.fake([(0, "@12"), (8, "vf2__3BarFv"), (0xC, "vf3__3FooFv"), (0x10, "vf4__3BarFv")],
+                         ["vf3__3FooFv"])
+        self.assertEqual(vtable_problems(target, ours), [
+            "__vt__3Foo+0x8: target vf2__3FooFv, ours vf2__3BarFv",
+            "__vt__3Foo+0xC: target vf3__3BarFv, ours vf3__3FooFv"])
+        # slot 0 is RTTI (data); 0x10 an unnamed function elsewhere that ours cannot be checked against
+        ok = self.fake([(0, "@12"), (8, "vf2__3FooFv"), (0xC, "vf3__3BarFv"), (0x10, "vf4__3BarFv")], ["vf2__3FooFv"])
+        self.assertEqual(vtable_problems(target, ok), [])
+
+
+class RelocationEquivalenceTest(unittest.TestCase):
+    """Our `.data.0+0x8` (or an `@12` literal) and dtk's `lbl_...` at the same offset of the same
+    section, with the same bytes there, link to the same instruction."""
+
+    def elf(self, data, symbols):
+        from tools.dk.platforms.gc_mwcc.elf import ElfSection, ElfSymbol
+
+        class Fake:
+            sections = (ElfSection(0, "", 0, 0, 0, 0, 0, b""), ElfSection(1, ".text", 1, 0, 8, 0, 0, bytes(8)),
+                        ElfSection(2, ".sdata2", 1, 0, len(data), 0, 0, data))
+            def section(self, name):
+                return next((s for s in self.sections if s.name == name), None)
+
+            def relocations(self, index):
+                return []
+        f = Fake()
+        f.symbols = tuple(ElfSymbol(n, v, sz, 1, 0, 2) for n, v, sz in symbols)
+        return f
+
+    def test_same_offset_and_bytes_is_equivalent(self):
+        from tools.dk.platforms.gc_mwcc.elf import Function, Reloc
+        from tools.dk.platforms.gc_mwcc.matching import relocation_difference
+        code = bytes.fromhex("c0220000") + bytes.fromhex("4e800020")         # lfs f1, x@sda21(r2); blr
+        floats = bytes.fromhex("3f800000" "40000000")
+        target = self.elf(floats, [("lbl_80390000", 0, 4), ("lbl_80390004", 4, 4)])
+        theirs = Function("f", ".text", code, [Reloc(0, 109, "lbl_80390004", 0, ".sdata2", 4)])
+        same = Function("f", ".text", code, [Reloc(0, 109, "@12", 0, ".sdata2", 4)])
+        self.assertIsNone(relocation_difference(target, self.elf(floats, [("@12", 4, 4)]), theirs, same))
+        moved = Function("f", ".text", code, [Reloc(0, 109, "@12", 0, ".sdata2", 0)])
+        self.assertIn("target's order", relocation_difference(target, self.elf(floats, [("@12", 0, 4)]), theirs, moved))
+        other = self.elf(bytes.fromhex("3f800000" "40400000"), [("@12", 4, 4)])
+        self.assertIn("different bytes", relocation_difference(target, other, theirs, same))
+        table = self.elf(floats, [("@12", 4, 4)])
+        table.relocations = lambda index: [Reloc(4, 1, ".text", 0x40, ".text", 0)] if index == 2 else []
+        self.assertIn("its pointers differ", relocation_difference(target, table, theirs, same))   # a jump table's labels
+        register = Function("f", ".text", bytes.fromhex("c0420000") + code[4:], same.relocs)   # lfs f2
+        self.assertEqual(relocation_difference(target, self.elf(floats, [("@12", 4, 4)]), theirs, register), "")
+
+    def test_notes_say_what_to_change(self):
+        from tools.dk.platforms.gc_mwcc.elf import Function, Reloc
+        from tools.dk.platforms.gc_mwcc.matching import relocation_difference
+        call = bytes.fromhex("48000001") + bytes.fromhex("4e800020")         # bl x; blr
+        target = self.elf(b"", [])
+        member = Function("f", ".text", call, [Reloc(0, 10, "Run__3FooFv", 0)])
+        c_name = Function("f", ".text", call, [Reloc(0, 10, "fn_80001000", 0)])
+        note = relocation_difference(target, target, member, c_name, {0x80001000: "Run__3FooFv"}.get)
+        self.assertIn("still uses the C name fn_80001000", note)
+        load = bytes.fromhex("c0220000") + bytes.fromhex("4e800020")
+        outside = Function("f", ".text", load, [Reloc(0, 109, "lbl_80390004", 0)])        # undefined in the target
+        ours = Function("f", ".text", load, [Reloc(0, 109, "@12", 0, ".sdata2", 0)])
+        self.assertIn("outside this unit's split", relocation_difference(target, self.elf(bytes(4), [("@12", 0, 4)]), outside, ours))
+
+
+class NearLinkTest(unittest.TestCase):
+    def test_lists_units_close_to_exact_with_reasons(self):
+        from tools.dk.platforms.gc_mwcc.matchcmds import near_rows
+        units = [{"name": "main/a", "metadata": {}}, {"name": "main/b", "metadata": {}},
+                 {"name": "main/linked", "metadata": {"complete": True}}]
+        a = UnitScore("main/a", [FunctionScore("f", 0x10, 100.0), FunctionScore("g", 0x20, 99.5, "+0x4: literal order")])
+        b = UnitScore("main/b", [FunctionScore(n, 4, 50.0) for n in "wxyz"])          # four open: not near
+        rows = near_rows(units, {"main/a": a, "main/b": b, "main/linked": a})
+        self.assertEqual(rows[0], "near link (1 WIP unit(s) at most 3 function(s) from exact):")
+        self.assertIn("main/a: 1 function(s) open, 0x20 bytes", rows[1])
+        self.assertIn("g 99.50%: +0x4: literal order", rows[2])

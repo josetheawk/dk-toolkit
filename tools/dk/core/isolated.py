@@ -10,6 +10,7 @@ commit_overlay()  writes the overlay with git plumbing through a private index, 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -20,9 +21,31 @@ from pathlib import Path
 
 from .config import Config
 from .gitops import git
-from .util import kill_session, tail
+from .util import kill_session, released, tail
 
 Overlay = dict[str, "bytes | None"]   # path -> new content (None = delete)
+
+# The commit a verify ran against. Verifies build without the project lock, so a commit lands
+# only on that same HEAD; when another commit got in first, the caller recomposes and retries.
+_pinned: str | None = None
+_unlocked = True
+MOVED = "HEAD moved concurrently; retry"
+UNLOCKED_TRIES = 2   # then verify holding the lock: commits take it too, so HEAD cannot move
+
+
+def pin_head(cfg: Config, attempt: int = 0) -> str:
+    """Pin HEAD for attempt `attempt` of a verify-and-commit. Early attempts build without the
+    project lock (other agents keep committing); a later one keeps it, so it always lands."""
+    global _pinned, _unlocked
+    _pinned = git(cfg.root, "rev-parse", "HEAD").stdout.strip()
+    _unlocked = attempt < UNLOCKED_TRIES
+    return _pinned
+
+
+def show(cfg: Config, rel: str) -> bytes | None:
+    """`rel` at the pinned commit (HEAD if none is pinned), or None if it does not exist there."""
+    proc = subprocess.run(["git", "show", f"{_pinned or 'HEAD'}:{rel}"], cwd=cfg.root, capture_output=True)
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def _worktree(cfg: Config, name: str) -> Path:
@@ -30,7 +53,7 @@ def _worktree(cfg: Config, name: str) -> Path:
     subprocess.run(["git", "worktree", "remove", "--force", str(tree)], cwd=cfg.root, capture_output=True)
     shutil.rmtree(tree, ignore_errors=True)
     subprocess.run(["git", "worktree", "prune"], cwd=cfg.root, capture_output=True)
-    proc = subprocess.run(["git", "worktree", "add", "--detach", str(tree), "HEAD"], cwd=cfg.root,
+    proc = subprocess.run(["git", "worktree", "add", "--detach", str(tree), _pinned or "HEAD"], cwd=cfg.root,
                           capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip())
@@ -43,9 +66,9 @@ def _drop(cfg: Config, tree: Path) -> None:
 
 
 def verify_overlay(cfg: Config, overlay: Overlay, timeout: int = 900, keep: bool = False,
-                   name: str = "verify", measures: dict | None = None) -> tuple[bool, str]:
+                   name: str = "", measures: dict | None = None) -> tuple[bool, str]:
     """`measures`, when given, receives the clean tree's progress measures (what would be committed)."""
-    tree = _worktree(cfg, name)
+    tree = _worktree(cfg, name or f"verify-{os.getpid()}")
     try:
         for rel, data in overlay.items():
             dest = tree / rel
@@ -72,12 +95,19 @@ def verify_overlay(cfg: Config, overlay: Overlay, timeout: int = 900, keep: bool
             p = subprocess.Popen(step, cwd=tree, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  start_new_session=True)
             try:
-                out, _ = p.communicate(timeout=timeout)
+                with released() if _unlocked else contextlib.nullcontext():   # minutes; nothing shared
+                    out, _ = p.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 kill_session(p.pid)
                 return False, f"timeout after {timeout}s in {' '.join(step)}"
             if p.returncode != 0:
-                return False, tail(out, 30)
+                noise = ("FORCEACTIVE", "Usage Warning", "Specified directory", "doesn't exist")
+                lines = [l for l in out.splitlines() if not any(n in l for n in noise)]
+                # the failing edge and its errors first: warnings often fill the tail
+                key = [i for i, l in enumerate(lines) if l.startswith("FAILED:") or "Error:" in l or "rror   :" in l]
+                picked = sorted({j for i in key for j in range(max(0, i - 3), min(len(lines), i + 4))})
+                head = "\n".join(lines[j] for j in picked[:60])
+                return False, (head + "\n...\n" if head else "") + tail("\n".join(lines), 10)
         report = tree / cfg.rel(cfg.report)
         if measures is not None and report.is_file():
             measures.update(json.loads(report.read_text()).get("measures", {}))
@@ -90,6 +120,8 @@ def verify_overlay(cfg: Config, overlay: Overlay, timeout: int = 900, keep: bool
 def commit_overlay(cfg: Config, overlay: Overlay, message: str) -> tuple[bool, str]:
     """Commit exactly HEAD + overlay. Never touches the shared index except to sync those paths."""
     head = git(cfg.root, "rev-parse", "HEAD").stdout.strip()
+    if _pinned and head != _pinned:
+        return False, MOVED
     with tempfile.TemporaryDirectory() as tmp:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
 
@@ -111,7 +143,7 @@ def commit_overlay(cfg: Config, overlay: Overlay, message: str) -> tuple[bool, s
             return False, "nothing to commit"
         commit = g("commit-tree", tree, "-p", head, data=message.encode()).stdout.decode().strip()
         if not commit or g("update-ref", "HEAD", commit, head).returncode != 0:
-            return False, "HEAD moved concurrently; retry"
+            return False, MOVED
     git(cfg.root, "reset", "-q", "--", *sorted(overlay))      # shared index := new HEAD for these paths
     return True, f"{commit[:9]} ({len(overlay)} file(s))"
 

@@ -22,8 +22,8 @@ def _matched_functions(cfg: Config) -> int:
     return int(report.get("measures", {}).get("matched_functions", 0) or 0)
 
 
-def _build(cfg: Config) -> tuple[bool, str]:
-    proc = fresh.build(cfg)
+def _build(cfg: Config, own: tuple[str, ...] = ()) -> tuple[bool, str]:
+    proc = fresh.build(cfg, fresh.hash_target(cfg), own=own)
     return proc.returncode == 0, proc.stdout + proc.stderr
 
 
@@ -60,7 +60,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     set_status(units, rel_source, "Matching")
     units_path.write_text(render_units_file(units))
 
-    ok, output = _build(cfg)
+    ok, output = _build(cfg, (unit["base_path"],))
     after = _matched_functions(cfg)
     # The shared tree also holds other agents' half-edited units, so its numbers only warn;
     # the floor is enforced on the clean HEAD + this unit build that the commit is made from.
@@ -74,6 +74,11 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
             print("first differences in the linked binary:")
             for line in first_diff(cfg, cfg.built, cfg.original, 6):
                 print(f"  {line}")
+        if s.functions and all(f.name.startswith("__sinit") for f in s.functions):
+            print("hint: this unit's only code is a static initializer; nothing references it, so the linker "
+                  "drops the whole object (.ctors entry included). If the TU before it has no initializer, it "
+                  f"is that TU's tail (./dk unit propose {s.functions[0].name} prints the merged unit); "
+                  "otherwise keep it with `#pragma force_active on` after the includes")
         return _restore(cfg, units_path, original_units, "hash mismatch or build error after linking")
     print(f"ACCEPTED: {unit['name']} linked, hash OK, matched functions {before} -> {after}")
 

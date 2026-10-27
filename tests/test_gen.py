@@ -229,6 +229,33 @@ VCALL = """
 """
 
 
+class ConditionalReturnTest(unittest.TestCase):
+    def test_a_conditional_return_is_an_early_return(self):
+        asm = """
+/* 8001C974 00000000  88 03 00 11 */\tlbz r0, 0x11(r3)
+/* 8001C978 00000000  28 00 00 00 */\tcmplwi r0, 0x0
+/* 8001C97C 00000000  4C 82 00 20 */\tbnelr
+/* 8001C980 00000000  38 00 00 FF */\tli r0, 0xff
+/* 8001C984 00000000  98 03 06 28 */\tstb r0, 0x628(r3)
+/* 8001C988 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, True)
+        src, _ = gen.render_tu(lifted, True, "C", "f", [gen.Variant((), "void")], {}, display=True)
+        self.assertIn("void C::f() {\n    if (m11 == 0) {\n        m628 = 255;\n    }\n}", src)
+
+    def test_a_constructor_is_written_as_one(self):
+        asm = """
+/* 80000000 00000000  38 00 00 00 */\tli r0, 0x0
+/* 80000004 00000000  90 03 00 04 */\tstw r0, 0x4(r3)
+/* 80000008 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, True)
+        void = [v for v in gen.variants(lifted) if v.ret_mode == "void"][:1]
+        src, _ = gen.render_tu(lifted, True, "Pos", "__ct", void, {}, standalone=True)
+        self.assertIn("    Pos();\n", src)
+        self.assertIn("Pos::Pos() {\n    m4 = 0;\n}", src)
+
+
 class VirtualCallTest(unittest.TestCase):
     def test_slot_and_vptr_position(self):
         lifted = gen.lift(gen.parse(VCALL), no_literals, True)
@@ -263,6 +290,20 @@ class CxxCallTest(unittest.TestCase):
         self.assertIn("struct EAGL { struct SymbolPool; };", src)
         self.assertIn("    void fn_80151EEC(const char*, void*);", src)
         self.assertIn("void Owner::f(const char* arg1, void* arg2) {\n    m14->fn_80151EEC(arg1, arg2);\n}", src)
+
+    def test_inherited_method_called_on_this_is_a_member_of_the_derived_class(self):
+        asm = MEMBER_CALL.replace("\tlwz r3, 0x14(r3)", "\tstw r4, 0x8(r3)").replace("Q24EAGL10SymbolPoolFPCcPv", "4BaseFv")
+        lifted = gen.lift(gen.parse(asm), no_literals, True)
+        src, notes = gen.render_tu(lifted, True, "Base", "f", gen.variants(lifted)[:1], {}, standalone=True,
+                                   chain=["Base", "Mid", "Leaf"])
+        self.assertIn("struct Base {\n    char _pad0[0x8];\n    int m8;\n    void fn_80151EEC();\n};", src)
+        self.assertIn("struct Mid : Base {\n};\nstruct Leaf : Mid {\n    void f(int arg1);\n};", src)
+        self.assertIn("void Leaf::f(int arg1) {\n    m8 = arg1;\n    Base::fn_80151EEC();\n}", src)
+        self.assertTrue(any(n.startswith("class chain (RTTI, root last): Leaf : Mid : Base") for n in notes))
+
+    def test_a_slot_called_by_name_is_one_virtual_declaration(self):
+        members = ["virtual void vf0();", "virtual void vf1();", "float vf1(int);", "void fn_1();"]
+        self.assertEqual(gen._fold_called_slots(members), ["virtual void vf0();", "virtual float vf1(int);", "void fn_1();"])
 
 
 I2F = """
@@ -351,6 +392,90 @@ class MergedValueTest(unittest.TestCase):
         self.assertIn("int m1;\n    if (arg1 != 0) {\n        m1 = 1;\n    } else {\n        m1 = 2;\n    }\n    m8 = m1;", src)
 
 
+    def test_a_merged_return_value_is_returned_in_each_arm(self):
+        asm = """
+/* 80000000 00000000  80 63 00 6C */\tlwz r3, 0x6c(r3)
+/* 80000004 00000000  28 03 00 00 */\tcmplwi r3, 0x0
+/* 80000008 00000000  41 82 00 0C */\tbeq .L_80000014
+/* 8000000C 00000000  48 00 00 01 */\tbl fn_80001000
+/* 80000010 00000000  48 00 00 08 */\tb .L_80000018
+.L_80000014:
+/* 80000014 00000000  38 60 00 00 */\tli r3, 0x0
+.L_80000018:
+/* 80000018 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, True, lambda name: (1, 0))
+        sink = [v for v in gen.variants(lifted) if v.sink]
+        self.assertTrue(sink)
+        src, _ = gen.render_tu(lifted, True, "C", "f", sink[:1], {}, display=True)
+        self.assertIn("    if (m6C != 0) {\n        return fn_80001000(m6C);\n    }\n    return 0;\n}", src)
+
+
+class CallArgumentTest(unittest.TestCase):
+    def test_varargs_call_takes_the_registers_written_before_it(self):
+        asm = """
+/* 80000000 00000000  38 80 00 05 */\tli r4, 0x5
+/* 80000004 00000000  4C C6 31 82 */\tcrclr cr1eq
+/* 80000008 00000000  48 00 00 01 */\tbl printf
+/* 8000000C 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, False, lambda name: (8, 8))
+        src, _ = gen.render_tu(lifted, False, "G", "f", [gen.Variant((), "void")], {}, display=True)
+        self.assertIn('extern "C" void printf(int, ...);', src)
+        self.assertIn("    printf(arg0, 5);", src)
+
+    def test_a_locals_address_in_a_later_register_is_an_argument(self):
+        asm = """
+/* 80000000 00000000  94 21 FF E0 */\tstwu r1, -0x20(r1)
+/* 80000004 00000000  7C 08 02 A6 */\tmflr r0
+/* 80000008 00000000  90 01 00 24 */\tstw r0, 0x24(r1)
+/* 8000000C 00000000  38 81 00 08 */\taddi r4, r1, 0x8
+/* 80000010 00000000  48 00 00 01 */\tbl fn_80001000
+/* 80000014 00000000  80 01 00 24 */\tlwz r0, 0x24(r1)
+/* 80000018 00000000  7C 08 03 A6 */\tmtlr r0
+/* 8000001C 00000000  38 21 00 20 */\taddi r1, r1, 0x20
+/* 80000020 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, False, lambda name: (1, 0))
+        self.assertEqual(len(lifted.calls[0].args), 2)
+
+    def test_registers_set_for_a_call_and_read_by_nothing_else_are_arguments(self):
+        asm = """
+/* 80000000 00000000  38 A0 00 05 */\tli r5, 0x5
+/* 80000004 00000000  90 A3 00 08 */\tstw r5, 0x8(r3)
+/* 80000008 00000000  38 80 00 07 */\tli r4, 0x7
+/* 8000000C 00000000  48 00 00 01 */\tbl fn_80001000
+/* 80000010 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, False, lambda name: (0, 0))
+        self.assertEqual(len(lifted.calls[0].args), 2)     # r3, r4 (r5 was read by the store)
+
+    def test_other_callers_show_a_passed_on_parameter(self):
+        asm = """
+/* 80000000 00000000  38 60 00 05 */\tli r3, 0x5
+/* 80000004 00000000  48 00 00 01 */\tbl fn_80001000
+/* 80000008 00000000  4E 80 00 20 */\tblr
+"""
+        sig, callers = lambda name: (1, 0), lambda name: (2, 0)
+        known = gen.lift(gen.parse(asm), no_literals, False, sig, callers=callers, params=(2, 0))
+        self.assertEqual(len(known.calls[0].args), 2)                # r4: this function's own parameter
+        self.assertTrue(known.caller_evidence and known.review)
+        src, _ = gen.render_tu(known, False, "G", "f", [gen.Variant((), "void")], {}, display=True)
+        self.assertIn("    // REVIEW: fn_80001000 takes 2 int", src)
+        unknown = gen.lift(gen.parse(asm), no_literals, False, sig, callers=callers, params=(0, 0))
+        self.assertEqual(len(unknown.calls[0].args), 1)              # r4 holds nothing of this function's
+
+    def test_a_result_used_once_by_the_next_call_is_nested(self):
+        asm = """
+/* 80000000 00000000  48 00 00 01 */\tbl fn_80001000
+/* 80000004 00000000  48 00 00 01 */\tbl fn_80002000
+/* 80000008 00000000  4E 80 00 20 */\tblr
+"""
+        lifted = gen.lift(gen.parse(asm), no_literals, False, lambda name: (0, 0) if name == "fn_80001000" else (1, 0))
+        nest = [v for v in gen.variants(lifted) if v.nest and v.ret_mode == "void"]
+        src, _ = gen.render_tu(lifted, False, "G", "f", nest[:1], {}, display=True)
+        self.assertIn("    fn_80002000(fn_80001000());\n}", src)
+
 class FloatCompareTest(unittest.TestCase):
     def _body(self, asm):
         lifted = gen.lift(gen.parse(asm), no_literals)
@@ -395,6 +520,23 @@ class FrameTest(unittest.TestCase):
                "/* 80000034 00000000  4E 80 00 20 */\tblr\n")
         body = gen.strip_frame(gen.parse(asm))
         self.assertEqual([i.op for i in body], ["mr", "bl", "mr", "blr"])
+
+    def test_a_struct_local_can_be_sized_by_its_fields(self):
+        asm = ("/* 80000000 00000000  94 21 FF E0 */\tstwu r1, -0x20(r1)\n"
+               "/* 80000004 00000000  7C 08 02 A6 */\tmflr r0\n"
+               "/* 80000008 00000000  90 01 00 24 */\tstw r0, 0x24(r1)\n"
+               "/* 8000000C 00000000  C0 03 00 00 */\tlfs f0, 0x0(r3)\n"
+               "/* 80000010 00000000  D0 01 00 08 */\tstfs f0, 0x8(r1)\n"
+               "/* 80000014 00000000  D0 01 00 10 */\tstfs f0, 0x10(r1)\n"
+               "/* 80000018 00000000  38 61 00 08 */\taddi r3, r1, 0x8\n"
+               "/* 8000001C 00000000  48 00 00 01 */\tbl fn_80001000\n"
+               "/* 80000020 00000000  80 01 00 24 */\tlwz r0, 0x24(r1)\n"
+               "/* 80000024 00000000  7C 08 03 A6 */\tmtlr r0\n"
+               "/* 80000028 00000000  38 21 00 20 */\taddi r1, r1, 0x20\n"
+               "/* 8000002C 00000000  4E 80 00 20 */\tblr\n")
+        lifted = gen.lift(gen.parse(asm), no_literals, False, lambda name: (1, 0))
+        self.assertEqual(lifted.locals, {8: 0x18})                    # up to the frame's save area
+        self.assertEqual(gen.tight_locals(lifted), {8: 0xC})          # m0 .. m8 + 4
 
 
 class CompoundConditionTest(unittest.TestCase):

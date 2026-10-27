@@ -4,6 +4,7 @@
     first_diff(cfg, built, original, limit) -> list[str]
                                           human summary of where two binaries differ
     prebuild(cfg)                         optional: called before `dk build` runs ninja
+    declared_sources(cfg, read) -> set    optional: source paths the unit list declares (`dk rm` keeps them)
 """
 
 from __future__ import annotations

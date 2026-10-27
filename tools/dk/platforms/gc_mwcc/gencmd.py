@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,9 +27,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ...core.command import MISMATCH, OK, USAGE, Command, hint
+from ...core.command import BUILD_ERROR, MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
-from . import asmgen, asmindex, classgen, gen
+from . import asmgen, asmindex, classgen, gen, genmerge
 from .ctxcmd import class_slots
 from .dol import Dol
 from .dtk_symbols import is_auto_name, read_symbols, read_units
@@ -49,6 +50,11 @@ class Result:
     notes: list[str] = field(default_factory=list)
     compiler: str = ""
     closest: str = ""           # differs: how far the closest variant matched
+    standalone: str = ""        # exact: a self-contained TU under the function's own names (--write)
+    symbol: str = ""            # the standalone TU's symbol for the function, when known
+    renames: dict = field(default_factory=dict)     # applied when comparing (class drafts)
+    caller_evidence: bool = False                   # a call took more arguments from other callers' setup
+    alternatives: list = field(default_factory=list)    # standalone TUs of the other exact variants
 
 
 class Context:
@@ -68,12 +74,15 @@ class Context:
         settings = opts.get("gen", {})
         self.code_end = int(settings.get("code_end", 0))
         self.template = settings.get("template")
+        # library ranges built with a known linked unit's flags: [(start, end, unit)]
+        self.templates = [(int(t["start"]), int(t["end"]), t["unit"]) for t in settings.get("templates", [])]
         self._commands: dict[str, str] = {}
         self._command_lock = threading.Lock()      # compile_command runs ninja under a process lock
         self._signatures: dict[str, tuple[int, int] | None] = {}
         self._signature_lock = threading.RLock()
         self.max_insns = MAX_INSNS
         self._callers: dict | None = None
+        self._caller_args: dict = {}
         rtti = cfg.root / "build" / "dk" / "rtti.json"
         self.class_records = json.loads(rtti.read_text()) if rtti.is_file() else []
         self.classes = {c["name"]: c for c in self.class_records}
@@ -91,6 +100,22 @@ class Context:
             target = self.by_address.get(vt["slots"][slot])
             return self.signature(target.name) if target else None
         return sig
+
+    def base_path(self, derived: str, base: str) -> list[str] | None:
+        """[base, ..., derived]: `derived`'s classes from `base` on, along the bases RTTI records
+        at offset 0 (so `this` passes unchanged), or None when `base` is not one of them. The
+        classes in between come only from a provable single chain, else [base, derived]."""
+        by_rtti = {c["rtti"]: c["name"] for c in self.class_records}
+        zero = lambda name: [by_rtti.get(b) for b, off in self.classes[name]["bases"] if off == 0] \
+            if name in self.classes else None
+        mine = zero(derived)
+        if not mine or base not in mine or None in mine:
+            return None
+        # a single chain: the i-th class (root first) has exactly the i classes before it as bases
+        chain = sorted(mine, key=lambda n: len(zero(n) or ()))
+        if any(set(zero(n) or ()) != set(chain[:i]) for i, n in enumerate(chain)):
+            return [base, derived]
+        return chain[chain.index(base):] + [derived]
 
     def signature(self, name: str, depth: int = 0) -> tuple[int, int] | None:
         """A function's (GPR, FPR) parameter counts, inferred from its own asm. Serialised:
@@ -129,14 +154,32 @@ class Context:
                 self._build_callers()
         return self._result_used(name)
 
+    def caller_args(self, name: str) -> tuple[int, int] | None:
+        """The most (GPR, FPR) argument registers any direct call to `name` sets up: written
+        on the path into the bl and read by nothing first (varargs calls aside)."""
+        with self._signature_lock:
+            if self._callers is None:
+                self._build_callers()
+        return self._caller_args.get(name)
+
     def _build_callers(self) -> None:
         callers: dict = {}
+        args: dict = {}
         for entry in self.entries.values():
             insns = gen.parse(entry.text)
+            targets = None
             for i, insn in enumerate(insns):
-                if insn.op == "bl" and insn.args:
+                if insn.op not in ("bl", "b") or not insn.args or insn.args[0].startswith(".L"):
+                    continue
+                if insn.op == "bl":
                     callers.setdefault(insn.args[0], []).append(insns[i + 1:])
-        self._callers = callers
+                if i and insns[i - 1].op in ("crclr", "crset"):
+                    continue                            # varargs: each call passes its own count
+                targets = targets if targets is not None else {t for t in map(gen._target, insns) if t is not None}
+                g, f = gen.set_before(insns, i, "r", targets) - 2, gen.set_before(insns, i, "f", targets)
+                old = args.get(insn.args[0], (0, 0))
+                args[insn.args[0]] = (max(old[0], g), max(old[1], f))
+        self._callers, self._caller_args = callers, args
 
     def _result_used(self, name: str) -> bool | None:
         sites = self._callers.get(name)
@@ -159,13 +202,18 @@ class Context:
         u = self.objdiff.get(unit or "")
         return bool(u and u["metadata"].get("complete"))
 
+    def template_for(self, address: int) -> str | None:
+        """The linked unit whose compile command verifies an undeclared function here."""
+        ranged = next((u for a, b, u in self.templates if a <= address < b), None)
+        return ranged or (self.template if address < self.code_end else None)
+
     def command(self, address: int) -> tuple[str | None, str]:
         """(compile command, why not) for a function at `address`."""
         unit = self.unit_of(address)
         if unit is None:
-            if not self.template or address >= self.code_end:
+            unit = self.template_for(address)
+            if unit is None:
                 return None, "library code outside a declared unit (use the reference decomps)"
-            unit = self.template
         if not unit.endswith((".cpp", ".cp")):
             return None, f"{unit} is C (drafts are C++)"
         with self._command_lock:
@@ -201,18 +249,51 @@ def _display_names(ctx: Context, name: str, address: int) -> tuple[str, str, boo
     return f"Unk{address:08X}", name, False
 
 
-def _compile(ctx: Context, command: str, source: str, work: Path, stem: str) -> tuple[Elf | None, str]:
+def _own_params(ctx: Context, name: str) -> tuple[int, int] | None:
+    """(GPR, FPR) parameters a function has: from its mangled name (with `this`), else the
+    most its direct callers pass, else None."""
+    from .demangle import demangle
+    fn = demangle(name) if "__" in name.lstrip("_") else None
+    if fn is not None and not any(t.reg == "none" for t in fn.params):
+        gpr = sum(t.reg == "gpr" for t in fn.params) + bool(fn.quals)
+        return gpr, sum(t.reg == "fpr" for t in fn.params)
+    return ctx.caller_args(name)
+
+
+def _compile(ctx: Context, command: str, source: str, work: Path, stem: str, include_dir: Path | None = None,
+             preprocess: bool = False, overlay: Path | None = None) -> tuple[Elf | str | None, str]:
+    """(object, "") or (None, the first error). `include_dir`: where the real source sits (its
+    quoted includes); `preprocess`: (the preprocessed text, "") instead of an object."""
     src = work / f"{stem}.cpp"
     src.write_text(source)
     args = retarget(command, work)
     i = args.index("-c")
     args[i + 1] = str(src)
+    if include_dir is not None:
+        args[i:i] = ["-i", str(include_dir)]
+        i += 2
+    if overlay is not None and overlay.is_dir():        # searched before every other include path
+        first = args.index("-i")
+        args[first:first] = ["-i", str(overlay)]
+        i += 2
+    if preprocess:
+        args[i] = "-E"
+        proc = subprocess.run(args, cwd=ctx.cfg.root, capture_output=True, text=True, timeout=60)
+        return (proc.stdout, "") if proc.returncode == 0 else (None, (proc.stdout + proc.stderr).strip()[-300:])
     proc = subprocess.run(args, cwd=ctx.cfg.root, capture_output=True, text=True, timeout=60)
     obj = work / f"{stem}.o"
     if proc.returncode != 0 or not obj.is_file():
         text = [l for l in (proc.stdout + proc.stderr).splitlines()
                 if l.strip() and "Usage Warning" not in l and "Specified directory" not in l]
-        return None, next((l.strip() for l in text if "rror" in l), text[-1].strip() if text else "compile failed")
+        # mwcc: "#   Error:   ^" under the source line, then the message on the next line
+        at = next((i for i, l in enumerate(text) if "rror" in l), None)
+        if at is None:
+            return None, text[-1].strip() if text else "compile failed"
+        message = ""
+        if text[at].rstrip().endswith("^"):                 # the message, and its continuation line
+            more = [l.lstrip("# ").strip() for l in text[at + 1:at + 3] if l.startswith("#   ") and not l.startswith("#    ")]
+            message = " ".join(more[:1] + [m for m in more[1:2] if not re.match(r"\d+:", m)])
+        return None, f"{text[at].strip().rstrip('^ ')} {message}".strip()
     return Elf.parse(obj.read_bytes()), ""
 
 
@@ -255,14 +336,49 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
         return result
     if draft is not None:
         return _verify_class_draft(ctx, command, insns, draft, work, result)
+    first = _solve_lifted(ctx, name, sym, insns, command, work, Result(name, sym.address, "unsupported"), ctx.caller_args)
+    if first.status == "exact":
+        return first
+    if first.caller_evidence:
+        # other callers' argument registers made this call longer: the shorter reading may match
+        second = _solve_lifted(ctx, name, sym, insns, command, work, Result(name, sym.address, "unsupported"), None)
+        if second.status == "exact":
+            return second
+    if first.status == "differs" and "(stwu)" in first.detail:
+        # the frame size differs: the struct locals may be smaller than the space they span
+        tight = _solve_lifted(ctx, name, sym, insns, command, work, Result(name, sym.address, "unsupported"),
+                              ctx.caller_args, tight=True)
+        if tight.status == "exact":
+            return tight
+    return first
+
+
+def _solve_lifted(ctx: Context, name: str, sym, insns, command: str, work: Path, result: Result, callers,
+                  tight: bool = False) -> Result:
+    """The lifted (not class-model) draft of one function, verified; `callers` gives other
+    call sites' argument counts (None: only this function's own evidence); `tight`: struct
+    locals as small as their fields."""
     this_type, method, known_class = _display_names(ctx, name, sym.address)
+    if method == "__dt":
+        result.detail = "a destructor without a vtable (member destructors need the class model)"
+        return result
     try:
-        lifted = gen.lift(insns, ctx.literal, known_class, ctx.signature, ctx.vsignature(this_type if known_class else None))
+        lifted = gen.lift(insns, ctx.literal, known_class, ctx.signature, ctx.vsignature(this_type if known_class else None),
+                          callers=callers, params=_own_params(ctx, name))
+        result.caller_evidence = lifted.caller_evidence
+        if tight:
+            sized = gen.tight_locals(lifted)
+            if sized == lifted.locals:
+                raise gen.Unsupported("no smaller local layout")
+            lifted.locals = sized
         member = gen.Param("r3") in lifted.nodes or (known_class and "r3" not in lifted.int_params)
         # a member call on this names this's class: the scratch class must carry that name
         this_q = lifted.bound.get(("this",)) or lifted.bound.get(gen.Param("r3"))
+        chain = None                              # [base, ..., this_type]: inherited methods called on this
         if this_q and known_class and "::".join(this_q) != this_type:
-            raise gen.Unsupported(f"calls {'::'.join(this_q)} methods on this ({this_type})")
+            chain = ctx.base_path(this_type, "::".join(this_q))
+            if chain is None:
+                raise gen.Unsupported(f"calls {'::'.join(this_q)} methods on this ({this_type})")
         if this_q:
             this_type, member = "::".join(this_q), True
         verify_type = this_type if this_q else "G"
@@ -274,13 +390,13 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
         chosen, first_error = [], None
         for v in gen.variants(lifted):
             try:
-                gen.render_tu(lifted, member, verify_type, "v", [v], sizes)
+                gen.render_tu(lifted, member, verify_type, "v", [v], sizes, chain=chain)
                 chosen.append(v)
             except gen.Unsupported as e:
                 first_error = first_error or e
         if not chosen:
             raise first_error or gen.Unsupported("no variant can be written")
-        source, _ = gen.render_tu(lifted, member, verify_type, "v", chosen, sizes)
+        source, _ = gen.render_tu(lifted, member, verify_type, "v", chosen, sizes, chain=chain)
     except gen.Unsupported as e:
         result.detail = str(e)
         return result
@@ -293,7 +409,7 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
         objects = []
         for i, v in enumerate(chosen):
             try:
-                one, _ = gen.render_tu(lifted, member, verify_type, "v", [v], sizes)
+                one, _ = gen.render_tu(lifted, member, verify_type, "v", [v], sizes, chain=chain)
             except gen.Unsupported:
                 objects.append(None)
                 continue
@@ -313,18 +429,46 @@ def solve(ctx: Context, name: str, work: Path) -> Result:
             best = (matched, v, diff)
         if diff is None:
             try:
-                result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [v], sizes, display=True)
+                result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [v], sizes, display=True, chain=chain)
             except gen.Unsupported as e:
-                result.status, result.detail = "error", f"generator bug (display): {e}"
+                result.status, result.detail = ("unsupported", str(e)) if method == "__ct" else \
+                    ("error", f"generator bug (display): {e}")
                 return result
+            try:
+                result.standalone, _ = gen.render_tu(lifted, member, this_type, method, [v], sizes, standalone=True, chain=chain)
+            except gen.Unsupported:
+                pass                            # --write leaves it out
+            if method == "__ct":                 # verify the constructor form under its own symbol
+                obj_c, error = _compile(ctx, command, result.standalone, work, f"k{sym.address:08X}")
+                diff_c = error if obj_c is None else \
+                    gen.compare(insns, obj_c, name, ctx.literal, literal_info=ctx.literal_info)
+                if diff_c is not None:
+                    result.status, result.detail = "differs", f"exact only as a plain function; as a constructor: {diff_c}"
+                    return result
             result.status = "exact"
             result.notes += lifted.notes
+            # the other exact variants (another return type, statement order...): --merge falls
+            # back on them when the unit's headers declare the function differently
+            for j in range(i + 1, len(chosen)):
+                obj_j = objects[j]
+                if obj_j is None:
+                    continue
+                index = j if len(set(map(id, objects))) == 1 else 0
+                sym_j = next((f for f in obj_j.functions() if re.match(rf"^v{index}(?:__|$)", f)), f"v{index}")
+                if gen.compare(insns, obj_j, sym_j, ctx.literal, literal_info=ctx.literal_info) is None:
+                    try:
+                        alt, _ = gen.render_tu(lifted, member, this_type, method, [chosen[j]], sizes, standalone=True,
+                                               chain=chain)
+                    except gen.Unsupported:
+                        continue
+                    if alt != result.standalone and alt not in result.alternatives:
+                        result.alternatives.append(alt)
             return result
         first_diff = first_diff or diff
     result.status, result.detail = "differs", f"no variant matched ({len(chosen)} tried): {first_diff}"
     if best[1] is not None:                     # the closest variant, for --unverified
         try:
-            result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [best[1]], sizes, display=True)
+            result.source, result.notes = gen.render_tu(lifted, member, this_type, method, [best[1]], sizes, display=True, chain=chain)
             result.notes += lifted.notes
             result.closest = f"{best[0]}/{len(insns)} instructions match, then: {best[2]}"
         except gen.Unsupported:
@@ -356,7 +500,8 @@ def _verify_class_draft(ctx: Context, command: str, insns, draft, work: Path, re
         result.status, result.detail = "differs", f"class draft: {diff}"
         return result
     result.status = "exact"
-    result.source = draft.source
+    result.source = result.standalone = draft.source
+    result.symbol, result.renames = fn_symbol, renames
     result.notes = draft.notes + [f"then: {a}" for a in draft.advice + [f"./dk rename {result.name} {draft.function}"]
                                   if result.name != draft.function and gen.is_auto(result.name)] \
         if result.name != draft.function else draft.notes + [f"then: {a}" for a in draft.advice]
@@ -395,6 +540,7 @@ def solve_asm(ctx: Context, name: str, work: Path) -> Result:
         result.source = source
         return result
     result.status, result.source = "exact", source
+    result.standalone, result.symbol = source, name
     result.notes = ["hand-written assembly: use this only where the original was assembly"]
     return result
 
@@ -434,6 +580,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         return _regress(ctx, args)
     if args.survey:
         return _survey(ctx, args)
+    if args.harvest is not None:
+        return _harvest(ctx, args)
     names = list(args.functions)
     if args.unit:
         try:
@@ -448,6 +596,17 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         print("error: give functions, --unit or --survey")
         return USAGE
     results = solve_many(ctx, names, args.jobs, asm=args.asm)
+    if args.write:
+        if not (args.unit or args.into) or args.asm:
+            print("error: --write needs --unit or --into (and no --asm)")
+            return USAGE
+        return _write(ctx, args, results, cfg.root / unit["metadata"]["source_path"] if args.unit else Path(args.into),
+                      unit if args.unit else None)
+    if args.merge:
+        if not args.unit or args.asm:
+            print("error: --merge needs --unit (and no --asm)")
+            return USAGE
+        return _merge(ctx, args, results, unit)
     for r in results:
         if r.status == "exact" or args.unverified and r.status == "differs" and r.source:
             print(format_draft(r) + "\n")
@@ -469,8 +628,439 @@ from tools.dk.platforms.gc_mwcc import gencmd
 ctx = gencmd.Context(config.load(Path(sys.argv[2])))
 ctx.max_insns = int(sys.argv[3])
 names = json.loads(Path(sys.argv[4]).read_text())
-print(json.dumps({r.name: r.status for r in gencmd.solve_many(ctx, names, int(sys.argv[5]))}))
+results = gencmd.solve_many(ctx, names, int(sys.argv[5]))
+Path(sys.argv[4]).with_suffix(".drafts.json").write_text(json.dumps(
+    {r.name: getattr(r, "standalone", "") for r in results if r.status == "exact"}))
+print(json.dumps({r.name: r.status for r in results}))
 """
+
+
+def _symbol_in(obj: Elf, ctx: Context, r: Result) -> str | None:
+    """Our symbol for a draft's function: given, or its name (mangled as a member)."""
+    if r.symbol:
+        return r.symbol
+    _, method, _ = _display_names(ctx, r.name, r.address)
+    found = [f for f in obj.functions() if f == method or f.startswith(method + "__")]
+    return found[0] if len(found) == 1 else None
+
+
+def _merged_failures(ctx: Context, command: str, unit: genmerge.Unit, drafts: list, work: Path) -> tuple[str, dict]:
+    """(merged source, draft name -> why it is not exact in it) for the drafts in `unit`."""
+    source = unit.render([])
+    obj, error = _compile(ctx, command, source, work, "merged")
+    if obj is None:
+        return source, {r.name: f"merged source does not compile: {error}" for r, _ in drafts}
+    failures = {}
+    for r, sym in drafts:
+        diff = gen.compare(gen.parse(ctx.entries[r.name].text), obj, sym, ctx.literal, r.renames or None, ctx.literal_info)
+        if diff:
+            failures[r.name] = diff
+    return source, failures
+
+
+def _has_code(path: Path) -> bool:
+    return path.is_file() and any(l.strip() and not l.startswith(("//", "#include")) for l in path.read_text().splitlines())
+
+
+def _write(ctx: Context, args: argparse.Namespace, results: list[Result], unit_source: Path, unit: dict | None = None) -> int:
+    """--write: the unit's exact drafts merged into one source, every function verified again
+    in it (see genmerge.py). Writes the unit's source when it is still empty, else --into.
+    Classes a header under include/ defines come from that header (#include), as --merge
+    does with a source that has code."""
+    target = Path(args.into) if args.into else unit_source
+    if not args.into and _has_code(target):
+        print(f"error: {ctx.cfg.rel(target)} already has code: --into PATH writes the merged drafts elsewhere")
+        return USAGE
+    drafts = [r for r in results if r.status == "exact" and r.standalone]
+    headers = _class_headers(ctx, drafts) if unit is not None else {}
+    if headers:
+        own = [l for l in (unit_source.read_text().splitlines() if unit_source.is_file() else []) if l.startswith("#include")]
+        rel = ctx.cfg.rel(unit_source)
+        includes = list(dict.fromkeys(own + [f'#include "{h}"' for h in sorted(set(headers.values()))]))
+        start = "\n".join([f"// {rel}: exact drafts merged by ./dk gen --write (placeholder types and names)", ""]
+                          + includes + [""]) + "\n"
+        print(f"classes from headers: {', '.join(f'{n} ({h})' for n, h in sorted(headers.items()))}")
+        return _merge(ctx, args, results, unit, start_source=start, out=target)
+    if not drafts:
+        print("no exact drafts to write")
+        return MISMATCH
+    command, _ = ctx.command(drafts[0].address)
+    root = ctx.cfg.root / "build" / "dk" / "gen"
+    root.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f"{os.getpid()}-w-", dir=root))
+    dropped = [(r.name, "its draft cannot be written under its own names")
+               for r in results if r.status == "exact" and not r.standalone]
+
+    def alone(r: Result):
+        """Each draft under its own names must still be exact on its own."""
+        obj, error = _compile(ctx, command, r.standalone, work, f"s{r.address:08X}")
+        if obj is None:
+            return r, None, f"does not compile under its own names: {error}"
+        sym = _symbol_in(obj, ctx, r)
+        if sym is None:
+            return r, None, "its function is not found under its own name"
+        diff = gen.compare(gen.parse(ctx.entries[r.name].text), obj, sym, ctx.literal, r.renames or None, ctx.literal_info)
+        return r, sym, diff
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            checked = list(pool.map(alone, sorted(drafts, key=lambda r: r.address)))
+        ok = []
+        for r, sym, why in checked:
+            (dropped.append((r.name, why)) if why else ok.append((r, sym)))
+        # all at once first; on any failure, greedily in address order
+        unit, kept = genmerge.Unit(), []
+        for r, sym in ok:
+            try:
+                unit = unit.add(r.standalone, r.address)
+                kept.append((r, sym))
+            except genmerge.Conflict as e:
+                dropped.append((r.name, f"conflicts with an earlier draft: {e}"))
+        source, failures = _merged_failures(ctx, command, unit, kept, work)
+        if failures:
+            unit, greedy = genmerge.Unit(), []
+            for r, sym in kept:
+                try:
+                    trial = unit.add(r.standalone, r.address)
+                except genmerge.Conflict as e:
+                    dropped.append((r.name, f"conflicts with an earlier draft: {e}"))
+                    continue
+                _, fails = _merged_failures(ctx, command, trial, greedy + [(r, sym)], work)
+                if fails:
+                    dropped.append((r.name, "not exact once merged: " + "; ".join(f"{n}: {d}" for n, d in fails.items())))
+                    continue
+                unit, greedy = trial, greedy + [(r, sym)]
+            kept = greedy
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    rel = ctx.cfg.rel(unit_source)
+    header = [f"// {rel}: {len(kept)} exact drafts merged by ./dk gen --write (placeholder types and names)", ""]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(unit.render(header))
+    print(f"wrote {ctx.cfg.rel(target)}: "
+          f"{len(kept)}/{len(drafts)} exact drafts, each verified exact in the merged source")
+    for name, why in dropped:
+        print(f"  left out {name}: {why}")
+    shadowed = _header_classes(ctx, unit)
+    for name, path in shadowed:
+        print(f"  note: {name} is also defined in {path}: use that class instead of the placeholder")
+    if args.unit:
+        hint(f"rename --unit {args.unit}, then check {args.unit}")
+    return OK
+
+
+def _merge(ctx: Context, args: argparse.Namespace, results: list[Result], unit: dict,
+           start_source: str | None = None, out: Path | None = None) -> int:
+    """--merge: the exact drafts of functions the unit's source does not define yet, inserted
+    into it (genmerge.Paste). All at once first; on any failure greedily in address order. A
+    draft stays only if the merged source compiles, it is exact there, and no function of
+    the unit scores lower than before (objdiff). Members a draft needs from a class of the
+    unit's own header (same stem) are added to it, inside its padding, if that lets more
+    drafts in. `start_source`/`out`: --write starts from the headers it includes."""
+    path = ctx.cfg.root / unit["metadata"]["source_path"]
+    source = start_source if start_source is not None else path.read_text() if path.is_file() else ""
+    drafts = sorted((r for r in results if r.status == "exact" and r.standalone), key=lambda r: r.address)
+    if not drafts:
+        print("no exact drafts to merge")
+        return MISMATCH
+    command, why = ctx.command(drafts[0].address)
+    if command is None:
+        print(f"error: {why}")
+        return USAGE
+    root = ctx.cfg.root / "build" / "dk" / "gen"
+    root.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f"{os.getpid()}-m-", dir=root))
+    overlay = work / "overlay"                      # grown headers, searched before include/
+    out = out or (Path(args.into) if args.into else path)
+    grown: dict = {}
+    try:
+        first = _paste_attempt(ctx, args, unit, command, source, drafts, work, overlay)
+        if isinstance(first, int):
+            return first
+        best = first
+        base, plan = _grow_headers(ctx, path, first.missing, first.probe)
+        if plan:
+            for rel, text in plan.items():
+                (overlay / rel).parent.mkdir(parents=True, exist_ok=True)
+                (overlay / rel).write_text(text)
+            second = _paste_attempt(ctx, args, unit, command, source, drafts, work, overlay)
+            if not isinstance(second, int) and len(second.put) > len(first.put):
+                best, grown = second, plan
+        if best.put:
+            if out == path and start_source is None and (path.read_text() if path.is_file() else "") != source:
+                print(f"error: {ctx.cfg.rel(path)} changed while merging: run again")
+                return USAGE
+            if out == path and start_source is not None and _has_code(path):
+                print(f"error: {ctx.cfg.rel(path)} got code while writing: run --merge instead")
+                return USAGE
+            for rel, text in grown.items():
+                dest = (out.parent / f"{out.name}.include" if args.into else ctx.cfg.root / "include") / rel
+                if not args.into and dest.read_text() != base[rel]:
+                    print(f"error: include/{rel} changed while merging: run again")
+                    return USAGE
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(text)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(best.text)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"{ctx.cfg.rel(out)}: merged {len(best.put)}/{len(best.ok)} exact drafts into {ctx.cfg.rel(path)}, each exact "
+          f"in the merged unit (no function scores lower)")
+    for rel in grown:
+        where = f"{ctx.cfg.rel(out)}.include/{rel}" if args.into else f"include/{rel}"
+        print(f"  grew {where}: members the drafts need, inside its padding (layout unchanged)")
+    for r, _ in best.put:
+        print(f"  put in {r.name}")
+    for name, why in best.dropped:
+        print(f"  left out {name}: {why}")
+    if best.put and not args.into:
+        hint(f"rename --unit {args.unit}, then check {args.unit}")
+    return OK
+
+
+@dataclass
+class _Pasted:
+    ok: list                    # (Result, symbol) exact alone, not in the source yet
+    put: list                   # (Result, symbol) exact in the merged text
+    dropped: list               # (name, why)
+    missing: list               # genmerge.Missing raised by the drafts left out
+    text: str
+    probe: object
+
+
+def _paste_attempt(ctx: Context, args: argparse.Namespace, unit: dict, command: str, source: str, drafts: list,
+                   work: Path, overlay: Path):
+    """One --merge pass against the headers as they are (overlay first): _Pasted, or an exit code."""
+    from .matching import score
+    path = ctx.cfg.root / unit["metadata"]["source_path"]
+    target = ctx.cfg.root / unit["target_path"]
+    counter = iter(range(1 << 30))
+    dropped, missing = [], []
+
+    def build(text: str):
+        """(object path, Elf) of the unit's source as `text`, or (None, error)."""
+        stem = f"u{next(counter)}"
+        obj, error = _compile(ctx, command, text, work, stem, include_dir=path.parent, overlay=overlay)
+        return (work / f"{stem}.o", obj) if obj is not None else (None, error)
+    base_path, base = build(source)
+    if base_path is None:
+        print(f"error: {ctx.cfg.rel(path)} does not compile as it is: {base}")
+        return BUILD_ERROR
+    before = {f.name: f.percent for f in score(ctx.cfg, unit["name"], target, base_path).functions}
+    preprocessed, error = _compile(ctx, command, source, work, "pre", include_dir=path.parent, overlay=overlay,
+                                   preprocess=True)
+    if preprocessed is None:
+        print(f"error: cannot preprocess {ctx.cfg.rel(path)}: {error}")
+        return BUILD_ERROR
+    have = set(base.functions())
+
+    def alone(r: Result):
+        obj, error = _compile(ctx, command, r.standalone, work, f"s{r.address:08X}")
+        if obj is None:
+            return r, None, f"does not compile under its own names: {error}"
+        sym = _symbol_in(obj, ctx, r)
+        if sym is None:
+            return r, None, "its function is not found under its own name"
+        if sym in have or r.name in have:
+            return r, None, "already in the source"
+        diff = gen.compare(gen.parse(ctx.entries[r.name].text), obj, sym, ctx.literal, r.renames or None, ctx.literal_info)
+        return r, sym, diff
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        checked = list(pool.map(alone, drafts))
+    ok = []
+    for r, sym, why in checked:
+        if why == "already in the source":
+            continue
+        (dropped.append((r.name, why)) if why else ok.append((r, sym)))
+    probe = _Probe(ctx, command, source, path, work, overlay)
+    if not ok:
+        return _Pasted(ok, [], dropped, missing, source, probe)
+    lines = source.splitlines()
+    addresses = {f: _address_of(ctx, f) for f in have}
+    keys = {genmerge.definition_key(f): a for f, a in addresses.items() if a is not None and genmerge.definition_key(f)}
+    start = genmerge.Paste.of(source, preprocessed, genmerge.function_starts(lines, keys), probe.members)
+
+    def verify(paste: genmerge.Paste, put: list) -> tuple[str, dict]:
+        """(merged text, draft or "@unit" -> why it fails there)."""
+        text = paste.render()
+        obj_path, obj = build(text)
+        if obj_path is None:
+            return text, {"@unit": f"the merged source does not compile: {obj}"}
+        fails, defined = {}, obj.functions()
+        for r, sym in put:
+            sym = r.name if r.name in defined else sym      # (a head the header declares names it fully)
+            diff = gen.compare(gen.parse(ctx.entries[r.name].text), obj, sym, ctx.literal, r.renames or None, ctx.literal_info)
+            if diff:
+                fails[r.name] = f"not exact once merged: {diff}"
+        after = {f.name: f.percent for f in score(ctx.cfg, unit["name"], target, obj_path).functions}
+        lower = [f"{f} {p:.1f}% -> {after.get(f, 0.0):.1f}%" for f, p in before.items() if after.get(f, 0.0) < p]
+        if lower:
+            fails["@unit"] = "lowers " + ", ".join(lower[:3])
+        return text, fails
+
+    def conflict(r: Result, e: genmerge.Conflict) -> None:
+        dropped.append((r.name, f"conflicts: {e}"))
+        if isinstance(e, genmerge.Missing):
+            missing.append(e)
+    alone_dropped = list(dropped)
+    paste, put = start, []
+    for r, sym in ok:
+        try:
+            paste = paste.add(r.standalone, r.address)
+            put.append((r, sym))
+        except genmerge.Conflict as e:
+            conflict(r, e)
+    text, fails = verify(paste, put)
+    if fails or any(r.alternatives for r, s_ in ok if (r, s_) not in put):
+        # one by one, in address order; a draft that fails goes in as another exact variant
+        # (say the void one, when a header declares the function void) if one fits
+        dropped[:], missing[:] = alone_dropped, []
+        paste, kept, text = start, [], source
+        for r, sym in ok:
+            first = None
+            for candidate in [r.standalone] + r.alternatives[:3]:
+                try:
+                    trial = paste.add(candidate, r.address)
+                except genmerge.Conflict as e:
+                    first = first or e
+                    continue
+                trial_text, trial_fails = verify(trial, kept + [(r, sym)])
+                if trial_fails:
+                    why = "; ".join(trial_fails.values())
+                    if re.search(r"' redefined", why):
+                        why += " (a header defines it already: an inline function is emitted where the unit uses it)"
+                    elif re.search(r"' redeclared", why):
+                        why += " (a header declares it with another signature)"
+                    first = first or why
+                    continue
+                paste, kept, text = trial, kept + [(r, sym)], trial_text
+                break
+            else:
+                conflict(r, first) if isinstance(first, genmerge.Conflict) else dropped.append((r.name, first))
+        put = kept
+    return _Pasted(ok, put, dropped, missing, text, probe)
+
+
+def _grow_headers(ctx: Context, unit_source: Path, missing: list, probe) -> tuple[dict, dict]:
+    """(include path -> its text now, include path -> its new text) for the unit's own headers
+    (same stem as its source), with the members the drafts lacked added inside the class's
+    padding (genmerge.grow_class)."""
+    wanted: dict = {}                           # class -> (fields by offset, methods)
+    for m in missing:
+        fields, methods = wanted.setdefault(m.cls, ({}, []))
+        for off, size, text in m.fields:
+            fields.setdefault(off, (off, size, text))
+        methods += [x for x in m.methods if x not in methods]
+    headers = _class_headers_named(ctx, {c.split("::")[-1] for c in wanted})
+    base, plan = {}, {}
+    for cls, (fields, methods) in wanted.items():
+        rel = headers.get(cls.split("::")[-1])
+        if rel is None or Path(rel).stem != unit_source.stem:
+            continue                                # not this unit's header: the reason stays
+        base.setdefault(rel, (ctx.cfg.root / "include" / rel).read_text())
+        text = plan.get(rel, base[rel])
+        body = re.search(rf"\b(?:class|struct)\s+{re.escape(cls.split('::')[-1])}\b[^;{{()]*\{{(.*?)^\}};", text, re.S | re.M)
+        names = re.findall(r"\bchar\s+(\w+)\s*\[", body[1]) if body else []
+        values = probe.values([f"(int)&(({cls}*)0)->{n}" for n in names] + [f"(int)sizeof((({cls}*)0)->{n})" for n in names])
+        pads = {n: (values[i], values[len(names) + i]) for i, n in enumerate(names)
+                if values[i] is not None and values[len(names) + i] is not None}
+        grown = genmerge.grow_class(text, cls, list(fields.values()), methods, pads)
+        if grown is not None:
+            plan[rel] = grown
+    return base, plan
+
+
+def _class_headers_named(ctx: Context, names: set) -> dict[str, str]:
+    """Class name -> the one header under include/ that defines it (as an #include path)."""
+    if not names:
+        return {}
+    pattern = re.compile(r"^\s*(?:struct|class)\s+(" + "|".join(map(re.escape, sorted(names))) + r")\b[^;{()]*\{", re.M)
+    found: dict = {}
+    root = ctx.cfg.root / "include"
+    for path in sorted(root.rglob("*.h")):
+        for m in pattern.finditer(path.read_text(errors="replace")):
+            found.setdefault(m[1], set()).add(str(path.relative_to(root)))
+    return {n: next(iter(hs)) for n, hs in found.items() if len(hs) == 1}
+
+
+class _Probe:
+    """Constant expressions about the unit's types, evaluated by compiling them after its
+    source: all failures reported in one compile (-maxerrors), then the values read back."""
+
+    def __init__(self, ctx: Context, command: str, source: str, path: Path, work: Path, overlay: Path):
+        self.ctx, self.command, self.path, self.work, self.overlay = ctx, command, path, work, overlay
+        self.lines = source.rstrip("\n").splitlines()
+        self.cache: dict = {}
+
+    def _run(self, text: str, stem: str):
+        (self.work / f"{stem}.cpp").write_text(text)
+        args = retarget(self.command, self.work)
+        i = args.index("-c")
+        args[i + 1] = str(self.work / f"{stem}.cpp")
+        args[i:i] = ["-maxerrors", "1000", "-i", str(self.path.parent)]
+        if self.overlay.is_dir():
+            first = args.index("-i")
+            args[first:first] = ["-i", str(self.overlay)]
+        proc = subprocess.run(args, cwd=self.ctx.cfg.root, capture_output=True, text=True, timeout=120)
+        obj = self.work / f"{stem}.o"
+        if proc.returncode == 0 and obj.is_file():
+            return Elf.parse(obj.read_bytes()), set()
+        return None, {int(m[1]) for m in re.finditer(r"^#\s+(\d+):", proc.stdout + proc.stderr, re.M)}
+
+    def values(self, exprs: list[str]) -> list:
+        """Each expression's int value, or None where it does not compile."""
+        todo = [e for e in dict.fromkeys(exprs) if e not in self.cache]
+        if todo:
+            checks = [f"static const int __dk_probe{k} = {e};" for k, e in enumerate(todo)]
+            _, bad = self._run("\n".join(self.lines + checks) + "\n", "probe")
+            good = [e for k, e in enumerate(todo) if len(self.lines) + 1 + k not in bad]
+            got = {}
+            if good:
+                array = 'extern "C" const int __dk_probe[] = { ' + ", ".join(good) + " };"
+                obj, _ = self._run("\n".join(self.lines + [array]) + "\n", "probe2")
+                sym = next((x for x in obj.symbols if x.name == "__dk_probe"), None) if obj else None
+                if sym is not None:
+                    data = obj.sections[sym.shndx].data[sym.value:sym.value + 4 * len(good)]
+                    got = dict(zip(good, struct.unpack(f">{len(good)}i", data)))
+            for e in todo:
+                self.cache[e] = got.get(e)
+        return [self.cache[e] for e in exprs]
+
+    def members(self, cls: str, names: list[str]) -> dict:
+        """(class, [member]) -> {member: its offset, or None when the class has no such member}."""
+        return dict(zip(names, self.values([f"(int)&(({cls}*)0)->{n}" for n in names])))
+
+
+def _address_of(ctx: Context, symbol: str) -> int | None:
+    """Target address of one of our function symbols: its own name, or fn_ADDR in it."""
+    if symbol in ctx.by_name:
+        return ctx.by_name[symbol].address
+    m = re.match(r"(?:fn|lbl)_([0-9A-F]{8})(?:__|$)", symbol)
+    return int(m[1], 16) if m else None
+
+
+def _class_headers(ctx: Context, drafts: list[Result]) -> dict[str, str]:
+    """Named classes the drafts define (not generator placeholders) -> the one header under
+    include/ that defines each, as an #include path."""
+    names = set()
+    for r in drafts:
+        try:
+            names |= {n.split("::")[-1] for n in genmerge.Unit().add(r.standalone, r.address).structs}
+        except genmerge.Conflict:
+            continue
+    return _class_headers_named(ctx, {n for n in names if not re.match(r"Unk|G_|\w+_(?:m|arg|l|ret|target|elem|vf)[0-9A-F_]", n)})
+
+
+def _header_classes(ctx: Context, unit: genmerge.Unit) -> list[tuple[str, str]]:
+    """Placeholder structs whose name a header under include/ already defines."""
+    names = {n.split("::")[-1]: n for n in unit.structs if not re.match(r"Unk|G_|\w+_(m|arg|l)[0-9A-F]", n)}
+    found = []
+    if not names:
+        return found
+    pattern = re.compile(r"^\s*(?:struct|class)\s+(" + "|".join(map(re.escape, names)) + r")\b\s*[:{]", re.M)
+    for path in sorted((ctx.cfg.root / "include").rglob("*.h")):
+        for m in pattern.finditer(path.read_text(errors="replace")):
+            found.append((names[m[1]], ctx.cfg.rel(path)))
+    return found
 
 
 def _regress(ctx: Context, args: argparse.Namespace) -> int:
@@ -494,14 +1084,39 @@ def _regress(ctx: Context, args: argparse.Namespace) -> int:
             print(f"error: the generator at {args.regress} failed:\n{proc.stderr[-2000:]}")
             return USAGE
         old = json.loads(proc.stdout.strip().splitlines()[-1])
-    new = {r.name: r for r in solve_many(ctx, names, args.jobs)}
-    lost = sorted(n for n, s in old.items() if s == "exact" and new[n].status not in ("exact", "skipped"))
+        old_drafts = json.loads((tree / "names.drafts.json").read_text()) if (tree / "names.drafts.json").is_file() else {}
+        new = {r.name: r for r in solve_many(ctx, names, args.jobs)}
+        dropped = sorted(n for n, s in old.items() if s == "exact" and new[n].status not in ("exact", "skipped"))
+        # a draft that could not be written under its own name (say `C* C::__ct()`) was never
+        # usable: retiring it is not a loss
+        retired = [n for n in dropped if old_drafts and not _writable(ctx, n, old_drafts.get(n, ""), tree)]
+    lost = [n for n in dropped if n not in retired]
     gained = sorted(n for n, r in new.items() if r.status == "exact" and old.get(n) != "exact")
     print(f"dk gen regress vs {args.regress}: {len(names)} functions, exact {sum(s == 'exact' for s in old.values())}"
-          f" -> {sum(r.status == 'exact' for r in new.values())}; lost {len(lost)}, gained {len(gained)}")
+          f" -> {sum(r.status == 'exact' for r in new.values())}; lost {len(lost)}, gained {len(gained)}"
+          + (f", retired {len(retired)} drafts not writable under their own names" if retired else ""))
     for n in lost:
         print(f"  LOST {n}: {new[n].status}: {new[n].detail}")
+    for n in retired:
+        print(f"  retired {n}: now {new[n].status}: {new[n].detail}")
     return MISMATCH if lost else OK
+
+
+def _writable(ctx: Context, name: str, standalone: str, work: Path) -> bool:
+    """Does this draft compile under its own names and stay exact there?"""
+    sym = ctx.by_name.get(name)
+    command = ctx.command(sym.address)[0] if sym else None
+    if not standalone or command is None:
+        return False
+    obj, _ = _compile(ctx, command, standalone, work, f"w{sym.address:08X}")
+    if obj is None:
+        return False
+    r = Result(name, sym.address, "exact", standalone=standalone)
+    # a special member (__ct__, __dt__, __as__...) must come out under exactly its symbol: a
+    # member literally named __ct is a different function
+    found = name if name in obj.functions() else None if name.startswith("__") else _symbol_in(obj, ctx, r)
+    return found is not None and gen.compare(gen.parse(ctx.entries[name].text), obj, found, ctx.literal,
+                                             literal_info=ctx.literal_info) is None
 
 
 def _survey_names(ctx: Context, args: argparse.Namespace) -> list[str]:
@@ -555,10 +1170,93 @@ def _survey(ctx: Context, args: argparse.Namespace) -> int:
     return OK
 
 
+def stretches(found: list[tuple[int, str]], declared: list[tuple[int, int]]) -> list[tuple[int, int, list[str]]]:
+    """Group (address, name) of functions outside every unit into the undeclared stretches of
+    .text between declared ranges: [(start, end, names)], end exclusive (0 = open-ended)."""
+    bounds = sorted(declared)
+    out: dict[tuple[int, int], list[str]] = {}
+    for addr, name in sorted(found):
+        lo = max((b for a, b in bounds if b <= addr), default=0)
+        hi = min((a for a, b in bounds if a > addr), default=0)
+        out.setdefault((lo, hi), []).append(name)
+    return [(lo, hi, names) for (lo, hi), names in out.items()]
+
+
+def _harvest(ctx: Context, args: argparse.Namespace) -> int:
+    """Undeclared stretches ranked by how many of their functions already have exact drafts:
+    declaring that unit (unit propose / unit add) turns them into progress at once."""
+    lo, hi = (int(x, 16) for x in args.harvest) if len(args.harvest) == 2 else (0, 1 << 32)
+    if args.wip:
+        return _harvest_wip(ctx, args, lo, hi)
+    names = []
+    for name, entry in ctx.entries.items():
+        sym = ctx.by_name.get(name)
+        if sym is None or sym.type != "function" or not lo <= sym.address < hi or ctx.unit_of(sym.address):
+            continue
+        if ctx.template_for(sym.address) is None:
+            continue
+        try:
+            n = len(gen.strip_frame(gen.parse(entry.text)))
+        except gen.Unsupported:
+            n = len(gen.parse(entry.text))
+        if n <= args.max_insns:
+            names.append(name)
+    exact = [(ctx.by_name[r.name].address, r.name) for r in solve_many(ctx, names, args.jobs) if r.status == "exact"]
+    declared = [(a, b) for u in ctx.splits for sec, a, b in u.splits if sec == ".text"]
+    ranked = sorted(stretches(exact, declared), key=lambda t: (-len(t[2]), t[0]))
+    print(f"dk gen harvest: {len(exact)} of {len(names)} undeclared functions (<= {args.max_insns} instructions) "
+          f"have exact drafts, in {len(ranked)} undeclared stretches")
+    for start, end, fns in ranked:
+        span = f"0x{start:08X}-0x{end:08X}" if end else f"0x{start:08X}-"
+        print(f"  {len(fns):4} exact  {span}  e.g. {fns[0]}")
+    if ranked:
+        hint(f"unit propose {ranked[0][2][0]}")
+    return OK
+
+
+def _harvest_wip(ctx: Context, args: argparse.Namespace, lo: int, hi: int) -> int:
+    """--harvest --wip: declared units that are not linked, ranked by how many of their
+    not-yet-exact functions (per the last build's objdiff report) have exact drafts."""
+    if not ctx.cfg.report.is_file():
+        print(f"error: no report at {ctx.cfg.rel(ctx.cfg.report)} (./dk build writes it)")
+        return USAGE
+    report = json.loads(ctx.cfg.report.read_text())
+    open_at = {int(f["metadata"]["virtual_address"]) for u in report.get("units", []) for f in u.get("functions", [])
+               if f.get("fuzzy_match_percent", 0) < 100 and "virtual_address" in f.get("metadata", {})}
+    names = []
+    for address in sorted(open_at):
+        sym = ctx.by_address.get(address)
+        unit = ctx.unit_of(address)
+        if sym is None or sym.name not in ctx.entries or not unit or ctx.linked(unit) or not lo <= address < hi:
+            continue
+        try:
+            n = len(gen.strip_frame(gen.parse(ctx.entries[sym.name].text)))
+        except gen.Unsupported:
+            n = len(gen.parse(ctx.entries[sym.name].text))
+        if n <= args.max_insns:
+            names.append(sym.name)
+    by_unit: dict[str, list[str]] = {}
+    for r in solve_many(ctx, names, args.jobs):
+        if r.status == "exact":
+            by_unit.setdefault(ctx.unit_of(r.address), []).append(r.name)
+    ranked = sorted(by_unit.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    print(f"dk gen harvest --wip: {sum(map(len, by_unit.values()))} of {len(names)} not-yet-exact functions "
+          f"(<= {args.max_insns} instructions) in WIP units have exact drafts, in {len(ranked)} units")
+    for unit, fns in ranked:
+        print(f"  {len(fns):4} exact  {unit}  e.g. {fns[0]}")
+    if ranked:
+        hint(f"gen --unit {ranked[0][0]} --max-insns {args.max_insns}")
+    return OK
+
+
 def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("functions", nargs="*", help="function symbols")
     p.add_argument("--unit", help="every function of this declared unit")
     p.add_argument("--survey", action="store_true", help="dry run over every small function outside linked units")
+    p.add_argument("--harvest", nargs="*", metavar="HEX",
+                   help="rank undeclared stretches by exact drafts (optionally only START END) to split first")
+    p.add_argument("--wip", action="store_true",
+                   help="with --harvest: WIP units ranked by exact drafts for their not-yet-exact functions")
     p.add_argument("--include-linked", action="store_true", help="survey linked units instead (self-test)")
     p.add_argument("--max-insns", type=int, default=MAX_INSNS, help="instruction limit (body, without the frame)")
     p.add_argument("--reasons", type=int, default=12, help="survey: how many reasons to list per status")
@@ -569,6 +1267,13 @@ def _configure(p: argparse.ArgumentParser) -> None:
                    help="also print the closest NOT-exact draft of a function that lifts but does not match")
     p.add_argument("--asm", action="store_true",
                    help="the function as a CodeWarrior asm function (only for code the original wrote in assembly)")
+    p.add_argument("--write", action="store_true",
+                   help="with --unit: merge the exact drafts into one source (the unit's, while it is empty), each verified again")
+    p.add_argument("--into", metavar="PATH", help="with --write or --merge: write the merged source here instead")
+    p.add_argument("--merge", action="store_true",
+                   help="with --unit: insert the exact drafts of functions the unit's source lacks into it (by address), "
+                        "reusing its and its headers' definitions; keeps a draft only if it is exact there and no "
+                        "other function scores lower")
     p.add_argument("--regress", metavar="REV", help="compare with the generator at REV on the same functions (exit 1 if a draft is lost)")
 
 

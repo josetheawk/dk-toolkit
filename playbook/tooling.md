@@ -45,6 +45,8 @@
 ## Shared working trees
 
 - **Judge ratchets on the clean build a commit is made from, never on the shared tree.** Why: the shared tree also holds other agents' half-edited units, so its numbers come and go; a floor raised from them crept above what HEAD builds and then refused honest commits. Apply: build HEAD + the change in a clean worktree, compare that report with the committed floor, and commit the floor raised to it.
+- **Never wait while holding a shared lock.** Why: a retry loop (waiting for another agent's broken source) inside a locked command made every queued command wait in turn; one broken file stalled 16 agents for 20 minutes. Apply: fail fast, name the culprit, and let the caller retry.
+- **Renaming a placeholder to a member's mangled name breaks every unit that still uses it as a C name** (`extern "C"` declarations or blocks, asm `bl`, C files): their link fails with `undefined`, and a hash proof that links only matched units does not notice. Apply: find those uses before renaming and refuse (`dk rename` does).
 - **Shared config files change entry by entry.** A unit's commit composes HEAD's copy plus only that unit's entries; committing the whole file would land other agents' unfinished entries.
 
 ## GC/Wii template quick start

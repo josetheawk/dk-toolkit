@@ -61,6 +61,64 @@ def data_rows(left_sec: dict, right_sec: dict) -> list[str]:
     return rows
 
 
+def _objects(elf, section: str) -> list[tuple[int, int, str]]:
+    """(offset, size, name) of the objects in one section, in address order."""
+    sec = elf.section(section)
+    if sec is None:
+        return []
+    found = {}
+    for x in elf.symbols:
+        if x.shndx == sec.index and x.type in (0, 1) and x.name and x.size:
+            found.setdefault(x.value, (x.value, x.size, x.name))
+    return sorted(found.values())
+
+
+def _first_users(elf, section: str) -> dict[int, str]:
+    """Section offset -> the first function (in .text order) that relocates against it."""
+    out: dict[int, str] = {}
+    fns = sorted(elf.functions().values(), key=lambda f: next(
+        (x.value for x in elf.symbols if x.name == f.name and x.type == 2), 0))
+    for f in fns:
+        for r in f.relocs:
+            if r.target_section == section:
+                out.setdefault(r.target_value + r.addend, f.name)
+    return out
+
+
+def _value(raw: bytes) -> str:
+    import struct
+    text = raw[:8].hex() + ("…" if len(raw) > 8 else "")
+    if len(raw) == 4:
+        text += f" ({struct.unpack('>f', raw)[0]:g}f)"
+    elif len(raw) == 8:
+        text += f" ({struct.unpack('>d', raw)[0]:g})"
+    elif raw.rstrip(b"\0") and all(32 <= c < 127 for c in raw.rstrip(b"\0")):
+        text = repr(raw.rstrip(b"\0").decode())
+    return text
+
+
+def literal_rows(target, base, section: str) -> list[str]:
+    """The unit's objects in one section side by side, by offset: what each holds and the first
+    function using it. Compilers place literals in order of first use, so this is the order to
+    write them in when a function differs only by a literal's offset."""
+    rows = []
+    t, b = _objects(target, section), _objects(base, section)
+    tsec, bsec = target.section(section), base.section(section)
+    if not t or bsec is None:
+        return rows
+    tu, bu = _first_users(target, section), _first_users(base, section)
+    ours = {off: (size, name) for off, size, name in b}
+    data = lambda sec, off, size: b"" if sec.type == 8 else sec.data[off:off + size]
+    rows.append(f"{section}: offset, target (first user), ours (first user)")
+    for off, size, name in t:
+        theirs = data(tsec, off, size)
+        mine = ours.get(off)
+        same = mine is not None and data(bsec, off, mine[0]) == theirs
+        right = f"{mine[1]} {_value(data(bsec, off, mine[0]))} ({bu.get(off, '-')})" if mine else "-"
+        rows.append(f"  {'  ' if same else '!='} +0x{off:<4X} {name} {_value(theirs)} ({tu.get(off, '-')})  |  {right}")
+    return rows
+
+
 def run(cfg: Config, args: argparse.Namespace) -> int:
     try:
         unit = resolve_unit(cfg, args.target)
@@ -79,6 +137,14 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if proc.returncode != 0:
         print(f"error: objdiff failed: {proc.stderr.strip()}")
         return USAGE
+    if args.literals:
+        from .elf import Elf
+        target, base = Elf.parse((cfg.root / unit["target_path"]).read_bytes()), Elf.parse((cfg.root / unit["base_path"]).read_bytes())
+        for section in args.literals.split(","):
+            for row in literal_rows(target, base, section):
+                print(row)
+        hint(f"check {args.target}")
+        return OK
     doc = json.loads(proc.stdout)
     left, right = doc["left"], doc.get("right", {})
     rsyms = right.get("symbols", [])
@@ -120,6 +186,9 @@ def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("target", help="unit (source path or name) or a function inside one")
     p.add_argument("--function", help="show only this function (even if exact)")
     p.add_argument("--context", type=int, default=2, help="matching lines shown around each difference (default 2)")
+    p.add_argument("--literals", nargs="?", const=".sdata2,.rodata", metavar="SECTIONS",
+                   help="list the unit's objects in these sections (default .sdata2,.rodata) side by side with "
+                        "values and first users: the order to write literals in")
 
 
 COMMAND = Command("diff", "matching", "side-by-side target vs compiled instructions (mismatches + context)", run, _configure)
