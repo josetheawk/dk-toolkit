@@ -20,6 +20,31 @@ already-matched neighbours in the unit, and the relevant headers.
 - **Renames update the sources** that reference the old placeholder, so naming work can't silently break a match.
 - **Never prove against stale outputs.** Force the split or analysis step to re-run whenever its inputs changed, independent of the build system's dependency records, and periodically build HEAD in a clean worktree (`dk verify-head`) to prove every commit is self-contained.
 
+## Running many agents at once
+
+Verified on a run of about 16 parallel agents against one shared working tree.
+
+- **Roles.**
+  - A coordinator assigns work and integrates; it matches nothing itself.
+  - Sweepers each own one address slice. A unit belongs to the slice its `.text` starts in.
+  - Closers take nearly-exact WIP units (about 88% of functions exact or more) to linked.
+  - Toolsmiths turn repeated manual work into tested commands.
+  - Shared header families (a UI framework, core classes) get one owner. Every layout change goes through that owner, in batches, compared on all includers.
+- **Progress counts code bytes.** Point sweepers at big functions they can get exact, not at register-only near misses.
+- **Every brief carries the same rules.**
+  - Commit only through the tool.
+  - Iterate on private copies only. Writing another unit's file or a shared header in a search loop breaks everyone else's build.
+  - After any edit to a header, a linked unit or a symbol name, run the full link, not just the unit check.
+  - Additive header edits are fine: re-read the header just before editing, and commit promptly.
+  - Keep going until told to wind down.
+- **Cross-unit changes go through the coordinator.** Renames of linked symbols and header retypes are sent as "ready to integrate: files, renames". The coordinator commits the shared working state in one integration (`commit-tools --integrate`). The integration holds back units that fell below their last commit, so agents mid-edit don't block it. Never re-run an integration just to read its error: it commits.
+- **Agents run out of context.** Replace one with a fresh agent that carries the old one's notes, and keep a roster of agent ids. Messaging a finished agent restarts it, so send every agent the current roster, and have toolsmiths report "unit X needs Y" to the coordinator instead of to owners.
+- **Decide devices once, for everyone.** When an agent asks whether a pragma, `volatile` or dummy layout is acceptable, the answer goes into the project's decision log. Then every brief can cite it.
+- **Wind down in order.**
+  1. Each agent finishes its current function, commits, and reports what is committed and what is open.
+  2. The coordinator runs a final integration and stops any periodic integrator.
+  3. The coordinator exports the toolkit and records the open leads for the next session.
+
 ## Refinement passes
 
 Every few units, revisit your own earlier units and replace placeholders that new evidence explains. Evidence includes:
