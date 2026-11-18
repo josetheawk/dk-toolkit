@@ -76,6 +76,9 @@ def run_queue(cfg: Config, args: argparse.Namespace, opts) -> int:
         frozen = FrozenMap({k: v for k, v in frozen.items() if v not in thaw})
     items = queue_rows(rows, frozen, never_train(cfg)[0], read_skip(args.skip_list or []),
                        args.min, args.small, args.max_size)
+    classes = {c for c in (getattr(args, "only_class", "") or "").split(",") if c}
+    if classes:                                           # e.g. near-register for `--moves degree`
+        items = [r for r in items if r.get("class") in classes]
     first = read_skip(getattr(args, "first", None) or [])
     if first:                                             # e.g. `regs --residue`'s register-order-only functions
         items = [r for r in items if (r["unit"], r["function"]) in first] + \

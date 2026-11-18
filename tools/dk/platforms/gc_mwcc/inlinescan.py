@@ -261,14 +261,14 @@ def render(rows: list[dict], limit: int) -> list[str]:
 
 def diverging_offsets(target_rows: list[dict], our_rows: list[dict]) -> list[int]:
     """Target offsets of the objdiff rows where ours differs (an instruction missing on one side counts)."""
-    addrs = [int(r["instruction"]["address"]) for r in target_rows if "instruction" in r]
+    addrs = [int(r["instruction"].get("address", 0)) for r in target_rows if "instruction" in r]
     if not addrs:
         return []
     base, out, last = addrs[0], [], addrs[0]
     for t, o in zip(target_rows, our_rows):
         ti, oi = t.get("instruction"), o.get("instruction")
         if ti:
-            last = int(ti["address"])
+            last = int(ti.get("address", 0))
         if t.get("diff_kind") or o.get("diff_kind") or not ti or not oi or ti.get("formatted") != oi.get("formatted"):
             out.append(last - base)
     return out

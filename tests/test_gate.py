@@ -215,3 +215,15 @@ class RefreshTest(DataDir):
                           "stats": {"gave_up_pool": 1, "gave_up_logged": 1, "fresh_pool": 0}}, {"gate-lora2": new["functions"]})
         self.assertIn("refresh 1", text)
         self.assertIn("retired fn_80000010 (exact); added fn_80000020", text)
+
+
+class ReleaseFileTest(DataDir):
+    def test_the_release_file_beside_the_eval_sets_is_not_read_as_a_set(self):
+        self.write_gate()
+        (self.d / "eval").mkdir()
+        (self.d / "eval" / "bench.json").write_text(json.dumps({"functions": [rec("u/c", "fn_C")]}))
+        (self.d / "eval" / "released.json").write_text(json.dumps({"fn_C": {"date": "2000-01-01", "reason": "x"}}))
+        files = gate.set_files(self.cfg)
+        self.assertIn("eval:bench", files)
+        self.assertNotIn("eval:released", files)
+        self.assertIn("eval", gate.load_sets(self.cfg))

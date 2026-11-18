@@ -139,8 +139,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
               f"the commit's clean build is checked against the floor")
     if not ok:
         print(build_errors(output, 30))
-        for note in s.link_notes:                      # a weak copy the link keeps because the original's is unnamed
-            print(f"hint: {note}")
+        for link_note in s.link_notes:                      # a weak copy the link keeps because the original's is unnamed
+            print(f"hint: {link_note}")
         for line in dropped_by_link(cfg, unit):
             print(f"hint: {line}")
         if cfg.built.is_file() and "did NOT match" in output:

@@ -84,5 +84,56 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("this compiler inlines it at any size", got[0])
 
 
+def doc(checks, small=(), cap=512, totals=(300,)):
+    return {"schema": "inline.v1", "compiler": "X", "limits": {"stmts": 30, "locals": 1024, "max_size": 512, "total": 7000},
+            "functions": [{"name": "caller", "link": "", "obj": 1, "max": cap, "totals": list(totals), "checks": checks}],
+            "small": list(small)}
+
+
+def check(callee="callee", rnd=0, explicit=False, auto=True, est=None, cap=512, can=6, stmts=3):
+    c = {"callee": callee, "link": "", "obj": 2, "round": rnd, "explicit": explicit, "auto": auto, "stmts": stmts, "can": can}
+    if est is not None:
+        c.update(est=est, max=cap)
+    return c
+
+
+class ExplainTest(unittest.TestCase):
+    """The rule's verdicts from an oracle document (synthetic numbers)."""
+
+    def test_inlined_auto_gives_both_slacks(self):
+        got = inlinecost.explain(doc([check(est=40)], [{"name": "callee", "link": "", "obj": 2, "stmts": 12, "locals": 0}]),
+                                 "caller__Fv", "callee__Fi")
+        self.assertEqual(got[0], "inlined: auto-inline, cost 40 against the caller's limit 512, 472 unit(s) of slack")
+        self.assertIn("19 more statement(s) (12 statement(s) of 30)", got[1])
+        self.assertIn("473 more cost unit(s)", got[1])
+
+    def test_over_the_cost_limit(self):
+        got = inlinecost.explain(doc([check(explicit=True, auto=False, est=600)]), "caller", "callee")
+        self.assertEqual(got[0], "not inlined: inline, cost 600 against the caller's limit 512, 88 over")
+
+    def test_halved_limit_names_the_caller_budget(self):
+        got = inlinecost.explain(doc([check(est=200, cap=128)], cap=128, totals=(7300,)), "caller", "callee")
+        self.assertIn("72 over; the caller's limit is 128, not 512: its own size estimate is over 7000 (7300)", got[0])
+
+    def test_not_a_candidate_reasons(self):
+        many = {"name": "callee", "link": "", "obj": 2, "stmts": 38, "locals": 0}
+        got = inlinecost.explain(doc([{"callee": "callee", "link": "", "obj": 2, "round": 0, "explicit": False,
+                                       "auto": False}], [many]), "caller", "callee")
+        self.assertIn("38 statement(s) as lowered, over the auto-inline limit of 30 by 8", got[0])
+        got = inlinecost.explain(doc([{"callee": "callee", "link": "", "obj": 2, "round": 0, "explicit": False,
+                                       "auto": False}]), "caller", "callee")
+        self.assertIn("only a body defined before the caller", got[0])
+
+    def test_last_round_inline_of_an_oversized_explicit(self):
+        late = check(rnd=7, explicit=True, auto=False)
+        got = inlinecost.explain(doc([check(rnd=1, explicit=True, auto=False, est=514), late]), "caller", "callee")
+        self.assertTrue(got[0].startswith("inlined in round 7 only"))
+
+    def test_records_match_by_link_name_first(self):
+        d = doc([dict(check(est=5), link="callee__1AFv"), dict(check(est=9), link="callee__1BFv", obj=3)])
+        self.assertEqual(inlinecost.callee_checks(d["functions"][0], "callee__1BFv")[0]["est"], 9)
+        self.assertEqual(len(inlinecost.callee_checks(d["functions"][0], "callee")), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

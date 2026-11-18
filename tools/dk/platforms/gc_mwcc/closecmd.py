@@ -158,10 +158,10 @@ class Closer:
         self.batched = 0                          # candidates the batch answered without a compile of their own
         self.keep_rows = False                    # keep the target | ours rows on each Eval (llm-agent)
         self.diag = None                          # --moves directed: regdirect.Diagnosis of the start
-        if opts.moves in ("oracle", "directed"):
+        if opts.moves in ("oracle", "directed", "degree"):
             from . import oracle
             self.oracle_cmd = oracle.runner(cfg)
-            self.temps = opts.moves == "directed"
+            self.temps = opts.moves in ("directed", "degree")
             if self.oracle_cmd is not None:
                 self.v2 = oracle.supports_solve(self.oracle_cmd, self.work / "probe")
 
@@ -170,7 +170,7 @@ class Closer:
         work = self.work / f"s{slot}"
         try:
             wrap, table = None, None
-            if self.opts.moves in ("oracle", "directed") and self.oracle_cmd:
+            if self.opts.moves in ("oracle", "directed", "degree") and self.oracle_cmd:
                 from . import oracle
                 table = work.resolve() / "vregs.json"
                 work.mkdir(parents=True, exist_ok=True)
@@ -272,12 +272,15 @@ class Closer:
         if site is None:
             return []
         out: list[tuple[str, str, str]] = []
-        if self.opts.moves == "directed":
+        if self.opts.moves in ("directed", "degree"):
             from . import regdirect
-            if self.diag is None or self.diag.kind == "none":
-                return []
-            diff_lines = {ln - 1 for ln in e.sym.lines}
-            found = regdirect.candidates(site, self.diag, e.values, self.wanted, self.rule_names, diff_lines)
+            found = []
+            if self.opts.moves == "degree" and self.analysis is not None:
+                from . import degmoves                  # the solver's degree levers first (H10, T69)
+                found += degmoves.candidates(site, self.analysis)
+            if self.diag is not None and self.diag.kind != "none":
+                diff_lines = {ln - 1 for ln in e.sym.lines}
+                found += regdirect.candidates(site, self.diag, e.values, self.wanted, self.rule_names, diff_lines)
             for kind, label, new in found:
                 if new not in seen and _sha(new) not in self.explored:
                     seen.add(new)
@@ -336,17 +339,24 @@ class Closer:
         """Ask the runner's solver for the minimal rules on the starting source; they direct and score the search."""
         from . import oracle
         if not self.v2 or start.record is None or start.values is None:
-            if self.opts.moves == "directed":
+            if self.opts.moves in ("directed", "degree"):
                 from . import regdirect
                 self.diag = regdirect.Diagnosis("none")
                 self.log("  directed: no contract-v2 oracle record for the start: nothing to direct")
             return
         an = oracle.solve(self.oracle_cmd, start.record, start.values, self.work / "solve")
-        if self.opts.moves == "directed":
+        if self.opts.moves in ("directed", "degree"):
             from . import regdirect
             self.diag = regdirect.diagnose(None if "error" in an else an, start.record, start.values)
             for line in regdirect.render(self.diag):
                 self.log(line)
+        if self.opts.moves == "degree" and "error" not in an:
+            from . import degmoves
+            site = self.site(start)
+            tg = degmoves.targets(an, site)
+            self.log(f"  degree: {len(tg)} target(s)" + "".join(f"; {t.why}" for t in tg[:4]))
+            for h in degmoves.ctor_hints(site) if site is not None else []:
+                self.log(f"  degree hint (not compiled): {h}")
         if "error" in an:
             self.log(f"  order solver: {an['error']}")
             return
@@ -382,6 +392,9 @@ class Closer:
         res = Result(self.unit["name"], self.symbol, 0.0, 0.0)
         try:
             start = self.evaluate(text, 0)
+            if start is None and self.temps:              # the runner's temp origins (contract v3) cover fewer
+                self.temps = False                        # compiler builds than v2: direct without them
+                start = self.evaluate(text, 0)
             if start is None:
                 res.error = "the unit does not compile or the function is missing"
                 return res
@@ -465,7 +478,7 @@ class Closer:
                         r.rejected = True                           # a judged device is never expanded
                         if r.code:
                             rejected_codes.add(r.code)
-                n = (4 if self.rules else 3) if self.opts.moves in ("oracle", "directed") else 2   # oracle: shape rows, rules, wrong values
+                n = (4 if self.rules else 3) if self.opts.moves in ("oracle", "directed", "degree") else 2   # oracle: shape rows, rules, wrong values
                 keep = sorted((r for p, r in children if r.key[:n] <= p.key[:n] and not r.rejected), key=lambda r: r.key)
                 ranked_children = sorted((r for _, r in children), key=lambda r: r.key)
                 if ranked_children and ranked_children[0].key < best.key:
@@ -1000,14 +1013,14 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     opts = Options(width=args.width, depth=args.depth, budget=args.budget, jobs=args.jobs, skip=skip,
                    solver="rank-solver" not in skip, moves=args.moves, memo=not args.fresh, batch=args.batch,
                    trace=args.trace)
-    if args.moves == "directed":
+    if args.moves in ("directed", "degree"):
         opts.width, opts.depth, opts.per_state = min(args.width, 3), min(args.depth, 3), 16
         if args.budget == 600:
             opts.budget = 150
     if args.baseline:
         opts = baseline_options(args.budget, args.jobs)
         opts.memo = not args.fresh
-    if args.moves in ("oracle", "directed"):
+    if args.moves in ("oracle", "directed", "degree"):
         from . import oracle
         if oracle.runner(cfg) is None:
             print(f"error: {oracle.UNAVAILABLE}")
@@ -1071,6 +1084,8 @@ def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("--thaw", default="", metavar="SET[,SET]", help="with --queue: frozen sets CPU tools may work "
                    "(gate-lora2 and the near-sample sets, owner decision 2026-11-08; results stay out of every dataset)")
     p.add_argument("--max-size", type=int, default=4096, help="with --queue: largest function tried (default 4096)")
+    p.add_argument("--class", dest="only_class", default="", metavar="C[,C]",
+                   help="with --queue: only these route classes (e.g. near-register)")
     p.add_argument("--until", default="", metavar="HH:MM", help="with --queue: stop starting new functions at this time")
     p.add_argument("--resume", action="store_true", help="with --queue: continue the last run's state (llm-data/close-queue-state.json)")
     p.add_argument("--first", action="append", metavar="JSON",
@@ -1089,7 +1104,7 @@ def _configure(p: argparse.ArgumentParser) -> None:
                    "applied move with its compiled score, the judged final definition) to this file")
     p.add_argument("--card", default="", metavar="DIR", help="write DIR/CARD.md and DIR/SHA256SUMS for DIR/traces.jsonl "
                    "(records from --trace) and exit")
-    p.add_argument("--moves", choices=("table", "truth", "oracle", "directed"), default="table",
+    p.add_argument("--moves", choices=("table", "truth", "oracle", "directed", "degree"), default="table",
                    help="truth: at every beam state compile the register explainer's edits first (`regs --explain`: "
                         "declaration order, temporary vs named shape, statement order, inline helper, each aimed at a "
                         "variable whose register differs), then the rewrite table and the solver. oracle: every compile "
@@ -1098,7 +1113,9 @@ def _configure(p: argparse.ArgumentParser) -> None:
                         "come first (name or fold an operand, commutative operand order, statement order, split/join). "
                         "directed: the oracle's diagnosis of the start (reachable by order / stuck / scheduling only) "
                         "picks the moves per flipped rule's cell (regdirect.py): only those are compiled, cross-phase "
-                        "temp pairs are reported as STOP; defaults width 3, depth 3, budget 150, 16 per state")
+                        "temp pairs are reported as STOP; defaults width 3, depth 3, budget 150, 16 per state. "
+                        "degree: directed plus, first, the solver's degree levers (H10: add or remove one value that "
+                        "coalesces away at the lines the lever or span names; degmoves.py), same defaults")
     p.add_argument("--batch", type=int, default=0, metavar="K",
                    help="compile up to K candidates of a level in one copy of the unit first (renamed copies after the "
                         "real definition, with a control copy that must equal it): candidates whose code a sibling, the "

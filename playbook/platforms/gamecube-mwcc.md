@@ -117,17 +117,17 @@
 
 ## Inlining
 
-- **Auto-inlining (`-inline auto`) counts the callee's own statements, as lowered, against a limit per compiler version; make a callee heavier (or lighter) with natural shapes first.**
-  - Limits: up to 14 statements plus the return on GC 1.3, 29 on GC 1.3.2. An expression-size budget (the same on both) binds only for statements with many operands.
-  - Costs: an expression statement 1, even one that makes no code (`((void)0);`, `(void)e;`, an empty inline call); a declaration with an initializer 1, without one 0; `if` 2 plus its body; `if/else` 4; `while` 3; a small `for` 5; a one-case `switch` 3; `?:` as a statement 1; `;`, `{}`, labels and `do {} while (0)` 0.
-  - A call to an inline helper costs 1 whatever the helper's size: the count is taken before the callee's own callees are inlined.
-  - Explicitly `inline` functions are not counted this way: GC 1.3 inlined one of 250 statements; GC 1.3.2 judges them by size after dead code, so no-code statements are nearly free there.
-  - Why: toys on both versions (each form measured by how far it moves the limit); then two near misses closed with natural shapes (a named temporary with an initializer; a result variable returned once).
+- **The inliner decides in two steps: is the callee a candidate, and does its cost fit the caller's limit.** GC 1.3 and 1.3.2 run CodeWarrior's bottom-up inliner (the default).
+  - Candidate: an `inline` function (or one defined in its class) whose body has been seen; any other function only when it is defined *before* the caller, has at most 15 (GC 1.3) or 30 (GC 1.3.2) statements as lowered, counting the implicit final return, at most 1024 bytes of locals, no `...`, and no class with a destructor passed or returned by value. `#pragma auto_inline off` and `-inline noauto` turn auto candidacy off at the callee's definition.
+  - Statement costs (candidacy): an expression or a declaration with an initializer 1 (no-code ones like `((void)0);` too), `if` 2, `if` with `&&` 3, `if/else` 4, an early `return` in an `if` 3, `while` 3, `do/while` 2, a small `for` 5, a 3-case `switch` with breaks 7, `?:` 1; `;`, `{}` and a declaration without an initializer 0; a call to an inline helper 1 whatever its size (the count is taken before the callee's own callees are inlined).
+  - Cost: the callee's statements (labels and the return included) plus its expression nodes (each operand, operator, cast, call), with each inlinable callee of its own added at its own cost. It is inlined when the cost is at most the caller's limit: 512, halved while the caller's own size estimate is over 7000. A caller over 7000 by itself ends at a limit of 1 and inlines nothing, `inline` functions included.
+  - Rounds: calls that appear inside an inlined body are judged in the next round, 8 rounds in all, one nesting level less each round. Recursion therefore unrolls as far as the remaining depth's cost fits (heavier expressions, fewer levels), and calls inside a body inlined in the last round stay calls. GC 1.3 also inlines an `inline` function whatever its cost in the last round, so a too-big explicit inline still disappears but its own helpers stay calls: that is "the inline budget runs out partway".
+  - Why: read from the compiler (CInline: InlineFunctionCheck, IsSmallFunction, EstimateSizeOfFunc, the halving loop) and checked against its decisions on every call of the project's units (99.7% of 3,121 candidate calls in exact units; the rest are recursion copies).
   - Detect: the target keeps a call that ours inlines, or inlines one that ours keeps, and the callee's code is exact.
   - Apply, in order:
-    1. `dk inline-cost <callee>`: the slack (statements that still fit) or the statements over the limit.
-    2. Read the asm for shapes that account for that number: a value held in a named temporary (+1 each), a result variable returned once (+1), an early return instead of a wrapping `if` (+1), a chained assignment split (+1), `if/else` instead of `?:` (+3), an inline helper's body written out (+its size − 1), or the reverse to make it lighter.
-    3. Keep only shapes that leave the bytes identical.
+    1. `dk inline-cost <callee>`: the reason and the distance (statements or cost units), read from the compiler when the oracle is configured.
+    2. A small callee defined before its caller that the target still calls was no candidate in the original (more statements, a pragma or flag); a cost-limit miss means more or fewer operands, or a helper layer that adds nested cost.
+    3. Read the asm for shapes that account for the number: a value held in a named temporary (+1 statement), a result variable returned once (+1), an early return instead of a wrapping `if` (+1), `if/else` instead of `?:` (+3), an inline helper's body written out (+its size − 1), or the reverse. Keep only shapes that leave the bytes identical.
     4. If none fits, list the function as a candidate for a release-build assert macro (no-code statements) and leave the decision to the project owner. Never add no-code statements yourself.
 
 ## Hand-written assembly

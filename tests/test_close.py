@@ -154,3 +154,19 @@ class ReadPairsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TempsFallbackTest(unittest.TestCase):
+    def test_a_start_that_fails_with_temp_origins_is_compiled_again_without_them(self):
+        c = FakeCloser(SRC, lambda t: 90.0)
+        calls = []
+        plain = FakeCloser.evaluate
+
+        def evaluate(text, slot):
+            calls.append(c.temps)
+            return None if c.temps else plain(c, text, slot)
+        c.evaluate, c.temps = evaluate, True
+        r = c.run()
+        self.assertEqual(calls[:2], [True, False])
+        self.assertFalse(r.error)
+        self.assertEqual(r.start, 90.0)

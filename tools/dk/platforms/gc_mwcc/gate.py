@@ -95,8 +95,10 @@ def set_files(cfg: Config) -> dict[str, Path]:
     for name in SNAPSHOT_SETS:
         out[name] = d / f"{name}.snapshot.json"
         out[name + ":list"] = data_dir(cfg) / f"{name}.json"
+    released = frozen_config(cfg)[2].resolve()
     for p in sorted((data_dir(cfg) / "eval").glob("*.json")):        # frozen eval sets (llm-bench t63-freeze)
-        out["eval:" + p.stem] = p
+        if p.resolve() != released:                                  # the release file is not a set
+            out["eval:" + p.stem] = p
     return {k: p for k, p in out.items() if p.is_file()}
 
 
