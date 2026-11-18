@@ -17,6 +17,10 @@ owned files are no longer that state (another project exported since), `import` 
 project's are not (our changes would be dropped); both print the git recipe that merges instead.
 `base --set` records the current toolkit HEAD when the two copies are equal; `--force` mirrors
 regardless (and records the base).
+
+The toolkit repo is public, so every export first scans the files it would copy for anything that
+names this project or carries its binary (game names, real symbol addresses, copied code words:
+exportscan.py) and refuses on a hit, `--force` included; `export --check` runs the scan alone.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from pathlib import Path
 
 from .command import MISMATCH, OK, USAGE, Command, hint
 from .config import Config
+from .exportscan import scan
 
 OWNED = ("dk", "tools/dk", "tests", "playbook")
 _SKIP_PARTS = {"__pycache__", ".pytest_cache"}
@@ -189,6 +194,22 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         write_base(cfg.root, commit, digest(repo))
         print(f"sync base recorded: {commit[:12]} (dk.toml [toolkit]; commit it)")
         return OK
+    if args.action == "export":
+        hits, info = scan(cfg, owned_files(cfg.root))
+        print(f"pre-export scan: {info['files']} files; {len(info['words'])} banned words, "
+              f"{info['addresses']} real addresses, {info['code_triples']} code word triples")
+        if hits:
+            for h in hits[:50]:
+                print(f"  {h}")
+            print(f"error: refusing to export: {len(hits)} hit(s) would publish project-specific text; make the code "
+                  "generic (values into dk.toml, synthetic fixtures), or list a false hit in dk.toml [toolkit] export_allow")
+            return MISMATCH
+        print("pre-export scan: clean")
+        if getattr(args, "check", False):
+            return OK
+    elif getattr(args, "check", False):
+        print("error: --check goes with export")
+        return USAGE
     src, dst = (cfg.root, repo) if args.action == "export" else (repo, cfg.root)
     dirty = _dirty(dst)
     if dirty and not args.force:
@@ -216,6 +237,8 @@ def _configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("action", choices=("diff", "export", "import", "base"))
     p.add_argument("--force", action="store_true", help="mirror even over uncommitted changes, or when the other side "
                                                         "changed since the last sync (removes what the source lacks)")
+    p.add_argument("--check", action="store_true", help="with export: only run the pre-export scan (names, real "
+                                                        "addresses, code words), exit 1 on a hit")
     p.add_argument("--set", action="store_true", help="with base: record the toolkit's HEAD as the sync base "
                                                       "(the copies must be equal)")
 

@@ -52,6 +52,22 @@ template = "<a linked game unit compiled with the game flags>"
 [toolkit]
 # The shared toolkit repo (dk launcher, tools/dk, tests, playbook): ./dk toolkit diff|export|import
 repo = "<path to dk-toolkit, relative to the project root>"
+# The toolkit repo is public: export scans what it copies and refuses on a hit (export --check scans only).
+# Banned words (case-insensitive) besides [docs] banned_in_playbook, game_id, the project name and [docs] project;
+# real symbol addresses and code words from [target] original are checked too.
+export_banned = ["<game name>", "<names of the game's own classes>"]
+# export_allow = []                       # false hits: the word, the address, or the three words as hex
+# export_endian = "big"                   # byte order of the original's words
+
+# [test]
+# paths = ["tests_project"]               # project-owned tests ./dk test runs after tests/ (an import never touches them)
+
+# [site]                                  # dk site: the local status website
+# name = "<project> decomp"               # brand in the top bar and titles (default: [project] name)
+# headline = "<Game>, rebuilt byte for byte"
+# categories_hint = "\"game\" is the game's own code; \"sdk\" is the system libraries it links against."
+# shot_unit = "<unit page slug>"          # dk site shots
+# shot_tour = "<tour name>"
 
 [docs]
 agents_md = "AGENTS.md"

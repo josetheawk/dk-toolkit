@@ -353,6 +353,10 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         print(f"  variant {k}: {pct:6.2f}%" + (f"  (worse: {', '.join(worse[:4])})" if worse else "") + f"   {first}")
         if not worse and (best is None or pct > best[1]):
             best = (k, pct)
+    from ...core.usage import note
+    note(unit=unit["name"], function=args.function, variants=len(variants),
+         score_before=round(before.get(args.function, 0.0), 2), score_after=round(best[1], 2) if best else None,
+         compiled=sum(1 for s, _ in results[1:] if s is not None))
     if shown:
         print(f"variant {args.show}, target vs ours:")
         print(clip_rows(shown, args.show_rows))

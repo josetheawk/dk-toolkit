@@ -44,4 +44,6 @@ core changes small and list them in the commit.
 - **Output is deterministic:** sorted, no timestamps.
 - **Python is stdlib-first.**
 - **Generic logic goes in `tools/dk/core/`; platform logic in `tools/dk/platforms/<platform>/`.** Project specifics come from the project's `dk.toml`.
+- **Nothing here names a game.** Synthetic fixtures and addresses only; a project's golden tests live in its
+  own `[test] paths` folder. `./dk toolkit export` refuses on a scan hit (`--check` runs the scan alone).
 - **Playbook entries** follow the format rule → why → how to apply, use no project names, stay within the budgets, and are each verified by an exact match. `./dk doc-lint` checks all of this.

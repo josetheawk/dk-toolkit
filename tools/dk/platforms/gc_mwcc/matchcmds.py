@@ -48,8 +48,13 @@ def run_check(cfg: Config, args: argparse.Namespace) -> int:
 
     for line in render(s):
         print(line)
+    from ...core.usage import note
+    note(unit=unit["name"], exact_functions=sum(f.percent == 100.0 for f in s.functions),
+         functions_total=len(s.functions), code_percent=round(s.code_percent, 2))
     if args.function:
         f = next((f for f in s.functions if f.name == args.function), None)
+        if f is not None:
+            note(function=f.name, score=round(f.percent, 2))
         if f is None:
             print(f"error: {args.function} not in {unit['name']}")
             return USAGE

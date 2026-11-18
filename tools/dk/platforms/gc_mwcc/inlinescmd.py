@@ -415,6 +415,9 @@ def run_scan(cfg: Config, ctx: Context, args: argparse.Namespace) -> int:
         inlinescan.write_json(args.json, rows)
     print("\n".join(inlinescan.render(rows, args.limit)))
     hits = [r for r in rows if r["flagged"]]
+    from ...core.usage import note
+    note(scanned=len(rows), flagged=len(hits),
+         functions=[r["function"] for r in sorted(hits, key=lambda r: -r["at_stake"])[:30]])
     if hits:
         hint(f"inlines {max(hits, key=lambda r: r['at_stake'])['function']}")
     return OK

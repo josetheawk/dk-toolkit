@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from tests.helpers import DK_TOML, git
 from tools.dk.core import toolkitcmd
-from tools.dk.core.command import OK, USAGE
+from tools.dk.core.command import MISMATCH, OK, USAGE
 from tools.dk.core.config import load
 
 
@@ -42,10 +42,10 @@ class SyncTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_cmd(self, action, force=False, set_=False):
+    def run_cmd(self, action, force=False, set_=False, check=False):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = toolkitcmd.run(self.cfg, SimpleNamespace(action=action, force=force, set=set_))
+            code = toolkitcmd.run(self.cfg, SimpleNamespace(action=action, force=force, set=set_, check=check))
         return code, out.getvalue()
 
     def commit(self, root: Path, msg: str):
@@ -61,6 +61,22 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(base["base"], toolkitcmd.head(self.toolkit))
         self.assertEqual(base["repo"], "../toolkit")                   # other keys kept
         self.assertIn("# the shared repo", (self.project / "dk.toml").read_text())
+
+    def test_export_refuses_a_project_name_even_with_force(self):
+        text = (self.project / "dk.toml").read_text().replace('repo = "../toolkit"\n',
+                                                              'repo = "../toolkit"\nexport_banned = ["Zorblax"]\n')
+        (self.project / "dk.toml").write_text(text)
+        self.cfg = load(self.project)
+        self.run_cmd("base", set_=True)
+        self.assertEqual(self.run_cmd("export", check=True)[0], OK)
+        (self.project / "tools/dk/core/a.py").write_text("a = 2   # the zorblax camera\n")
+        self.commit(self.project, "leak")
+        code, out = self.run_cmd("export", check=True)
+        self.assertEqual(code, MISMATCH)
+        self.assertIn("tools/dk/core/a.py:1: names: zorblax", out)
+        code, out = self.run_cmd("export", force=True)
+        self.assertEqual(code, MISMATCH)
+        self.assertEqual((self.toolkit / "tools/dk/core/a.py").read_text(), "a = 1\n")    # nothing copied
 
     def test_base_set_refuses_while_the_copies_differ(self):
         (self.project / "tools/dk/core/a.py").write_text("a = 2\n")

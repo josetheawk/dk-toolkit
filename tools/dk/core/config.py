@@ -46,6 +46,7 @@ class Config:
     quality: dict[str, Any]
     toolkit_repo: Path | None = None       # the shared toolkit repo ([toolkit] repo)
     brief_template: Path | None = None     # [brief] template: the rules template `dk brief` fills in
+    usage_log: str = ""                    # [usage] log: the usage log, relative to the main checkout ("off": none)
 
     def rel(self, path: Path) -> str:
         """Path relative to the repo root, for messages."""
@@ -94,6 +95,7 @@ def load(root: Path = REPO) -> Config:
         quality=dict(raw.get("quality", {})),
         toolkit_repo=p(raw["toolkit"]["repo"]) if raw.get("toolkit", {}).get("repo") else None,
         brief_template=p(raw["brief"]["template"]) if raw.get("brief", {}).get("template") else None,
+        usage_log=str(raw.get("usage", {}).get("log", "")),
         docs=DocsConfig(
             agents_md=p(docs.get("agents_md", "AGENTS.md")),
             playbook=p(docs.get("playbook", "playbook")),

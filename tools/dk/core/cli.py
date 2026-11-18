@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from .. import platforms
-from . import briefcmd, build, committools, doclint, floor, nextcmd, progress, quality, retro, rmcmd, setup, status, testcmd, toolkitcmd, verifyhead, worktreecmd
+from . import briefcmd, build, committools, doclint, floor, nextcmd, progress, quality, retro, rmcmd, setup, site, status, testcmd, toolkitcmd, usage, usagecmd, verifyhead, worktreecmd
 from .command import GROUPS, USAGE, Command
 from .config import ConfigError, load
 from .util import project_lock
@@ -28,6 +28,8 @@ CORE_COMMANDS: list[Command] = [
     toolkitcmd.COMMAND,
     committools.COMMAND,
     briefcmd.COMMAND,
+    site.COMMAND,
+    usagecmd.COMMAND,
 ]
 
 
@@ -52,6 +54,14 @@ def _overview(cmds: list[Command]) -> str:
     return "\n".join(out)
 
 
+def _subcommand(p: argparse.ArgumentParser, rest: list[str]) -> str:
+    """The subcommand word of a command with subparsers (`toolkit diff`), else ""."""
+    for action in p._actions:                          # subparsers, or a positional with fixed choices
+        if isinstance(action, argparse._SubParsersAction) or (not action.option_strings and action.choices):
+            return next((t for t in rest if not t.startswith("-") and t in action.choices), "")
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     try:
@@ -67,14 +77,15 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="./dk", add_help=True)
     sub = parser.add_subparsers(dest="command", required=True)
-    by_name = {}
+    by_name, parsers = {}, {}
     for c in cmds:
         p = sub.add_parser(c.name, help=c.summary, description=c.summary)
         if c.configure:
             c.configure(p)
-        by_name[c.name] = c
+        by_name[c.name], parsers[c.name] = c, p
     args = parser.parse_args(argv)
     cmd = by_name[args.command]
+    usage.begin(cfg, cmd.name, _subcommand(parsers[cmd.name], argv[1:]), args)
     if cmd.needs_config and cfg is None:
         print(f"error: {config_error}")
         return USAGE

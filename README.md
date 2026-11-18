@@ -94,7 +94,11 @@ See [playbook/platforms/raw.md](playbook/platforms/raw.md) and
 
 1. Change it inside a project, where the real binary exercises it.
 2. Commit there.
-3. Run `./dk toolkit export`, then commit here.
+3. Run `./dk toolkit export`, then commit here. This repo is public: the export first scans what it
+   copies for the project's names (`[toolkit] export_banned` in its dk.toml), real symbol addresses and
+   code words from its original binary, and refuses on a hit (`./dk toolkit export --check` scans only).
+   Game-specific values belong in dk.toml keys; tests that need the original live in a project folder
+   listed in `[test] paths`, never in `tests/`.
 4. Here, run `python3 -m pytest -q tests`.
 
 New lessons go in `playbook/`, in its format: rule → why → how to apply. Keep it within the

@@ -1031,10 +1031,15 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         return USAGE
     from .gate import frozen_keys
     held = held_set(frozen_keys(cfg), unit["name"], args.function)
+    from ...core.usage import note
+    note(unit=unit["name"], function=args.function)
     if held and args.apply:
+        note(refused_by="frozen")
         print(f"error: {args.function} is frozen ({held}): not applied (measure it without --apply)")
         return USAGE
     res = close_one(cfg, unit, args.function, opts, args.apply, source=Path(args.source) if args.source else None)
+    note(score_before=round(res.start, 2), score_after=round(res.best, 2), exact=res.exact, compiles=res.compiles,
+         applied=bool(args.apply and res.exact), **({"close_error": res.error[:80]} if res.error else {}))
     if res.error == "already exact":
         return OK
     if res.error:

@@ -11,6 +11,7 @@ import argparse
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
+from ...core.usage import note, refusal_kind
 from .matching import MatchError, commit_gate, resolve_unit, score
 from .unitcommit import commit_units
 
@@ -24,17 +25,20 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     # Only these units' objects, to score them: the clean-worktree verify in commit_units proves
     # the hash, so another agent's half-done edit in the shared tree cannot block this save.
     if fresh.build(cfg, [u["base_path"] for u in units], own=tuple(u["base_path"] for u in units)).returncode != 0:
+        note(refused_by="compile", committed=False)
         print("REJECTED: a unit does not compile")
         hint(f"check {args.target[0]} --private")
         return MISMATCH
-    lines = []
+    lines, landed = [], []
     for unit in units:
         s = score(cfg, unit["name"], cfg.root / unit["target_path"], cfg.root / unit["base_path"])
         exact = sum(1 for f in s.functions if f.percent == 100.0)
+        landed += [f.name for f in s.functions if f.percent == 100.0]
         rel = unit["metadata"]["source_path"].removeprefix(cfg.platform_options.get("src", "src") + "/")
         lines.append(f"{rel}: {exact}/{len(s.functions)} functions exact")
         problems = commit_gate(cfg, unit)
         if problems:
+            note(refused_by=refusal_kind(problems[0]), committed=False)
             for prob in problems:
                 print(f"REJECTED: {prob}")
             return MISMATCH
@@ -45,6 +49,8 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if args.trailer:
         message += "\n" + "\n".join(args.trailer) + "\n"
     ok, detail = commit_units(cfg, units, message)
+    note(unit=units[0]["name"], units=len(units), exact_functions=len(landed), committed=ok,
+         **({"landed": landed} if ok else {"refused_by": refusal_kind(detail)}))
     if not ok:
         print(f"{'REJECTED' if detail.startswith('below the progress floor') else 'note: not committed'}: {detail}")
         return MISMATCH if detail.startswith("below the progress floor") else OK

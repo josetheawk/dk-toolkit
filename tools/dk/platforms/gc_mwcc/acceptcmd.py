@@ -8,6 +8,7 @@ from pathlib import Path
 from . import freshness as fresh
 from ...core.command import MISMATCH, OK, USAGE, Command, hint
 from ...core.config import Config
+from ...core.usage import note, refusal_kind
 from ...core.progress import load_report
 from .dtk_symbols import build_errors
 from .matching import MatchError, commit_gate, render, resolve_unit, score
@@ -102,11 +103,14 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     rel_source = source.removeprefix(cfg.platform_options.get("src", "src") + "/")
 
     if fresh.build(cfg, [unit["base_path"]]).returncode != 0:
+        note(refused_by="compile", committed=False)
         print("error: unit does not compile")
         hint(f"check {args.target}")
         return MISMATCH
     s = score(cfg, unit["name"], cfg.root / unit["target_path"], cfg.root / unit["base_path"])
+    note(unit=unit["name"], exact_functions=sum(f.percent == 100.0 for f in s.functions), functions_total=len(s.functions))
     if not s.exact:
+        note(refused_by="not-exact", committed=False, code_percent=round(s.code_percent, 2))
         for line in render(s):
             print(line)
         print("REJECTED: unit is not an exact match")
@@ -114,6 +118,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
     forbidden = [p for p in commit_gate(cfg, unit) if p.startswith("forbidden")]
     if forbidden:
+        note(refused_by="quality", committed=False)
         for prob in forbidden:
             print(f"REJECTED: {prob}")
         return MISMATCH
@@ -149,6 +154,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
                   f"is that TU's tail (./dk unit propose {s.functions[0].name} prints the merged unit); "
                   "otherwise keep it with `#pragma force_active on` after the includes")
         return _restore(cfg, units_path, original_units, "hash mismatch or build error after linking")
+    note(matched_before=before, matched_after=after)
     print(f"ACCEPTED: {unit['name']} linked, hash OK, matched functions {before} -> {after}")
 
     if args.no_commit:
@@ -158,6 +164,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if args.trailer:
         message += "\n" + "\n".join(args.trailer) + "\n"
     ok, detail = commit_unit(cfg, unit, message)
+    note(committed=ok, **({"landed": [f.name for f in s.functions]} if ok else {"refused_by": refusal_kind(detail)}))
     if not ok and detail.startswith("below the progress floor"):
         return _restore(cfg, units_path, original_units, detail)
     print(f"committed: Match {rel_source} ({detail})" if ok else f"note: not committed ({detail})")
@@ -166,6 +173,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _restore(cfg: Config, units_path: Path, original: str, reason: str) -> int:
+    note(committed=False, refused_by=refusal_kind(reason) if reason.startswith("below") else "link")
     units_path.write_text(original)
     _build(cfg)
     print(f"REJECTED: {reason}; units.toml restored")

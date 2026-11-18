@@ -1,3 +1,4 @@
 from .core.cli import main
+from .core.usage import invoke
 
-raise SystemExit(main())
+raise SystemExit(invoke(main))

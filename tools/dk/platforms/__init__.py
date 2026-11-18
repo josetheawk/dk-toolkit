@@ -27,6 +27,9 @@ Each one exposes:
                                           commits that change a frozen function's source text are refused (core.frozen.guard)
     status_checks(cfg) -> list            optional: `dk status` rows (passed, text, next command)
     status_ready_hint(cfg) -> str         optional: `dk status` next command when every row passes
+    usage_fields(cfg, args) -> dict       optional: usage-log fields read from the parsed arguments (core/usage.py)
+    USAGE_SEARCH: {label: (cmd, flags)}   optional: search tools `dk usage report` rates by later landings
+    USAGE_LANDING: tuple[str, ...]        optional: commands whose committed run notes the functions it `landed`
 """
 
 from __future__ import annotations

@@ -156,11 +156,11 @@ class LlmTrainTest(unittest.TestCase):
             path, man = llmtrain.make_bundle(ds, tools, t / "out", head="abc")
             with tarfile.open(path) as tar:
                 names = set(tar.getnames())
-                self.assertIn("llm-train/data/train.jsonl", names)
+                self.assertIn(f"{llmtrain.top()}/data/train.jsonl", names)
                 self.assertFalse([n for n in names if "dpo" in n])            # SFT only: no DPO stage
                 self.assertIn("SFT only", man["stages"])
-                self.assertIn("llm-train/llm_train/train.py", names)
-                got = json.loads(tar.extractfile("llm-train/MANIFEST.json").read())
+                self.assertIn(f"{llmtrain.top()}/llm_train/train.py", names)
+                got = json.loads(tar.extractfile(f"{llmtrain.top()}/MANIFEST.json").read())
             self.assertEqual(got["files"]["data/train.jsonl"], llmtrain.sha256_file(ds / "train.jsonl"))
             self.assertEqual(got["head"], "abc")
 
