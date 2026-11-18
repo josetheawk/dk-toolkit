@@ -1,0 +1,24 @@
+# dk.toml for a SPI NOR flash dump (platform spi_nor, which builds on raw).
+# Paths are relative to the project root.
+
+[project]
+name = "<chip>-flash"
+platform = "spi_nor"          # tools/dk/platforms/spi_nor
+
+[target]
+original = "orig/flash.bin"   # full-chip read; git-ignored, never committed
+sha1 = "<sha1 of orig/flash.bin>"
+
+[platform]
+part = "<PART>"               # label only; the JEDEC id is not in the array
+# erased = 255                # byte an erased cell reads as
+# erase_span = 4096           # minimum erased run, in bytes (one sector)
+# out = "build/spi"           # dk carve writes regions/, files/ and manifest.txt here
+# arch = "auto"               # dk dis CPU when no vector table decides
+
+[toolkit]
+repo = "<path to dk-toolkit, relative to the project root>"
+
+[docs]
+project = "docs"
+banned_in_playbook = ["<chip>", "<PART>", "<project name>"]

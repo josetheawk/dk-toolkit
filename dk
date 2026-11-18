@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Single entry point for the project toolkit. Run `./dk` for the command list.
+set -euo pipefail
+cd "$(dirname "$(realpath "$0")")"
+exec python3 -m tools.dk "$@"

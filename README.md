@@ -1,0 +1,106 @@
+# dk-toolkit
+
+A deterministic toolkit for decompilation and binary reverse engineering of any target:
+one entry point (`./dk`), tested commands with fixed exit codes, ratchets that stop a
+project from getting worse, and a portable playbook of verified lessons.
+
+Each decomp project vendors this toolkit at the same paths. Use `./dk toolkit export` and
+`./dk toolkit import` inside a project to sync it with this repo.
+
+The core is target-agnostic. What the toolkit knows about one kind of target lives in a
+**platform**, and a platform can build on another one:
+
+| Platform | Target | Commands it adds |
+|---|---|---|
+| `raw` | any binary: firmware, ROM, flash or disk dump, unknown file | `map`, `carve`, `dis` (any Capstone arch) |
+| `spi_nor` | SPI NOR flash dumps; builds on `raw` | `raw`'s, with erased-flash rules and geometry |
+| `dotnet` | .NET (CLI) assemblies | `info`, `strings`, `il`, `resources` |
+| `gc_mwcc` | GameCube/Wii games built with CodeWarrior, byte-matching | `check`, `gen`, `accept`, `save`, `close`, ... |
+
+`gc_mwcc` sits on top of [decomp-toolkit](https://github.com/encounter/decomp-toolkit),
+[objdiff](https://github.com/encounter/objdiff) and
+[dtk-template](https://github.com/encounter/dtk-template). Start an unknown binary on `raw`;
+add a specialised platform when the target needs one. It is built to be driven by AI
+coding agents, alone or as a team; see [Using it with AI coding agents](#using-it-with-ai-coding-agents).
+
+## Using it with AI coding agents
+
+The toolkit was developed with Claude Code running up to ~16 agents in parallel on one
+real GameCube decomp. In one session that team took the game's matched code from 41% to 49%,
+with every commit verified. What makes that safe:
+
+- **One entry point and machine-readable outcomes.** Every command is `./dk <command>` with `-h`. Exit codes are fixed: `0` ok, `1` mismatch, `2` usage, `3` build error. Every command ends with a `next:` hint, so an agent branches on codes instead of parsing prose.
+- **Only byte-exact counts.** `check` scores functions, data and layout against the original. `accept` links a unit only if the whole binary's hash still matches.
+- **Agents can't make a project worse.** `save`, `accept` and `commit-tools` commit HEAD plus exactly their own delta, verified in a clean worktree under a lock, and refuse anything below the committed progress floor. So many agents can share one working tree.
+- **Integration that tolerates work in progress.** The coordinator's `commit-tools --integrate` lands cross-unit changes (header retypes, symbol renames) together. It holds back units an agent is still editing.
+- **Verified knowledge, not guesses.** `playbook/` maps asm symptoms to the source idioms that fixed them. It also covers the compiler's register-allocation and emission-order rules. Each entry was proven by an exact match.
+
+To point an agent at it:
+- [AGENTS.md](AGENTS.md) (also read as `CLAUDE.md`) orients an agent in this repo.
+- [NEW_PROJECT.md](NEW_PROJECT.md) sets up a decomp.
+- [templates/AGENTS.md](templates/AGENTS.md) becomes the project's map.
+- [playbook/agents.md](playbook/agents.md) covers the matching loop, the guard rails and running many agents at once: roles, briefs, integration, context hand-offs, wind-down.
+
+## Layout
+
+```
+dk                       launcher: python3 -m tools.dk "$@"
+tools/dk/core/           generic commands: build, verify-head, progress, floor, quality, docs, sync
+tools/dk/platforms/      one package per kind of target: raw, spi_nor (on raw), dotnet, gc_mwcc
+tests/                   toolkit tests (synthetic fixtures; golden tests skip without a project)
+playbook/                portable lessons (no project names; ./dk doc-lint enforces it)
+templates/               dk.toml and AGENTS.md for a new project
+NEW_PROJECT.md           how to start a decomp with this toolkit
+```
+
+## What the gc_mwcc platform does
+
+- **Analysis:**
+  - `analyze rtti` gives class names and vtables.
+  - `analyze lib` and `port` find and port SDK, MSL and runtime code from pinned reference decomps.
+  - `unit propose` finds translation-unit boundaries, including the `__sinit` tails.
+- **Matching:**
+  - `check` scores a unit's functions, data and layout, modelling the original link's data dead-stripping.
+  - `check --all` checks the whole project.
+  - `diff` shows target against ours, side by side.
+  - `compiler-search` tries compiler versions and flags.
+- **Generation:** `gen` writes C++ drafts that are verified exact. It handles leaf functions, stack frames, C and C++ calls (with a CodeWarrior demangler), if/else, virtual calls, int↔float conversions, stack locals, and virtual destructors and constructors rebuilt from RTTI.
+  - `gen --survey` measures coverage.
+  - `gen --regress REV` ensures a change loses nothing.
+- **Commits:**
+  - `accept` and `save` commit HEAD plus exactly one unit's delta, verified in a clean worktree under a project lock (safe for parallel agents).
+  - `verify-head` proves every commit builds on its own.
+
+## What the raw and spi_nor platforms do
+
+Analysis platforms: no build, so `./dk` hides the matching-flow core commands (`build`,
+`progress`, `floor`, ...). Python stdlib only; Capstone is optional for `dis`.
+
+- `map` splits the image on fill runs (0x00/0xFF padding; erased 0xFF sectors on `spi_nor`)
+  and reports each region's entropy, ARM and Cortex-M vector tables with the link address
+  they imply, containers, JFFS2 names and files, repeated regions and telling strings.
+  Containers are confirmed by structure, not magic: uImage (header CRC), device tree, ELF,
+  squashfs, cramfs, zip, `gziphead`, and gzip/xz/bzip2/lzma/zstd streams, which are decoded
+  to find where they end.
+- `carve` writes regions, containers and JFFS2 files (either byte order) with a manifest;
+  `carve --check` hashes them back.
+- `dis` disassembles any range: the CPU and link address come from the region's vector
+  table, or `--arch` (arm, thumb, arm64, mips, ppc, x86, riscv, ...) and `--va`.
+
+See [playbook/platforms/raw.md](playbook/platforms/raw.md) and
+[templates/dk-raw.toml](templates/dk-raw.toml) / [dk-spi.toml](templates/dk-spi.toml).
+
+## Developing the toolkit
+
+1. Change it inside a project, where the real binary exercises it.
+2. Commit there.
+3. Run `./dk toolkit export`, then commit here.
+4. Here, run `python3 -m pytest -q tests`.
+
+New lessons go in `playbook/`, in its format: rule → why → how to apply. Keep it within the
+budgets.
+
+## License
+
+MIT, see [LICENSE](LICENSE). A copy also sits in `tools/dk/LICENSE`, so it travels with every
+project's vendored toolkit.

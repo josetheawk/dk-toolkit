@@ -1,0 +1,303 @@
+[
+ {
+  "name": "offset-load",
+  "device": "offset-cast",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "offset-store-float",
+  "device": "offset-cast",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "offset-hex-unsigned-char",
+  "device": "offset-cast",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "offset-byte-store",
+  "device": "offset-cast",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "offset-through-pointer-local",
+  "device": "offset-cast",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "cases-added-breaks",
+  "device": "empty-cases",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "cases-label-group",
+  "device": "empty-cases",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "cases-if-to-switch",
+  "device": "empty-cases",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "cases-sixteen-empty",
+  "device": "empty-cases",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "copied-clamp-body",
+  "device": "copied-inline",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "copied-setpair-body",
+  "device": "copied-inline",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "copied-setpair-renamed",
+  "device": "copied-inline",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "copied-clamp-in-branch",
+  "device": "copied-inline",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pragma-dont-inline",
+  "device": "inline-trick",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pragma-inline-depth",
+  "device": "inline-trick",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pragma-auto-inline-off",
+  "device": "inline-trick",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "attribute-noinline",
+  "device": "inline-trick",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "attribute-always-inline",
+  "device": "inline-trick",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "keyword-inline-added",
+  "device": "inline-trick",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "forceinline-keyword",
+  "device": "inline-trick",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "selfcast-int-param",
+  "device": "self-cast",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "selfcast-pointer-param",
+  "device": "self-cast",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "selfcast-local-float",
+  "device": "self-cast",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "selfcast-unsigned-local",
+  "device": "self-cast",
+  "expect": "flag",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "temp-t0",
+  "device": "placeholder-temp",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "temp-tmp1-float",
+  "device": "placeholder-temp",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "temp-t1-t2",
+  "device": "placeholder-temp",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "temp-var3-and-v0",
+  "device": "placeholder-temp",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pad-array",
+  "device": "padding-local",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pad-int-unread",
+  "device": "padding-local",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pad-dummy-assigned",
+  "device": "padding-local",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pad-double-filler",
+  "device": "padding-local",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pad-array-written",
+  "device": "padding-local",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "pad-buffer-used-once",
+  "device": "padding-local",
+  "expect": "reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-one-case-switch",
+  "device": "clean",
+  "expect": "not-reject",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-call-the-inline",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-unsigned-index",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-named-result",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-sibling-field",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-different-cast",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-own-two-statements",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-bool-flag",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": ""
+ },
+ {
+  "name": "clean-non-inline-twin",
+  "device": "clean",
+  "expect": "clean",
+  "symbol": "Func",
+  "note": "a plain function with the same statements is the original's twin, not an inline helper"
+ }
+]

@@ -1,0 +1,22 @@
+# dk.toml for any binary (platform raw). Paths are relative to the project root.
+
+[project]
+name = "<project>"
+platform = "raw"              # tools/dk/platforms/raw
+
+[target]
+original = "orig/image.bin"   # the image; git-ignored, never committed
+sha1 = "<sha1 of orig/image.bin>"
+
+[platform]
+# fill = [0, 255]             # byte values a gap between regions is made of
+# min_gap = 4096              # shortest gap, in bytes
+# out = "build/raw"           # dk carve writes regions/, files/ and manifest.txt here
+# arch = "auto"               # dk dis CPU when no vector table decides (arm, thumb, mips, ppc, x86, ...)
+
+[toolkit]
+repo = "<path to dk-toolkit, relative to the project root>"
+
+[docs]
+project = "docs"
+banned_in_playbook = ["<project name>", "<vendor>", "<device>"]
